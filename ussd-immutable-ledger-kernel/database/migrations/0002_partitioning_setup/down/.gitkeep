@@ -1,0 +1,74 @@
+# Partitioning Setup Migration - Down Migration Placeholder
+
+## Purpose
+
+This .gitkeep file maintains the directory structure for the 0002_partitioning_setup
+migration rollback scripts.
+
+## Current Status
+
+The partitioning setup migration is designed to be IDEMPOTENT and REVERSIBLE through
+the following mechanisms:
+
+### Automatic Cleanup
+
+1. **Partition Detachment** - Partitions are automatically detached when running
+   the down migration stored procedure
+2. **Archive Schema** - Detached partitions are moved to the `archive` schema
+3. **Index Cleanup** - Partition-specific indexes are dropped
+
+### Manual Rollback Steps (if needed)
+
+If you need to completely remove partitioning:
+
+```sql
+-- 1. Detach all partitions
+DO $$
+DECLARE
+    partition_record RECORD;
+BEGIN
+    FOR partition_record IN 
+        SELECT child.relname as partition_name
+        FROM pg_inherits
+        JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+        JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+        WHERE parent.relname = 'ledger_entries'
+    LOOP
+        EXECUTE format('ALTER TABLE ledger_entries DETACH PARTITION %I', 
+                      partition_record.partition_name);
+    END LOOP;
+END $$;
+
+-- 2. Move partitions to archive or drop
+-- Option A: Move to archive schema
+ALTER TABLE ledger_entries_YYYY_MM SET SCHEMA archive;
+
+-- Option B: Drop (DANGER: DATA LOSS)
+-- DROP TABLE ledger_entries_YYYY_MM;
+
+-- 3. Convert parent table to regular table (if needed)
+-- This requires recreating the table structure
+```
+
+## Safety Notes
+
+⚠️ **WARNING**: Detaching/dropping partitions with data will result in
+DATA LOSS if not properly archived first. Always:
+
+1. Verify backups exist before rollback
+2. Move data to archive schema rather than dropping
+3. Document which partitions were removed
+4. Update any dependent views or procedures
+
+## Related Files
+
+- Up migration: `../up/0002_partitioning_setup.sql`
+- Rollback procedure: `../up/procedures/partition_rollback.sql`
+
+## TODO
+
+- [ ] Implement automated partition archival before detachment
+- [ ] Add partition data export to S3/GCS option
+- [ ] Create partition restore procedure from archive
+- [ ] Add partition rollback validation checks
+- [ ] Implement partition merge capability for small partitions

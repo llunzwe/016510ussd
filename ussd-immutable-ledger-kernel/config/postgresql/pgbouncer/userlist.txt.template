@@ -1,0 +1,168 @@
+# =============================================================================
+# PgBouncer User Authentication File (userlist.txt)
+# =============================================================================
+# Description: Contains usernames and encrypted passwords for PgBouncer
+# Format: "username" "encrypted_password"
+# 
+# SECURITY WARNING:
+# - This file contains sensitive credentials
+# - Set permissions: chmod 640 userlist.txt
+# - Owner: root:pgbouncer
+# - Never commit to version control
+#
+# TODO: Generate actual encrypted passwords before deployment
+# =============================================================================
+
+# =============================================================================
+# COMPLIANCE FRAMEWORK ALIGNMENT
+# =============================================================================
+# ISO/IEC 27001:2022
+#   A.9.2 (Access Control)  - Unique credentials per user role
+#   A.9.4 (System Access)   - scram-sha-256 password storage
+#   A.5.17 (Secrets Mgmt)   - Encrypted password storage
+#
+# ISO/IEC 27031:2025
+#   Business Continuity     - Separate credentials for failover scenarios
+#   ICT Readiness           - Backup user for recovery operations
+#
+# ISO/IEC 27040:2024
+#   Storage Security        - Credential file protection requirements
+#   Access Controls         - Role-based credential management
+# =============================================================================
+
+# =============================================================================
+# SECURITY CONFIGURATION STANDARDS
+# =============================================================================
+# Encryption: Passwords must be SCRAM-SHA-256 encrypted
+# Storage: File permissions must be 640 (root:pgbouncer)
+# Rotation: Passwords must be rotated per security policy
+# Audit: All access via these credentials is logged
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# PGBOUNCER INTERNAL USERS - Administrative Access
+# -----------------------------------------------------------------------------
+
+# PgBouncer admin user (for console access)
+# Role: Pool administration and monitoring
+"pgbouncer_admin" "<ENCRYPTED_PASSWORD>"
+
+# PgBouncer stats user (for monitoring)
+# Role: Read-only statistics access
+"pgbouncer_stats" "<ENCRYPTED_PASSWORD>"
+
+# Authentication query user
+# Role: Dynamic user authentication lookup
+"pgbouncer_auth" "<ENCRYPTED_PASSWORD>"
+
+# -----------------------------------------------------------------------------
+# LEDGER APPLICATION USERS - Application Access (ISO/IEC 27001:2022 A.9.2)
+# -----------------------------------------------------------------------------
+
+# Main application user (read/write)
+# Role: Application database operations
+# Permissions: SELECT, INSERT, UPDATE on ledger tables
+"ledger_app" "<ENCRYPTED_PASSWORD>"
+
+# Read-only user for replicas
+# Role: Reporting and analytics queries
+# Permissions: SELECT only
+"ledger_ro" "<ENCRYPTED_PASSWORD>"
+
+# Administrative user
+# Role: Database administration tasks
+# Permissions: DDL, maintenance operations
+"ledger_admin" "<ENCRYPTED_PASSWORD>"
+
+# -----------------------------------------------------------------------------
+# DATABASE ADMIN USERS - Privileged Access
+# -----------------------------------------------------------------------------
+
+# PostgreSQL superuser (limited use)
+# Role: Emergency administrative access
+# WARNING: Use only for critical maintenance
+"postgres" "<ENCRYPTED_PASSWORD>"
+
+# DBA user
+# Role: Day-to-day database administration
+"dba" "<ENCRYPTED_PASSWORD>"
+
+# -----------------------------------------------------------------------------
+# REPLICATION USERS - Business Continuity (ISO/IEC 27031:2025)
+# -----------------------------------------------------------------------------
+
+# Physical replication user
+# Role: Streaming replication to standbys
+# Permissions: REPLICATION, LOGIN
+"replicator" "<ENCRYPTED_PASSWORD>"
+
+# Logical replication / CDC user
+# Role: Change Data Capture for data warehouse
+# Permissions: REPLICATION, LOGIN
+"cdc_user" "<ENCRYPTED_PASSWORD>"
+
+# -----------------------------------------------------------------------------
+# BACKUP USER - Backup & Recovery (ISO/IEC 27001:2022 A.12.3)
+# -----------------------------------------------------------------------------
+
+# Backup operations
+# Role: pg_dump, pg_basebackup operations
+# Permissions: SELECT on all tables, pg_read_all_data
+"backup_user" "<ENCRYPTED_PASSWORD>"
+
+# -----------------------------------------------------------------------------
+# MONITORING USER - Audit Logging (ISO/IEC 27001:2022 A.12.4)
+# -----------------------------------------------------------------------------
+
+# Prometheus exporter
+# Role: Metrics collection
+# Permissions: pg_monitor role, SELECT on pg_stat_* views
+"exporter" "<ENCRYPTED_PASSWORD>"
+
+# =============================================================================
+# PASSWORD GENERATION - ISO/IEC 27001:2022 A.5.17 (Authentication Secrets)
+# =============================================================================
+# To generate encrypted passwords, use:
+# 
+# Method 1: Using psql (RECOMMENDED)
+#   SELECT rolpassword FROM pg_authid WHERE rolname = 'username';
+#
+# Method 2: Using pg_md5 (for MD5 - not recommended)
+#   pg_md5 -p -u username
+#   Enter password: <type password>
+#
+# Method 3: Using scram-sha-256 (COMPLIANCE REQUIRED)
+#   The password must be pre-encrypted by PostgreSQL and copied from pg_authid
+#
+# Method 4: Using pgbouncer mkauth (AUTOMATED)
+#   pgbouncer mkauth -u pgbouncer_auth -p <PGPASS> > userlist.txt
+#
+# =============================================================================
+# ENCRYPTION REQUIREMENTS - ISO/IEC 27040:2024
+# =============================================================================
+# - All passwords MUST use SCRAM-SHA-256 (not MD5)
+# - Minimum password length: 16 characters
+# - Password complexity: Upper, lower, digit, special character
+# - Rotation period: 90 days maximum
+# - Never reuse last 12 passwords
+
+# =============================================================================
+# AUDIT LOGGING CONFIGURATION
+# =============================================================================
+# All authentication attempts via PgBouncer are logged to:
+# - /var/log/pgbouncer/pgbouncer.log
+# - Connection and disconnection events
+# - Failed authentication attempts
+# Required for ISO/IEC 27001:2022 A.12.4 compliance
+
+# =============================================================================
+# TODO LIST - Pre-Production Security Checklist
+# =============================================================================
+# TODO: Create all users in PostgreSQL with proper passwords
+# TODO: Extract encrypted passwords from pg_authid
+# TODO: Replace all <ENCRYPTED_PASSWORD> placeholders
+# TODO: Set correct file permissions (640, root:pgbouncer)
+# TODO: Test authentication with pgbouncer
+# TODO: Implement password rotation procedure
+# TODO: Document password storage in secrets manager
+# TODO: Configure log monitoring for failed auth attempts

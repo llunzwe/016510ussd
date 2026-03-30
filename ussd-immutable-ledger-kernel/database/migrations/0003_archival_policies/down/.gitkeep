@@ -1,0 +1,131 @@
+# Archival Policies Migration - Down Migration Placeholder
+
+## Purpose
+
+This .gitkeep file maintains the directory structure for the 0003_archival_policies
+migration rollback scripts.
+
+## Current Status
+
+The archival policies migration sets up automated data lifecycle management.
+Rollback involves disabling/removing these policies.
+
+## Rollback Procedures
+
+### Option 1: Disable Policies (Recommended)
+
+```sql
+-- Disable archival jobs without removing configuration
+UPDATE archival_policies
+SET is_active = false,
+    disabled_at = NOW(),
+    disabled_by = current_user
+WHERE policy_name LIKE 'ledger_%';
+
+-- Stop scheduled jobs
+SELECT cron.unschedule('archival-job-ledger-entries');
+SELECT cron.unschedule('compression-job-old-partitions');
+```
+
+### Option 2: Remove Policies Completely
+
+```sql
+-- Remove archival configuration
+DELETE FROM archival_policies 
+WHERE policy_name LIKE 'ledger_%';
+
+-- Drop archival functions
+DROP FUNCTION IF EXISTS archive_old_partitions() CASCADE;
+DROP FUNCTION IF EXISTS compress_partition(varchar) CASCADE;
+DROP FUNCTION IF EXISTS move_to_cold_storage(varchar) CASCADE;
+
+-- Remove cron jobs
+SELECT cron.unschedule(jobid) 
+FROM cron.job 
+WHERE jobname LIKE 'ledger_%';
+```
+
+### Option 3: Restore Archived Data
+
+```sql
+-- Move data back from archive schema
+DO $$
+DECLARE
+    v_partition RECORD;
+BEGIN
+    FOR v_partition IN 
+        SELECT tablename 
+        FROM pg_tables 
+        WHERE schemaname = 'archive'
+          AND tablename LIKE 'ledger_entries_%'
+    LOOP
+        -- Move back to public schema
+        EXECUTE format('ALTER TABLE archive.%I SET SCHEMA public', 
+                      v_partition.tablename);
+        
+        -- Re-attach to parent table
+        EXECUTE format(
+            'ALTER TABLE ledger_entries ATTACH PARTITION %I 
+             FOR VALUES FROM (%L) TO (%L)',
+            v_partition.tablename,
+            -- Extract dates from partition name
+            TO_DATE(SUBSTRING(v_partition.tablename FROM 'ledger_entries_(....)_(..)'), 'YYYY_MM'),
+            TO_DATE(SUBSTRING(v_partition.tablename FROM 'ledger_entries_(....)_(..)'), 'YYYY_MM') + INTERVAL '1 month'
+        );
+    END LOOP;
+END $$;
+```
+
+## Policy Configuration Backup
+
+Before rollback, backup current policies:
+
+```sql
+COPY (
+    SELECT * FROM archival_policies
+    WHERE policy_name LIKE 'ledger_%'
+) TO '/backup/archival_policies_ledger.csv' WITH CSV HEADER;
+```
+
+## Impact Assessment
+
+| Rollback Option | Data Retention | Performance Impact | Recovery Complexity |
+|-----------------|----------------|-------------------|---------------------|
+| Disable Only | Maintained | High (no archival) | Low |
+| Remove Config | Maintained | High | Medium |
+| Full Restore | Restored | Normal | High |
+
+## Safety Notes
+
+⚠️ **CRITICAL**: Rolling back archival policies may cause:
+
+1. **Storage Growth** - Uncontrolled table growth without archival
+2. **Query Degradation** - Large tables impact query performance
+3. **Cost Increase** - Higher storage costs in hot storage
+4. **Backup Issues** - Larger backup windows and storage
+
+## Prerequisites for Rollback
+
+1. Verify sufficient storage capacity (disable archival)
+2. Confirm no legal hold requirements on archived data
+3. Ensure archive storage access for potential restore
+4. Notify stakeholders of retention policy change
+
+## Related Files
+
+- Up migration: `../up/0003_archival_policies.sql`
+- Archival configuration: `../up/config/archival_config.sql`
+- Archive schema: `../../schema/archive_schema.sql`
+
+## TODO
+
+- [ ] Implement archival policy version control
+- [ ] Add automated policy backup before changes
+- [ ] Create point-in-time restore from archive
+- [ ] Implement policy rollback validation
+- [ ] Add archival audit trail preservation
+- [ ] Create emergency archival disable switch
+- [ ] Implement cross-region archive synchronization rollback
+- [ ] Add archival cost impact calculator
+- [ ] Create legal hold integration for rollback blocking
+- [ ] Implement selective partition restore from archive

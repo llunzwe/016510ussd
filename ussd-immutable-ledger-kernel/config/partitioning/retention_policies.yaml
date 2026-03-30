@@ -1,0 +1,491 @@
+# =============================================================================
+# Data Retention Policies for Immutable Ledger
+# =============================================================================
+# Description: Defines retention, archival, and deletion policies
+#              for compliance and storage management
+# Format: YAML
+# Compliance: SOC2, GDPR, PCI-DSS ready
+# =============================================================================
+
+# =============================================================================
+# COMPLIANCE FRAMEWORK ALIGNMENT
+# =============================================================================
+# ISO/IEC 27001:2022
+#   A.12.3 (Backup)       - Retention periods align with backup strategy
+#   A.12.4 (Logging)      - Audit log retention for compliance
+#   A.5.33 (Records Mgmt) - Systematic records lifecycle management
+#   A.5.24 (Compliance)   - Policy-driven retention enforcement
+#
+# ISO/IEC 27031:2025
+#   Business Continuity   - Retention enables historical recovery
+#   ICT Readiness         - Archive accessibility for BC scenarios
+#   Recovery Objectives   - Tiered retention matches RPO targets
+#
+# ISO/IEC 27040:2024
+#   Storage Security      - Secure deletion procedures
+#   Data Lifecycle        - Automated lifecycle management
+#   Encryption            - Encrypted storage for all retention tiers
+# =============================================================================
+
+version: "1.0"
+description: "Data retention and lifecycle policies"
+
+# =============================================================================
+# SECURITY CONFIGURATION STANDARDS
+# =============================================================================
+# Encryption: All data encrypted at rest (AES-256)
+# Access Control: Role-based access per retention tier
+# Audit: All retention actions logged
+# Sanitization: Secure deletion per NIST 800-88
+# =============================================================================
+
+# =============================================================================
+# RETENTION TIERS
+# =============================================================================
+retention_tiers:
+  
+  # Financial transaction data - indefinite retention
+  # Compliance: Financial regulations require permanent records
+  financial_permanent:
+    description: "Financial transactions require permanent retention"
+    hot_retention: "90 days"
+    warm_retention: "1 year"
+    cold_retention: "7 years"
+    archive_retention: "indefinite"
+    legal_hold_capable: true
+    encryption: "AES-256"
+    
+  # Audit logs - long retention for compliance
+  # Compliance: ISO/IEC 27001:2022 A.12.4 requires audit retention
+  audit_compliance:
+    description: "Audit trails for regulatory compliance"
+    hot_retention: "30 days"
+    warm_retention: "6 months"
+    cold_retention: "7 years"
+    archive_retention: "7 years"
+    legal_hold_capable: true
+    encryption: "AES-256"
+    
+  # Operational logs - medium retention
+  operational:
+    description: "Operational and application logs"
+    hot_retention: "7 days"
+    warm_retention: "30 days"
+    cold_retention: "90 days"
+    archive_retention: "1 year"
+    legal_hold_capable: false
+    encryption: "AES-256"
+    
+  # Temporary/process data - short retention
+  temporary:
+    description: "Temporary processing data"
+    hot_retention: "1 day"
+    warm_retention: "7 days"
+    cold_retention: "30 days"
+    archive_retention: "90 days"
+    legal_hold_capable: false
+    encryption: "AES-256"
+    
+  # Personal data - GDPR compliant
+  # Compliance: GDPR Article 5 storage limitation
+  personal_data:
+    description: "User personal information (GDPR)"
+    hot_retention: "90 days"
+    warm_retention: "1 year"
+    cold_retention: "per user request"
+    archive_retention: "anonymized only"
+    legal_hold_capable: true
+    gdpr_subject: true
+    encryption: "AES-256"
+
+# =============================================================================
+# TABLE-SPECIFIC RETENTION POLICIES
+# =============================================================================
+policies:
+  
+  # ---------------------------------------------------------------------------
+  # CORE LEDGER (Permanent Retention) - ISO/IEC 27001:2022 A.8.1
+  # ---------------------------------------------------------------------------
+  ledger.transactions:
+    tier: financial_permanent
+    primary_key: transaction_id
+    retention_rules:
+      - stage: hot
+        duration: 90 days
+        storage: ssd_hot
+        access_pattern: real-time queries
+        encryption: "AES-256"
+        
+      - stage: warm
+        duration: 275 days
+        storage: ssd_warm
+        compression: pglz
+        access_pattern: historical lookup
+        encryption: "AES-256"
+        
+      - stage: cold
+        duration: 6 years
+        storage: hdd_archive
+        compression: lz4
+        access_pattern: compliance audit
+        encryption: "AES-256"
+        
+      - stage: glacier
+        duration: indefinite
+        storage: s3_glacier
+        format: parquet
+        encryption: aes-256
+        
+    special_handling:
+      - type: legal_hold
+        description: "Can be flagged for indefinite retention"
+        mechanism: legal_holds table reference
+        
+      - type: cross_border
+        description: "Data residency requirements"
+        eu_data: "eu-west-1"
+        us_data: "us-east-1"
+        
+  ledger.blocks:
+    tier: financial_permanent
+    inherits: ledger.transactions
+    
+  ledger.accounts:
+    tier: financial_permanent
+    retention_rules:
+      - stage: hot
+        duration: indefinite
+        storage: ssd_hot
+        note: "Account records never deleted, only deactivated"
+        encryption: "AES-256"
+        
+  # ---------------------------------------------------------------------------
+  # AUDIT TRAILS (Compliance Retention) - ISO/IEC 27001:2022 A.12.4
+  # ---------------------------------------------------------------------------
+  ledger.audit_trail:
+    tier: audit_compliance
+    retention_rules:
+      - stage: hot
+        duration: 30 days
+        storage: ssd_hot
+        encryption: "AES-256"
+        
+      - stage: warm
+        duration: 150 days
+        storage: ssd_warm
+        compression: pglz
+        encryption: "AES-256"
+        
+      - stage: cold
+        duration: 6 years
+        storage: hdd_archive
+        compression: lz4
+        encryption: "AES-256"
+        
+      - stage: archive
+        duration: 7 years
+        storage: s3_standard_ia
+        format: compressed_json
+        encryption: "SSE-KMS"
+        
+    purge_conditions:
+      - after: 7 years
+        requires: [compliance_approval, legal_review]
+        audit_log: true
+        
+  # ---------------------------------------------------------------------------
+  # OPERATIONAL LOGS (Standard Retention)
+  # ---------------------------------------------------------------------------
+  ledger.api_request_logs:
+    tier: operational
+    retention_rules:
+      - stage: hot
+        duration: 7 days
+        storage: ssd_hot
+        encryption: "AES-256"
+        
+      - stage: warm
+        duration: 23 days
+        storage: ssd_warm
+        compression: lz4
+        encryption: "AES-256"
+        
+      - stage: archive
+        duration: 1 year
+        storage: s3_standard
+        format: parquet
+        encryption: "SSE-KMS"
+        
+    purge_conditions:
+      - after: 1 year
+        requires: [automated_cleanup]
+        audit_log: true
+        
+  ledger.event_stream:
+    tier: operational
+    retention_rules:
+      - stage: hot
+        duration: 7 days
+        storage: ssd_hot
+        encryption: "AES-256"
+        
+      - stage: processed_events
+        duration: 7 days
+        condition: "processed = true AND processed_at < NOW() - INTERVAL '7 days'"
+        action: delete
+        secure_deletion: true
+        
+  # ---------------------------------------------------------------------------
+  # TEMPORARY DATA (Short Retention) - ISO/IEC 27040:2024 Data Lifecycle
+  # ---------------------------------------------------------------------------
+  ledger.idempotency_keys:
+    tier: temporary
+    retention_rules:
+      - stage: hot
+        duration: 24 hours
+        condition: "expires_at < NOW() OR processed_at < NOW() - INTERVAL '24 hours'"
+        encryption: "AES-256"
+        
+      - stage: archive
+        duration: 90 days
+        storage: s3_standard
+        condition: "archived = true"
+        encryption: "SSE-KMS"
+        
+    purge_conditions:
+      - after: 90 days
+        requires: [automated_cleanup]
+        secure_deletion: true
+        
+  ledger.reconciliation_discrepancies:
+    tier: operational
+    retention_rules:
+      - stage: open_discrepancies
+        duration: indefinite
+        condition: "status IN ('OPEN', 'INVESTIGATING')"
+        encryption: "AES-256"
+        
+      - stage: resolved_discrepancies
+        duration: 1 year
+        condition: "status = 'RESOLVED' AND resolved_at < NOW() - INTERVAL '1 year'"
+        action: archive_then_delete
+        audit_log: true
+        
+  # ---------------------------------------------------------------------------
+  # PERSONAL DATA (GDPR) - Data Subject Rights
+  # ---------------------------------------------------------------------------
+  ledger.user_profiles:
+    tier: personal_data
+    retention_rules:
+      - stage: active
+        duration: account_lifetime
+        encryption: "AES-256"
+        
+      - stage: deletion_request
+        duration: 30 days
+        condition: "deletion_requested_at IS NOT NULL"
+        action: anonymize_or_delete
+        audit_log: true
+        
+    gdpr_provisions:
+      - right: erasure
+        mechanism: soft_delete_then_anonymize
+        verification: checksum_validation
+        
+      - right: portability
+        format: json_export
+        encryption: "pgp_encrypted"
+        
+      - right: access
+        retention: "request_date + 30 days"
+        log_access: true
+
+# =============================================================================
+# ARCHIVAL CONFIGURATION - ISO/IEC 27040:2024 (Storage Security)
+# =============================================================================
+archival:
+  
+  # S3 destination configuration
+  s3:
+    bucket: "ledger-data-archives"
+    region: "us-east-1"
+    encryption: "SSE-KMS"
+    kms_key_id: "alias/ledger-archive-key"
+    versioning: enabled
+    mfa_delete: enabled
+    
+    lifecycle_rules:
+      - transition_to_ia: 90 days
+      - transition_to_glacier: 1 year
+      - transition_to_deep_archive: 3 years
+      - expiration: never  # Compliance: indefinite retention
+      
+  # Archive formats by data type
+  formats:
+    transactions:
+      format: parquet
+      compression: snappy
+      partitioning: [year, month]
+      encryption: "AES-256"
+      
+    audit_logs:
+      format: jsonl
+      compression: gzip
+      encryption: "AES-256"
+      
+    api_logs:
+      format: parquet
+      compression: snappy
+      encryption: "AES-256"
+      
+  # Archive metadata tracking
+  metadata:
+    table: ledger.archive_manifest
+    fields:
+      - archive_id
+      - source_table
+      - date_range
+      - record_count
+      - s3_location
+      - checksum
+      - archived_at
+      - archived_by
+      - retention_until
+      - encryption_key_id
+
+# =============================================================================
+# PURGE/DELETION PROCEDURES - ISO/IEC 27040:2024 (Sanitization)
+# =============================================================================
+deletion_procedures:
+  
+  # Soft delete pattern
+  soft_delete:
+    description: "Mark records as deleted without removing"
+    fields:
+      - deleted_at: timestamp
+      - deleted_by: varchar
+      - deletion_reason: text
+    audit_log: true
+      
+  # Anonymization for GDPR
+  anonymize:
+    description: "Replace PII with anonymized values"
+    rules:
+      - email: "anonymized_{id}@deleted.local"
+      - name: "[REDACTED]"
+      - phone: null
+      - address: "[REDACTED]"
+    verification: hash_check
+    audit_log: true
+      
+  # Hard delete (use sparingly)
+  hard_delete:
+    description: "Permanently remove records"
+    requires:
+      - legal_approval
+      - audit_log_entry
+      - backup_verification
+    secure_deletion: "NIST_800_88"
+    audit_log: true
+      
+  # Partition drop
+  partition_drop:
+    description: "Drop entire partition after archival"
+    requires:
+      - archive_verification
+      - checksum_match
+      - retention_period_expired
+      - compliance_approval
+    audit_log: true
+
+# =============================================================================
+# COMPLIANCE CONTROLS
+# =============================================================================
+compliance:
+  
+  # SOC2 Type II requirements
+  soc2:
+    logical_access:
+      - retention_policy_approval
+      - deletion_approval_workflow
+      
+    audit_logging:
+      - all_retention_actions_logged
+      - before_after_states_recorded
+      
+  # GDPR Article 5 requirements
+  gdpr:
+    storage_limitation:
+      - automated_retention_enforcement
+      - periodic_review_required: annually
+      
+    integrity_confidentiality:
+      - encrypted_archives
+      - access_logging
+      
+  # PCI-DSS requirements
+  pci_dss:
+    requirement_3:
+      - mask_pan_in_logs
+      - retain_audit_trail: 1_year_minimum
+      - secure_deletion_procedures
+
+# =============================================================================
+# AUDIT LOGGING CONFIGURATION - ISO/IEC 27001:2022 A.12.4
+# =============================================================================
+audit_logging:
+  log_all_retention_actions: true
+  log_deletion_events: true
+  log_archival_operations: true
+  log_access_to_archived_data: true
+  retention: "7 years"
+  immutable: true
+
+# =============================================================================
+# MONITORING AND ALERTING COMPLIANCE
+# =============================================================================
+monitoring:
+  
+  # Metrics to track
+  metrics:
+    - storage_by_tier
+    - retention_policy_violations
+    - archive_success_rate
+    - purge_queue_depth
+    - gdpr_deletion_backlog
+    
+  # Alerts
+  alerts:
+    - name: retention_policy_violation
+      condition: "data_older_than_retention_in_hot_storage"
+      severity: warning
+      
+    - name: archive_failure
+      condition: "archive_job_failed > 3_times"
+      severity: critical
+      
+    - name: gdpr_deletion_backlog
+      condition: "pending_deletions > 1000"
+      severity: high
+      
+  # Reports
+  reports:
+    - name: monthly_retention_report
+      schedule: "0 9 1 * *"
+      recipients: [compliance@company.com, dba@company.com]
+      
+    - name: gdpr_deletion_summary
+      schedule: "0 9 * * 1"
+      recipients: [privacy@company.com]
+
+# =============================================================================
+# TODO LIST
+# =============================================================================
+# TODO: Implement automated retention enforcement jobs
+# TODO: Set up S3 lifecycle policies matching these rules
+# TODO: Create legal hold management interface
+# TODO: Implement GDPR deletion workflow
+# TODO: Set up retention monitoring dashboards
+# TODO: Document retention policy for auditors
+# TODO: Create data subject request handling procedures
+# TODO: Test archive/restore procedures

@@ -1,0 +1,388 @@
+# =============================================================================
+# PostgreSQL Partitioning Strategy for Immutable Ledger
+# =============================================================================
+# Description: Declarative partitioning configuration for time-series data
+# Format: YAML
+# Version: PostgreSQL 15+
+# TODO: Adjust partition ranges based on actual data volume
+# =============================================================================
+
+# =============================================================================
+# COMPLIANCE FRAMEWORK ALIGNMENT
+# =============================================================================
+# ISO/IEC 27001:2022
+#   A.12.3 (Backup)       - Partitioning enables efficient backup/restore
+#   A.12.4 (Logging)      - Audit trail in dedicated partitions
+#   A.5.33 (Records Mgmt) - Partition lifecycle = record lifecycle
+#   A.8.1 (Asset Mgmt)    - Data classification by partition tier
+#
+# ISO/IEC 27031:2025
+#   Business Continuity   - Partition-level recovery options
+#   ICT Readiness         - Detachable partitions for rapid failover
+#   Recovery Objectives   - Targeted restore of recent partitions
+#
+# ISO/IEC 27040:2024
+#   Storage Security      - Tiered storage with encryption per tier
+#   Data Lifecycle        - Automated partition tiering
+#   Access Controls       - Partition-level access restrictions
+# =============================================================================
+
+version: "1.0"
+description: "Partitioning strategy for immutable ledger database"
+
+# =============================================================================
+# SECURITY CONFIGURATION STANDARDS
+# =============================================================================
+# Encryption: All partitions at rest use AES-256 encryption
+# Access Control: Row-level security applies across all partitions
+# Audit: Partition operations logged in audit_trail partition
+# =============================================================================
+
+# =============================================================================
+# PARTITIONING PROFILES
+# =============================================================================
+partition_profiles:
+  
+  # High-frequency time-series (transactions, events)
+  # Compliance: Frequent data requires optimized access patterns
+  high_frequency_daily:
+    strategy: range
+    column: created_at
+    interval: 1 day
+    partition_name_format: "{table}_{yyyy}{mm}{dd}"
+    advance_partitions: 7        # Create 7 days ahead
+    retention_partitions: 90     # Keep 90 days hot
+    compress_after_days: 30      # Compress after 30 days
+    archive_after_days: 365      # Archive after 1 year
+    
+  # Medium-frequency (audit logs, API logs)
+  # Compliance: Audit data requires longer retention
+  medium_frequency_daily:
+    strategy: range
+    column: created_at
+    interval: 1 day
+    partition_name_format: "{table}_{yyyy}{mm}{dd}"
+    advance_partitions: 3
+    retention_partitions: 30
+    compress_after_days: 7
+    archive_after_days: 90
+    
+  # Block-based partitioning (blockchain-like data)
+  # Compliance: Block immutability requires range partitioning
+  block_range:
+    strategy: range
+    column: block_height
+    interval: 100000             # 100k blocks per partition
+    partition_name_format: "{table}_{start}_{end}"
+    advance_partitions: 2
+    retention_partitions: 50     # 5M blocks hot
+    
+  # Account-based hash partitioning (for parallel access)
+  # Compliance: Hash partitioning supports access control distribution
+  account_hash:
+    strategy: hash
+    column: account_id
+    partitions: 64               # 64 hash partitions
+    
+  # Monthly aggregation partitions
+  # Compliance: Aggregated data for compliance reporting
+  monthly_aggregations:
+    strategy: range
+    column: aggregation_month
+    interval: 1 month
+    partition_name_format: "{table}_{yyyy}_{mm}"
+    advance_partitions: 3
+    retention_partitions: 36     # 3 years hot
+
+# =============================================================================
+# TABLE PARTITIONING CONFIGURATIONS
+# =============================================================================
+tables:
+  
+  # ---------------------------------------------------------------------------
+  # CORE LEDGER TABLES - Financial Data (Permanent Retention)
+  # ---------------------------------------------------------------------------
+  
+  ledger.transactions:
+    profile: high_frequency_daily
+    primary_key: [transaction_id, created_at]
+    indexes:
+      - columns: [from_account, created_at]
+        name: idx_transactions_from_account
+      - columns: [to_account, created_at]
+        name: idx_transactions_to_account
+      - columns: [block_id]
+        name: idx_transactions_block
+      - columns: [transaction_hash]
+        name: idx_transactions_hash
+        unique: true
+    constraints:
+      - type: foreign_key
+        columns: [block_id]
+        references: ledger.blocks(block_id)
+    partition_management:
+      auto_create: true
+      auto_drop: false            # Never auto-drop financial data
+      detach_before_drop: true
+    # Compliance: Financial records require permanent retention
+    retention_policy: financial_permanent
+      
+  ledger.blocks:
+    profile: high_frequency_daily
+    column_override: block_timestamp
+    primary_key: [block_id, block_timestamp]
+    indexes:
+      - columns: [block_height]
+        name: idx_blocks_height
+        unique: true
+      - columns: [merkle_root]
+        name: idx_blocks_merkle
+      - columns: [previous_hash]
+        name: idx_blocks_prev_hash
+    partition_management:
+      auto_create: true
+      auto_drop: false
+    retention_policy: financial_permanent
+      
+  # ---------------------------------------------------------------------------
+  # AUDIT AND LOGGING TABLES - Compliance Data (Long Retention)
+  # ---------------------------------------------------------------------------
+  
+  ledger.audit_trail:
+    profile: medium_frequency_daily
+    primary_key: [audit_id, created_at]
+    indexes:
+      - columns: [table_name, record_id]
+        name: idx_audit_table_record
+      - columns: [action_type, created_at]
+        name: idx_audit_action_time
+      - columns: [user_id]
+        name: idx_audit_user
+    partition_management:
+      auto_create: true
+      auto_drop: false
+      compress_after_days: 14
+    # Compliance: Audit logs require 7-year retention (ISO/IEC 27001:2022 A.12.4)
+    retention_policy: audit_compliance
+      
+  ledger.api_request_logs:
+    profile: medium_frequency_daily
+    primary_key: [log_id, created_at]
+    indexes:
+      - columns: [api_key, created_at]
+        name: idx_api_logs_key_time
+      - columns: [endpoint, created_at]
+        name: idx_api_logs_endpoint
+      - columns: [response_status]
+        name: idx_api_logs_status
+    partition_management:
+      auto_create: true
+      auto_drop: true             # Can auto-drop after archival
+      retention_partitions: 14    # 2 weeks
+    retention_policy: operational
+      
+  ledger.event_stream:
+    profile: high_frequency_daily
+    primary_key: [event_id, created_at]
+    indexes:
+      - columns: [event_type, created_at]
+        name: idx_events_type_time
+      - columns: [aggregate_id]
+        name: idx_events_aggregate
+      - columns: [processed]
+        name: idx_events_processed
+        where: "processed = false"
+    partition_management:
+      auto_create: true
+      auto_drop: true
+      retention_partitions: 7
+    retention_policy: operational
+      
+  # ---------------------------------------------------------------------------
+  # IDEMPOTENCY AND STATE TABLES - Temporary Data
+  # ---------------------------------------------------------------------------
+  
+  ledger.idempotency_keys:
+    profile: high_frequency_daily
+    primary_key: [key_hash, created_at]
+    indexes:
+      - columns: [expires_at]
+        name: idx_idempotency_expires
+        where: "expires_at IS NOT NULL"
+    partition_management:
+      auto_create: true
+      auto_drop: true
+      retention_partitions: 3     # Short retention, cleaned by worker
+    retention_policy: temporary
+      
+  # ---------------------------------------------------------------------------
+  # RECONCILIATION TABLES - Compliance Monitoring
+  # ---------------------------------------------------------------------------
+  
+  ledger.reconciliation_run_log:
+    profile: monthly_aggregations
+    column_override: period_start
+    primary_key: [run_id, period_start]
+    indexes:
+      - columns: [reconciliation_type, period_start]
+        name: idx_recon_type_period
+    partition_management:
+      auto_create: true
+      auto_drop: false
+    retention_policy: audit_compliance
+      
+  # ---------------------------------------------------------------------------
+  # HASH PARTITIONED TABLES - Performance Optimization
+  # ---------------------------------------------------------------------------
+  
+  ledger.account_balances_staging:
+    profile: account_hash
+    primary_key: [account_id]
+    indexes:
+      - columns: [account_id]
+        name: idx_balance_staging_account
+    purpose: >
+      Staging table for batch balance updates.
+      Hash partitioning allows parallel workers to update
+      different account ranges without lock contention.
+
+# =============================================================================
+# PARTITION MANAGEMENT POLICIES
+# =============================================================================
+management_policies:
+  
+  # Policy for creating future partitions
+  create_future_partitions:
+    enabled: true
+    schedule: "0 1 * * *"         # Daily at 1 AM
+    look_ahead_days: 7
+    
+  # Policy for detaching old partitions
+  detach_old_partitions:
+    enabled: true
+    schedule: "0 2 * * 0"         # Weekly on Sunday 2 AM
+    detach_after_days: 90
+    destination_tablespace: "archive"
+    
+  # Policy for compression
+  compress_partitions:
+    enabled: true
+    schedule: "0 3 * * *"         # Daily at 3 AM
+    compress_after_days: 30
+    compression_method: "pglz"    # or "lz4" for PG 16+
+    
+  # Policy for statistics update
+  update_partition_stats:
+    enabled: true
+    schedule: "0 4 * * *"         # Daily at 4 AM
+    analyze_threshold: 10000      # Rows changed threshold
+
+# =============================================================================
+# STORAGE CONFIGURATION - ISO/IEC 27040:2024 (Storage Security)
+# =============================================================================
+storage:
+  
+  tablespaces:
+    hot:
+      location: /data/postgres/hot
+      description: "SSD storage for recent partitions"
+      encryption: "AES-256 at rest"
+      backup: "Continuous backup enabled"
+      
+    warm:
+      location: /data/postgres/warm
+      description: "Slower SSD for older partitions"
+      encryption: "AES-256 at rest"
+      compression: "pglz"
+      
+    archive:
+      location: /data/postgres/archive
+      description: "HDD storage for archived partitions"
+      encryption: "AES-256 at rest"
+      compression: "lz4"
+      access_control: "Read-only except for admin"
+      
+  # Partition movement rules
+  tiering:
+    - age_days: 0-30
+      tablespace: hot
+      access_pattern: real-time
+      
+    - age_days: 31-90
+      tablespace: warm
+      compress: true
+      access_pattern: historical
+      
+    - age_days: 91-365
+      tablespace: archive
+      compress: true
+      access_pattern: compliance
+      
+    - age_days: 366+
+      action: detach_and_archive
+      destination: "s3_glacier"
+      encryption: "SSE-KMS"
+
+# =============================================================================
+# PERFORMANCE TUNING
+# =============================================================================
+performance:
+  
+  # Partition pruning settings
+  constraint_exclusion: partition
+  
+  # Parallel query settings per partition
+  parallel_workers:
+    ledger.transactions: 4
+    ledger.audit_trail: 2
+    default: 2
+    
+  # Autovacuum settings per table
+  autovacuum:
+    ledger.transactions:
+      vacuum_scale_factor: 0.05
+      analyze_scale_factor: 0.02
+      
+    ledger.api_request_logs:
+      vacuum_scale_factor: 0.1
+      vacuum_threshold: 1000
+
+# =============================================================================
+# AUDIT LOGGING CONFIGURATION - ISO/IEC 27001:2022 A.12.4
+# =============================================================================
+audit_logging:
+  log_partition_operations: true
+  log_partition_creation: true
+  log_partition_detach: true
+  log_partition_drop: true
+  log_tier_movement: true
+  retention: "7 years"
+
+# =============================================================================
+# MONITORING AND ALERTING COMPLIANCE
+# =============================================================================
+monitoring:
+  metrics:
+    - partition_count_per_table
+    - partition_size_by_tier
+    - partition_age_distribution
+    - compression_ratio
+  alerts:
+    - name: partition_creation_failed
+      severity: critical
+    - name: partition_storage_critical
+      severity: high
+    - name: partition_retention_violation
+      severity: warning
+
+# =============================================================================
+# TODO LIST
+# =============================================================================
+# TODO: Create tablespaces for hot/warm/archive storage tiers
+# TODO: Implement partition management scripts based on this config
+# TODO: Set up pg_partman or native partitioning automation
+# TODO: Test partition pruning with actual query patterns
+# TODO: Benchmark compression settings for data types
+# TODO: Configure partition-wise joins for analytical queries
+# TODO: Implement partition statistics aggregation
+# TODO: Set up monitoring for partition sizes and growth

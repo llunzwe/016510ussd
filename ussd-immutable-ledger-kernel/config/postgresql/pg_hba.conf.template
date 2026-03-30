@@ -1,0 +1,168 @@
+# =============================================================================
+# PostgreSQL Client Authentication Configuration (pg_hba.conf)
+# =============================================================================
+# Description: Security-focused authentication for immutable ledger system
+# WARNING: Review and customize before production deployment
+# TODO: Replace placeholders with actual values
+# =============================================================================
+
+# =============================================================================
+# COMPLIANCE FRAMEWORK ALIGNMENT
+# =============================================================================
+# ISO/IEC 27001:2022
+#   A.9.2 (Access Control)  - Network-based access restrictions
+#   A.9.4 (System Access)   - Secure authentication methods
+#   A.8.1 (Asset Mgmt)      - Database protection via network controls
+#
+# ISO/IEC 27031:2025
+#   Business Continuity     - Separate admin access paths for recovery
+#   ICT Readiness           - Replication security for standby readiness
+#
+# ISO/IEC 27040:2024
+#   Storage Security        - Network-level storage access controls
+#   Access Controls         - Role-based network access restrictions
+# =============================================================================
+
+# =============================================================================
+# SECURITY CONFIGURATION STANDARDS
+# =============================================================================
+# Encryption: hostssl required for all network connections (TLS 1.2+)
+# Authentication: scram-sha-256 only (no md5 or trust)
+# Access Control: IP-based restrictions per user role
+# Defense in Depth: Explicit reject rules before default deny
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# FORMAT: TYPE  DATABASE  USER  ADDRESS  METHOD  [OPTIONS]
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# LOCAL CONNECTIONS
+# -----------------------------------------------------------------------------
+# Unix domain socket connections - restricted to specific users
+local   all           postgres                     peer
+local   ledger        ledger_admin                 peer
+local   ledger        ledger_app                   peer
+local   replication   replicator                   peer
+
+# -----------------------------------------------------------------------------
+# LOCALHOST (IPv4/IPv6) - Administrative Access
+# -----------------------------------------------------------------------------
+# Superuser access from localhost only
+host    all           postgres       127.0.0.1/32  scram-sha-256
+host    all           postgres       ::1/128       scram-sha-256
+
+# Ledger admin from localhost
+host    ledger        ledger_admin   127.0.0.1/32  scram-sha-256
+host    ledger        ledger_admin   ::1/128       scram-sha-256
+
+# -----------------------------------------------------------------------------
+# APPLICATION SERVERS - Encryption Required
+# -----------------------------------------------------------------------------
+# TODO: Replace <APP_SERVER_IP_RANGE> with actual CIDR
+# Example: 10.0.1.0/24 for internal app subnet
+#
+# COMPLIANCE: ISO/IEC 27040:2024 - Encrypted connections for data access
+
+# Application read/write access
+hostssl ledger        ledger_app     <APP_SERVER_IP_RANGE>  scram-sha-256
+
+# Read-only replica access for reporting
+hostssl ledger        ledger_ro      <APP_SERVER_IP_RANGE>  scram-sha-256
+
+# -----------------------------------------------------------------------------
+# CONNECTION POOLER (PgBouncer) - Secure Middleware
+# -----------------------------------------------------------------------------
+# TODO: Replace <PGBOUNCER_IP> with actual PgBouncer host
+#
+# COMPLIANCE: ISO/IEC 27001:2022 A.9.4 - Secure middleware authentication
+hostssl ledger        pgbouncer      <PGBOUNCER_IP>/32      scram-sha-256
+
+# -----------------------------------------------------------------------------
+# MONITORING - Audit Logging Required
+# -----------------------------------------------------------------------------
+# TODO: Replace <MONITORING_IP> with monitoring server IP
+#
+# COMPLIANCE: ISO/IEC 27001:2022 A.12.4 - Monitoring access logging
+hostssl postgres      exporter       <MONITORING_IP>/32     scram-sha-256
+
+# -----------------------------------------------------------------------------
+# REPLICATION - Business Continuity (ISO/IEC 27031:2025)
+# -----------------------------------------------------------------------------
+# Physical replication from standby servers
+# TODO: Replace <STANDBY_IP_RANGE> with actual standby CIDR
+#
+# COMPLIANCE: Encrypted replication for data protection
+hostssl replication   replicator     <STANDBY_IP_RANGE>     scram-sha-256
+
+# Logical replication slots for CDC
+hostssl ledger        cdc_user       <STANDBY_IP_RANGE>     scram-sha-256
+
+# -----------------------------------------------------------------------------
+# BACKUP - Secure Backup Access (ISO/IEC 27001:2022 A.12.3)
+# -----------------------------------------------------------------------------
+# Backup user for pg_dump/pg_basebackup
+# TODO: Replace <BACKUP_IP> with backup server IP
+hostssl all           backup_user    <BACKUP_IP>/32         scram-sha-256
+
+# -----------------------------------------------------------------------------
+# ADMIN/MAINTENANCE - Privileged Access Controls
+# -----------------------------------------------------------------------------
+# DBA access from management subnet
+# TODO: Replace <ADMIN_IP_RANGE> with admin CIDR
+hostssl all           dba            <ADMIN_IP_RANGE>       scram-sha-256
+
+# -----------------------------------------------------------------------------
+# DENY RULES - Defense in Depth (ISO/IEC 27001:2022 A.8.1)
+# -----------------------------------------------------------------------------
+# Reject all other connections to sensitive databases
+host    replication   all            0.0.0.0/0              reject
+host    postgres      all            0.0.0.0/0              reject
+
+# -----------------------------------------------------------------------------
+# DEFAULT - Reject everything else
+# -----------------------------------------------------------------------------
+host    all           all            0.0.0.0/0              reject
+host    all           all            ::/0                   reject
+
+# =============================================================================
+# AUDIT LOGGING CONFIGURATION
+# =============================================================================
+# All connection attempts are logged per:
+# - ISO/IEC 27001:2022 A.12.4 (Logging)
+# - SOC 2 Type II access logging requirements
+# Ensure logging_collector = on in postgresql.conf
+# =============================================================================
+
+# =============================================================================
+# SECURITY NOTES - Compliance Requirements
+# =============================================================================
+# 1. Always use hostssl (SSL required) for network connections
+#    [ISO/IEC 27040:2024 - Encryption in transit]
+#
+# 2. Use scram-sha-256 for password authentication (not md5)
+#    [ISO/IEC 27001:2022 A.9.4 - Strong authentication]
+#
+# 3. Restrict by IP address/range where possible
+#    [ISO/IEC 27001:2022 A.9.1 - Network access control]
+#
+# 4. Separate users by function (app, ro, admin, replication)
+#    [ISO/IEC 27001:2022 A.5.18 - Access rights]
+#
+# 5. Never allow trust authentication in production
+#    [Defense in depth principle]
+#
+# 6. Review and rotate passwords regularly
+#    [ISO/IEC 27001:2022 A.5.17 - Authentication secrets]
+
+# =============================================================================
+# TODO LIST - Pre-Production Checklist
+# =============================================================================
+# TODO: Replace all <PLACEHOLDER> values with actual IP addresses
+# TODO: Create database users with proper passwords
+# TODO: Set up SSL certificates and configure server
+# TODO: Test all authentication paths before deployment
+# TODO: Document user roles and access levels
+# TODO: Set up password rotation policy
+# TODO: Configure fail2ban for brute force protection
+# TODO: Review and customize for specific network topology

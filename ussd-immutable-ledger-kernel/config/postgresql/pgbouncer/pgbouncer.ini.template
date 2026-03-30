@@ -1,0 +1,219 @@
+;; =============================================================================
+;; PgBouncer Configuration for Immutable Ledger
+;; =============================================================================
+;; Description: Connection pooling optimized for high-throughput ledger system
+;; Mode: Transaction pooling (recommended for ledger workloads)
+;; TODO: Replace all <PLACEHOLDER> values with actual configuration
+;; =============================================================================
+
+;; =============================================================================
+;; COMPLIANCE FRAMEWORK ALIGNMENT
+;; =============================================================================
+;; ISO/IEC 27001:2022
+;;   A.9.2 (Access Control)  - Connection pooling limits resource exhaustion
+;;   A.9.4 (System Access)   - scram-sha-256 authentication enforcement
+;;   A.12.4 (Logging)        - Connection/disconnection logging
+;;
+;; ISO/IEC 27031:2025
+;;   Business Continuity     - Pool sizing supports traffic spikes during BC
+;;   ICT Readiness           - reserve_pool for failover capacity
+;;
+;; ISO/IEC 27040:2024
+;;   Storage Security        - TLS 1.2+ for all connections
+;;   Encryption              - Client and server TLS configuration
+;; =============================================================================
+
+;; =============================================================================
+;; SECURITY CONFIGURATION STANDARDS
+;; =============================================================================
+;; Encryption: TLS 1.2+ required for client and server connections
+;; Authentication: scram-sha-256 with auth_query for dynamic auth
+;; Access Control: Admin console restricted to named users
+;; Audit Logging: All connections and disconnections logged
+;; =============================================================================
+
+[databases]
+;; Map pool names to actual PostgreSQL databases
+;; Format: dbname = host= port= dbname= user= password=
+
+;; Main ledger database
+ledger = host=<PG_HOST> port=<PG_PORT> dbname=ledger
+
+;; Replica for read queries
+ledger_replica = host=<PG_REPLICA_HOST> port=<PG_PORT> dbname=ledger
+
+;; Administrative connection
+postgres = host=<PG_HOST> port=<PG_PORT> dbname=postgres
+
+[pgbouncer]
+;; =============================================================================
+;; GENERAL SETTINGS
+;; =============================================================================
+
+;; Network settings
+listen_addr = 0.0.0.0
+listen_port = 6432
+unix_socket_dir = /var/run/pgbouncer
+
+;; Authentication - ISO/IEC 27001:2022 A.9.4 (System Access)
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+auth_query = SELECT usename, passwd FROM pg_shadow WHERE usename=$1
+auth_user = pgbouncer_auth
+
+;; Pool mode: transaction (best for ledger with many short transactions)
+pool_mode = transaction
+
+;; Maximum number of client connections
+max_client_conn = 10000
+
+;; Maximum number of server connections to PostgreSQL
+default_pool_size = 100
+min_pool_size = 50
+reserve_pool_size = 25
+reserve_pool_timeout = 5
+
+;; Maximum connections per database/user
+default_max_db_connections = 200
+default_max_user_connections = 200
+
+;; Connection limits per database (override defaults)
+max_db_connections = 400
+
+;; =============================================================================
+;; TIMEOUT SETTINGS - Resource Management (ISO/IEC 27001:2022 A.12.1)
+;; =============================================================================
+
+;; Close server connection if client disconnects
+server_reset_query = DISCARD ALL
+server_reset_query_always = 0
+
+;; Idle timeout for server connections
+server_idle_timeout = 600
+server_lifetime = 3600
+
+;; Connection retry settings
+server_connect_timeout = 15
+server_login_retry = 15
+
+;; Query timeout (0 = disabled, but recommended to set)
+query_timeout = 0
+query_wait_timeout = 120
+
+;; Client idle timeout
+client_idle_timeout = 0
+client_login_timeout = 60
+
+;; Close connections on SIGTERM
+server_fast_close = 0
+
+;; =============================================================================
+;; AUDIT LOGGING CONFIGURATION - ISO/IEC 27001:2022 A.12.4 (Logging)
+;; =============================================================================
+
+;; Log settings
+logfile = /var/log/pgbouncer/pgbouncer.log
+pidfile = /var/run/pgbouncer/pgbouncer.pid
+
+;; Verbose logging for debugging (reduce in production)
+verbose = 0
+
+;; Log connections and disconnections - Compliance requirement
+log_connections = 1
+log_disconnections = 1
+
+;; Log pooler errors
+log_pooler_errors = 1
+
+;; Stats logging
+stats_period = 60
+
+;; =============================================================================
+;; LEDGER-SPECIFIC TUNING
+;; =============================================================================
+
+;; Track application name for monitoring
+application_name_add_host = 1
+
+;; Don't let clients change server parameters
+ignore_startup_parameters = extra_float_digits
+
+;; Ledger workloads: many short transactions
+;; Keep connections ready
+server_round_robin = 0
+
+;; Maximum prepared statements per connection
+max_prepared_statements = 0  ; Disabled in transaction mode
+
+;; =============================================================================
+;; ADMIN SETTINGS - Access Control (ISO/IEC 27001:2022 A.9.2)
+;; =============================================================================
+
+;; Admin console access - Restrict to authorized personnel
+admin_users = pgbouncer_admin, postgres
+stats_users = pgbouncer_stats, prometheus
+
+;; Remote access to console (use with caution)
+;; listen_backlog = 128
+
+;; =============================================================================
+;; TLS/SSL SETTINGS - Encryption (ISO/IEC 27040:2024)
+;; =============================================================================
+;; All connections must use TLS 1.2 or higher
+
+;; Client TLS (connections to PgBouncer)
+client_tls_sslmode = require
+client_tls_key_file = /etc/pgbouncer/server.key
+client_tls_cert_file = /etc/pgbouncer/server.crt
+client_tls_ca_file = /etc/pgbouncer/ca.crt
+client_tls_protocols = tlsv1.2,tlsv1.3
+
+;; Server TLS (connections to PostgreSQL)
+server_tls_sslmode = require
+server_tls_key_file = /etc/pgbouncer/client.key
+server_tls_cert_file = /etc/pgbouncer/client.crt
+server_tls_ca_file = /etc/pgbouncer/ca.crt
+
+;; =============================================================================
+;; HEALTH CHECK - Monitoring Compliance
+;; =============================================================================
+
+;; Disable health check by default (use external monitoring)
+;; server_check_query = select 1
+;; server_check_delay = 30
+
+;; DNS settings
+dns_max_ttl = 15
+dns_nxdomain_ttl = 15
+dns_zone_check_period = 0
+
+;; =============================================================================
+;; PEER SETTINGS - Business Continuity (ISO/IEC 27031:2025)
+;; =============================================================================
+
+;; Uncomment for PgBouncer HA setup
+;; peer_id = pgbouncer-1
+;; [peers]
+;; pgbouncer-2 = host=pgbouncer-2 port=6432
+;; pgbouncer-3 = host=pgbouncer-3 port=6432
+
+;; =============================================================================
+;; MONITORING AND ALERTING COMPLIANCE
+;; =============================================================================
+;; These settings enable monitoring required for:
+;; - ISO/IEC 27001:2022 A.12.1 (Operational Procedures)
+;; - SOC 2 Type II continuous monitoring
+;; - Real-time pool exhaustion alerting
+;; =============================================================================
+
+;; =============================================================================
+;; TODO LIST - Pre-Production Checklist
+;; =============================================================================
+;; TODO: Replace <PG_HOST>, <PG_PORT>, <PG_REPLICA_HOST> with actual values
+;; TODO: Generate and install SSL certificates
+;; TODO: Create pgbouncer_auth user in PostgreSQL
+;; TODO: Create userlist.txt with encrypted passwords
+;; TODO: Set up firewall rules for port 6432
+;; TODO: Configure monitoring for pool statistics
+;; TODO: Load test and tune pool sizes
+;; TODO: Set up PgBouncer HA if needed

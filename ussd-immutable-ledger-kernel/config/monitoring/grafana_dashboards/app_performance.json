@@ -1,0 +1,452 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Application-level performance metrics for the ledger system. Compliance: ISO/IEC 27001:2022 A.12.1 (Operational Procedures), ISO/IEC 27001:2022 A.12.4 (Logging), ISO/IEC 27031:2025 (BC Monitoring)",
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "iteration": 1711800000000,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "datasource": null,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "panels": [],
+      "title": "Transaction Performance",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20
+          },
+          "unit": "reqps"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 1},
+      "id": 2,
+      "options": {
+        "legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "multi"}
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ledger_api_requests_total[1m])) by (endpoint)",
+          "legendFormat": "{{ endpoint }}",
+          "refId": "A"
+        }
+      ],
+      "title": "API Request Rate by Endpoint",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "custom": {"displayMode": "lcd"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 100},
+              {"color": "red", "value": 500}
+            ]
+          },
+          "unit": "ms"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 1},
+      "id": 3,
+      "options": {
+        "displayMode": "lcd",
+        "orientation": "horizontal",
+        "reduceOptions": {"calcs": ["mean"], "fields": "", "values": false},
+        "showUnfilled": true
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(ledger_api_request_duration_seconds_bucket[5m])) by (le, endpoint)) * 1000",
+          "legendFormat": "{{ endpoint }}",
+          "refId": "A"
+        }
+      ],
+      "title": "p99 Latency by Endpoint",
+      "type": "bargauge"
+    },
+    {
+      "collapsed": false,
+      "datasource": null,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 9},
+      "id": 10,
+      "panels": [],
+      "title": "Background Jobs",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line"},
+          "unit": "ms"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 10},
+      "id": 11,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right"}
+      },
+      "targets": [
+        {
+          "expr": "ledger_background_job_duration_seconds{job_type=\"merkle_computation\"} * 1000",
+          "legendFormat": "Merkle Computation",
+          "refId": "A"
+        },
+        {
+          "expr": "ledger_background_job_duration_seconds{job_type=\"integrity_check\"} * 1000",
+          "legendFormat": "Integrity Check",
+          "refId": "B"
+        },
+        {
+          "expr": "ledger_background_job_duration_seconds{job_type=\"mv_refresh\"} * 1000",
+          "legendFormat": "MV Refresh",
+          "refId": "C"
+        }
+      ],
+      "title": "Background Job Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "bars"},
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 10},
+      "id": 12,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"},
+        "stacking": {"group": "A", "mode": "normal"}
+      },
+      "targets": [
+        {
+          "expr": "increase(ledger_background_job_executions_total{status=\"success\"}[1h])",
+          "legendFormat": "{{ job_type }} - Success",
+          "refId": "A"
+        },
+        {
+          "expr": "increase(ledger_background_job_executions_total{status=\"failed\"}[1h])",
+          "legendFormat": "{{ job_type }} - Failed",
+          "refId": "B"
+        }
+      ],
+      "title": "Background Job Executions (1h)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": null,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 18},
+      "id": 20,
+      "panels": [],
+      "title": "Cron Jobs & EOD Processing",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"align": "auto", "displayMode": "auto"},
+          "mappings": [
+            {"options": {"0": {"text": "Pending"}}, "type": "value"},
+            {"options": {"1": {"text": "Running"}}, "type": "value"},
+            {"options": {"2": {"text": "Completed"}}, "type": "value"},
+            {"options": {"3": {"text": "Failed"}}, "type": "value"}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        }
+      },
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 19},
+      "id": 21,
+      "options": {"showHeader": true},
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "ledger_cron_job_status",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Cron Job Status",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true},
+            "renameByName": {"Value": "Status", "job_name": "Job Name"}
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line"},
+          "unit": "s"
+        }
+      },
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 19},
+      "id": 22,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right"}
+      },
+      "targets": [
+        {
+          "expr": "ledger_eod_processing_duration_seconds",
+          "legendFormat": "{{ step_name }}",
+          "refId": "A"
+        }
+      ],
+      "title": "EOD Processing Duration by Step",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": null,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 25},
+      "id": 30,
+      "panels": [],
+      "title": "Idempotency & Caching",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line"},
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 26},
+      "id": 31,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"}
+      },
+      "targets": [
+        {
+          "expr": "rate(ledger_idempotency_cache_hits_total[5m]) / rate(ledger_idempotency_checks_total[5m])",
+          "legendFormat": "Cache Hit Rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Idempotency Cache Hit Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line"},
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 26},
+      "id": 32,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"}
+      },
+      "targets": [
+        {
+          "expr": "ledger_idempotency_keys_total",
+          "legendFormat": "Total Keys",
+          "refId": "A"
+        },
+        {
+          "expr": "ledger_idempotency_keys_expired_total",
+          "legendFormat": "Expired Keys",
+          "refId": "B"
+        }
+      ],
+      "title": "Idempotency Key Metrics",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": null,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 34},
+      "id": 40,
+      "panels": [],
+      "title": "Archival & Storage",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line"},
+          "unit": "decbytes"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 35},
+      "id": 41,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"}
+      },
+      "targets": [
+        {
+          "expr": "ledger_archived_bytes_total",
+          "legendFormat": "Total Archived",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(ledger_archived_bytes_total[1h])",
+          "legendFormat": "Archive Rate",
+          "refId": "B"
+        }
+      ],
+      "title": "Archival Metrics",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1000000},
+              {"color": "red", "value": 5000000}
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 35},
+      "id": 42,
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      },
+      "targets": [
+        {
+          "expr": "ledger_partition_count",
+          "refId": "A"
+        }
+      ],
+      "title": "Active Partitions",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 7},
+              {"color": "red", "value": 14}
+            ]
+          },
+          "unit": "d"
+        }
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 35},
+      "id": 43,
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      },
+      "targets": [
+        {
+          "expr": "ledger_oldest_partition_age_days",
+          "refId": "A"
+        }
+      ],
+      "title": "Oldest Partition Age",
+      "type": "stat"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 27,
+  "style": "dark",
+  "tags": ["ledger", "application", "performance", "compliance", "iso27001", "iso27031"],
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": false, "text": "Prometheus", "value": "Prometheus"},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
+      {
+        "current": {"selected": true, "text": ["All"], "value": ["$__all"]},
+        "hide": 0,
+        "includeAll": true,
+        "label": "Environment",
+        "multi": true,
+        "name": "environment",
+        "options": [],
+        "query": "label_values(ledger_environment_info, environment)",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h"]
+  },
+  "timezone": "UTC",
+  "title": "Application Performance",
+  "uid": "ledger-app-performance",
+  "version": 1
+}

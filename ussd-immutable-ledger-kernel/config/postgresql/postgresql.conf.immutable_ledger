@@ -1,0 +1,281 @@
+# =============================================================================
+# PostgreSQL Configuration for Immutable Ledger System
+# =============================================================================
+# Description: Optimized settings for high-throughput, audit-focused
+#              immutable ledger with heavy write workloads
+# Version: PostgreSQL 15+
+# TODO: Review and adjust based on actual hardware and workload profiling
+# =============================================================================
+
+# =============================================================================
+# COMPLIANCE FRAMEWORK ALIGNMENT
+# =============================================================================
+# ISO/IEC 27001:2022
+#   A.12.3 (Backup)       - archive_mode, archive_command, full_page_writes
+#   A.12.4 (Logging)      - comprehensive audit logging configuration
+#   A.8.1 (Asset Mgmt)    - RLS enabled, SSL required for data protection
+#
+# ISO/IEC 27031:2025
+#   Business Continuity   - replication, hot_standby, wal_level settings
+#   ICT Readiness         - synchronous_commit, multiple standby support
+#   Recovery Objectives   - PITR configuration via WAL archiving
+#
+# ISO/IEC 27040:2024
+#   Storage Security      - full_page_writes, data encryption at rest
+#   Encryption            - password_encryption, SSL/TLS settings
+#   Access Controls       - row_security, ssl configuration
+# =============================================================================
+
+# =============================================================================
+# SECURITY CONFIGURATION STANDARDS
+# =============================================================================
+# Encryption: All connections must use TLS 1.2 or higher
+# Authentication: SCRAM-SHA-256 required for all users
+# Access Control: Row-level security enabled for multi-tenancy
+# =============================================================================
+
+# ------------------------------------------------------------------------------
+# CONNECTION SETTINGS
+# ------------------------------------------------------------------------------
+max_connections = 500                     # Allow many concurrent ledger writers
+superuser_reserved_connections = 10       # Reserve for admin/emergency
+
+# Connection pooling via PgBouncer is REQUIRED with this setting
+# Do not increase max_connections without proper load testing
+
+# ------------------------------------------------------------------------------
+# MEMORY SETTINGS
+# ------------------------------------------------------------------------------
+# TODO: Adjust based on available RAM (current assumes 64GB server)
+shared_buffers = 16GB                     # 25% of total RAM
+effective_cache_size = 48GB               # 75% of total RAM
+work_mem = 256MB                          # Per-operation memory
+maintenance_work_mem = 2GB                # For VACUUM, CREATE INDEX, etc.
+
+# Ledger-specific: Large work_mem for aggregation queries
+ledger_agg_work_mem = 1GB                 # Custom GUC for ledger operations
+
+# ------------------------------------------------------------------------------
+# WRITE-AHEAD LOGGING (WAL) - Critical for Immutable Ledger
+# ------------------------------------------------------------------------------
+# Compliance: A.12.3 (Backup) - Point-in-time recovery capability
+wal_level = replica                       # Required for replication & PITR
+wal_compression = on                      # Compress WAL to reduce I/O
+max_wal_size = 8GB                        # Allow larger WAL segments
+min_wal_size = 2GB
+wal_buffers = 64MB                        # Large WAL buffers for burst writes
+checkpoint_completion_target = 0.9        # Spread checkpoint I/O
+
+# Synchronous commit settings for durability/performance balance
+synchronous_commit = on                   # Always on for financial data
+# For batch operations only: can be temporarily disabled
+# ledger.batch_synchronous_commit = off   # Custom GUC
+
+# ------------------------------------------------------------------------------
+# REPLICATION SETTINGS - Business Continuity (ISO/IEC 27031:2025)
+# ------------------------------------------------------------------------------
+max_wal_senders = 10                      # Number of replication connections
+max_replication_slots = 10                # Logical replication slots
+wal_keep_size = 2GB                       # Retain WAL for standbys
+hot_standby = on                          # Allow reads on replicas
+hot_standby_feedback = on                 # Prevent vacuum conflicts
+
+# Logical replication for CDC (Change Data Capture)
+wal_sender_timeout = 60s
+max_logical_replication_workers = 8
+max_sync_workers_per_subscription = 4
+
+# ------------------------------------------------------------------------------
+# QUERY PLANNING
+# ------------------------------------------------------------------------------
+random_page_cost = 1.1                    # Assumes SSD storage
+effective_io_concurrency = 200            # SSD-optimized
+
+default_statistics_target = 1000          # Higher stats for ledger tables
+constraint_exclusion = partition          # Critical for partitioned tables
+
+# Enable parallel query for large analytical queries
+max_parallel_workers_per_gather = 4
+max_parallel_workers = 8
+max_parallel_maintenance_workers = 4
+parallel_tuple_cost = 0.01
+parallel_setup_cost = 100
+
+# ------------------------------------------------------------------------------
+# AUTOVACUUM SETTINGS - Tuned for High-Write Ledger
+# ------------------------------------------------------------------------------
+autovacuum = on
+autovacuum_max_workers = 6                # More workers for high churn
+autovacuum_naptime = 10s                  # Check frequently
+
+# Aggressive autovacuum for ledger tables (many updates to status fields)
+autovacuum_vacuum_threshold = 50
+autovacuum_vacuum_scale_factor = 0.05     # Vacuum at 5% change (lower = more frequent)
+autovacuum_analyze_threshold = 50
+autovacuum_analyze_scale_factor = 0.02
+
+# Vacuum cost limits (allow more aggressive vacuuming)
+autovacuum_vacuum_cost_limit = 2000
+autovacuum_vacuum_cost_delay = 2ms
+
+# Freeze settings for append-only tables
+vacuum_freeze_min_age = 5000000
+vacuum_freeze_table_age = 150000000
+vacuum_multixact_freeze_min_age = 5000000
+vacuum_multixact_freeze_table_age = 150000000
+
+# ------------------------------------------------------------------------------
+# AUDIT LOGGING CONFIGURATION - ISO/IEC 27001:2022 A.12.4 (Logging)
+# ------------------------------------------------------------------------------
+logging_collector = on
+log_destination = 'stderr,csvlog'
+log_directory = 'log'
+log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
+log_rotation_age = 1d
+log_rotation_size = 1GB
+log_truncate_on_rotation = off
+
+# Log all DDL for compliance - A.12.4 Logging requirement
+log_statement = 'ddl'                     # Log all schema changes
+log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+log_checkpoints = on
+log_connections = on
+log_disconnections = on
+log_lock_waits = on
+log_temp_files = 128MB
+
+# Slow query logging for optimization
+log_min_duration_statement = 1000         # Log queries > 1 second
+log_min_duration_sample = 100             # Sample queries > 100ms
+log_statement_sample_rate = 0.1
+
+# Auto-explain for slow queries (requires extension)
+shared_preload_libraries = 'auto_explain,pg_stat_statements,pg_cron'
+auto_explain.log_min_duration = '5s'
+auto_explain.log_analyze = true
+auto_explain.log_buffers = true
+
+# ------------------------------------------------------------------------------
+# STATISTICS AND MONITORING
+# ------------------------------------------------------------------------------
+track_activities = on
+track_counts = on
+track_io_timing = on
+track_functions = all
+track_activity_query_size = 4096
+
+# pg_stat_statements configuration
+pg_stat_statements.max = 10000
+pg_stat_statements.track = all
+pg_stat_statements.track_utility = on
+pg_stat_statements.track_planning = on
+
+# ------------------------------------------------------------------------------
+# LEDGER-SPECIFIC SETTINGS
+# ------------------------------------------------------------------------------
+# TODO: Create custom GUCs for ledger module
+# ledger.enable_immutable_checks = on
+# ledger.max_batch_size = 10000
+# ledger.hash_algorithm = 'sha256'
+# ledger.merkle_tree_depth = 32
+
+# Timezone for consistent timestamp handling
+timezone = 'UTC'
+lc_messages = 'en_US.UTF-8'
+lc_monetary = 'en_US.UTF-8'
+lc_numeric = 'en_US.UTF-8'
+
+# ------------------------------------------------------------------------------
+# PERFORMANCE TUNING
+# ------------------------------------------------------------------------------
+# Connection pooling recommendation: Use PgBouncer
+# Do not increase max_connections; use connection pooler instead
+
+# Prepared statements for repeated ledger queries
+plan_cache_mode = auto
+
+# JIT compilation for complex analytical queries
+jit = on
+jit_above_cost = 100000
+jit_inline_above_cost = 500000
+jit_optimize_above_cost = 500000
+
+# ------------------------------------------------------------------------------
+# ENCRYPTION REQUIREMENTS - ISO/IEC 27040:2024 (Storage Security)
+# ------------------------------------------------------------------------------
+# Password encryption using SCRAM-SHA-256
+password_encryption = scram-sha-256
+
+# SSL/TLS configuration - Required for production
+ssl = on                                  # Required for production
+ssl_cert_file = 'server.crt'
+ssl_key_file = 'server.key'
+ssl_ca_file = 'root.crt'
+
+# Row-level security for multi-tenant ledger
+row_security = on
+
+# ------------------------------------------------------------------------------
+# LOCK MANAGEMENT
+# ------------------------------------------------------------------------------
+deadlock_timeout = 5s
+max_locks_per_transaction = 256           # Higher for partitioned tables
+max_pred_locks_per_transaction = 128
+
+# ------------------------------------------------------------------------------
+# ERROR REPORTING
+# ------------------------------------------------------------------------------
+client_min_messages = notice
+log_min_messages = warning
+log_min_error_statement = error
+
+# ------------------------------------------------------------------------------
+# BACKGROUND WORKER PROCESSES
+# ------------------------------------------------------------------------------
+max_worker_processes = 16                 # For parallel workers & custom bgworkers
+
+# pg_cron background worker
+pg_cron.max_running_jobs = 10
+pg_cron.database_name = 'ledger'
+
+# ------------------------------------------------------------------------------
+# TEMPORARY TABLES AND FILES
+# ------------------------------------------------------------------------------
+temp_buffers = 256MB
+max_files_per_process = 1000
+
+# ------------------------------------------------------------------------------
+# IMMUTABLE LEDGER SPECIFIC - Data Integrity & Backup (ISO/IEC 27001:2022)
+# ------------------------------------------------------------------------------
+# Ensure data durability for financial records
+full_page_writes = on                     # Always on for crash recovery
+
+# Archival settings - A.12.3 Backup requirements
+archive_mode = on                         # Enable WAL archiving
+archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'
+archive_timeout = 600                     # Force archive every 10 minutes
+
+# Recovery settings
+recovery_target_timeline = 'latest'
+
+# =============================================================================
+# MONITORING AND ALERTING COMPLIANCE
+# =============================================================================
+# These settings enable comprehensive monitoring required for:
+# - ISO/IEC 27001:2022 A.12.1 (Operational Procedures)
+# - ISO/IEC 27031:2025 Monitoring and alerting
+# - SOC 2 Type II continuous monitoring requirements
+# =============================================================================
+
+# ------------------------------------------------------------------------------
+# TODO LIST
+# ------------------------------------------------------------------------------
+# TODO: Benchmark and tune shared_buffers for actual workload
+# TODO: Configure actual archive_command to S3/cloud storage
+# TODO: Set up SSL certificates for production
+# TODO: Configure pg_hba.conf for network security
+# TODO: Review and tune autovacuum settings after initial load
+# TODO: Implement connection pooling with PgBouncer
+# TODO: Set up monitoring and alerting for these metrics
+# TODO: Configure WAL archiving to cloud storage (S3/GCS)
+# TODO: Set up logical replication for CDC to data warehouse

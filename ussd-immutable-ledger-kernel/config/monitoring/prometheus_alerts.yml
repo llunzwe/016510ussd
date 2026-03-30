@@ -1,0 +1,467 @@
+# =============================================================================
+# Prometheus Alerting Rules for Immutable Ledger
+# =============================================================================
+# Description: Alerting rules for ledger health, performance, and compliance
+# Version: Prometheus 2.x
+# TODO: Adjust thresholds based on baseline performance
+# =============================================================================
+
+# =============================================================================
+# COMPLIANCE FRAMEWORK ALIGNMENT
+# =============================================================================
+# ISO/IEC 27001:2022
+#   A.12.3 (Backup)       - Alerts for backup failures and validation
+#   A.12.4 (Logging)      - Audit log gap and integrity alerts
+#   A.16.1 (Incident Mgmt) - Automated incident detection and alerting
+#   A.12.6 (Vuln. Mgmt)   - Anomaly detection for security events
+#
+# ISO/IEC 27031:2025
+#   Business Continuity   - BC event detection and alerting
+#   ICT Readiness         - Readiness metric monitoring
+#   Recovery Monitoring   - Post-recovery validation alerts
+#
+# ISO/IEC 27040:2024
+#   Storage Security      - Storage integrity and access alerts
+#   Data Integrity        - Cryptographic verification alerts
+#   Access Monitoring     - Unauthorized access detection
+# =============================================================================
+
+# =============================================================================
+# SECURITY CONFIGURATION STANDARDS
+# =============================================================================
+# Encryption: All alert communications via TLS
+# Authentication: Service account required for alertmanager
+# Audit: All alert state changes logged
+# Retention: Alert history retained per compliance requirements
+# =============================================================================
+
+groups:
+  # ===========================================================================
+  # CRITICAL ALERTS - Immediate Response Required
+  # Compliance: ISO/IEC 27031:2025 - BC event notification
+  # ===========================================================================
+  - name: ledger_critical
+    interval: 30s
+    rules:
+      
+      # Database connectivity loss
+      - alert: LedgerDatabaseDown
+        expr: pg_up{job="ledger-postgres"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: dba
+          compliance: "ISO/IEC 27031:2025"
+        annotations:
+          summary: "Ledger database is down"
+          description: "PostgreSQL instance {{ $labels.instance }} has been down for more than 1 minute"
+          runbook_url: "https://wiki/runbooks/ledger-db-down"
+          compliance_ref: "ISO/IEC 27031:2025 - ICT Continuity"
+          
+      # Replication lag - critical for read consistency
+      # Compliance: ISO/IEC 27001:2022 A.12.3 - Backup/Recovery
+      - alert: LedgerReplicationLagCritical
+        expr: pg_replication_lag{job="ledger-postgres"} > 300
+        for: 2m
+        labels:
+          severity: critical
+          team: dba
+          compliance: "ISO/IEC 27001:2022 A.12.3"
+        annotations:
+          summary: "Ledger replication lag is critical"
+          description: "Replication lag on {{ $labels.instance }} is {{ $value }} seconds (> 5 min)"
+          compliance_ref: "A.12.3 - Backup copies should be tested regularly"
+          
+      # Block production stopped (if applicable)
+      - alert: LedgerBlockProductionStopped
+        expr: increase(ledger_blocks_created_total[5m]) == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: ledger-core
+          compliance: "ISO/IEC 27001:2022 A.12.1"
+        annotations:
+          summary: "No new blocks created in 5 minutes"
+          description: "Block production appears to have stopped. Check ledger core services."
+          compliance_ref: "A.12.1 - Operating procedures"
+          
+      # Data integrity check failure
+      # Compliance: ISO/IEC 27040:2024 - Data integrity verification
+      - alert: LedgerIntegrityCheckFailed
+        expr: ledger_integrity_check_status{status="failed"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          team: ledger-core
+          compliance: "ISO/IEC 27040:2024"
+        annotations:
+          summary: "Ledger integrity check failed"
+          description: "Integrity check {{ $labels.check_type }} failed. Immediate investigation required."
+          compliance_ref: "Storage security - Data integrity compromised"
+          
+      # Unusual transaction volume (possible attack)
+      # Compliance: ISO/IEC 27001:2022 A.12.6 - Technical vulnerability management
+      - alert: LedgerAbnormalTransactionVolume
+        expr: |
+          (
+            rate(ledger_transactions_created_total[5m])
+            > 5 * avg_over_time(rate(ledger_transactions_created_total[1h])[24h:5m])
+          )
+        for: 2m
+        labels:
+          severity: critical
+          team: security
+          compliance: "ISO/IEC 27001:2022 A.12.6"
+        annotations:
+          summary: "Abnormal transaction volume detected"
+          description: "Transaction rate is 5x higher than 24h average"
+          compliance_ref: "A.12.6 - Information about technical vulnerabilities"
+
+  # ===========================================================================
+  # HIGH SEVERITY ALERTS
+  # Compliance: ISO/IEC 27001:2022 - Operational monitoring
+  # ===========================================================================
+  - name: ledger_high
+    interval: 1m
+    rules:
+      
+      # High connection count
+      - alert: LedgerHighConnectionCount
+        expr: |
+          pg_stat_activity_count{job="ledger-postgres"} 
+          / pg_settings_max_connections{job="ledger-postgres"} * 100 > 80
+        for: 5m
+        labels:
+          severity: high
+          team: dba
+          compliance: "ISO/IEC 27001:2022 A.12.1"
+        annotations:
+          summary: "High database connection utilization"
+          description: "Connection utilization is {{ $value }}%"
+          
+      # Slow queries accumulating
+      - alert: LedgerSlowQueriesHigh
+        expr: pg_slow_queries{job="ledger-postgres"} > 50
+        for: 5m
+        labels:
+          severity: high
+          team: dba
+          compliance: "ISO/IEC 27001:2022 A.12.1"
+        annotations:
+          summary: "Many slow queries detected"
+          description: "{{ $value }} slow queries (>1s) currently running"
+          
+      # Disk space critical
+      # Compliance: ISO/IEC 27040:2024 - Storage capacity management
+      - alert: LedgerDiskSpaceHigh
+        expr: |
+          pg_database_size_bytes{job="ledger-postgres", datname="ledger"} 
+          / pg_settings_data_directory_size * 100 > 85
+        for: 5m
+        labels:
+          severity: high
+          team: dba
+          compliance: "ISO/IEC 27040:2024"
+        annotations:
+          summary: "Ledger database disk usage high"
+          description: "Disk usage is {{ $value }}%"
+          compliance_ref: "Storage security - Capacity management"
+          
+      # Transaction deadlock detected
+      - alert: LedgerDeadlockDetected
+        expr: increase(pg_stat_database_deadlocks{job="ledger-postgres", datname="ledger"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: high
+          team: dba
+          compliance: "ISO/IEC 27001:2022 A.12.1"
+        annotations:
+          summary: "Deadlock detected in ledger database"
+          description: "{{ $value }} deadlocks in the last 5 minutes"
+          
+      # Merkle tree computation lagging
+      # Compliance: ISO/IEC 27040:2024 - Data integrity
+      - alert: LedgerMerkleComputationLag
+        expr: |
+          ledger_blocks_pending_merkle / ledger_merkle_computation_rate > 300
+        for: 5m
+        labels:
+          severity: high
+          team: ledger-core
+          compliance: "ISO/IEC 27040:2024"
+        annotations:
+          summary: "Merkle tree computation is lagging"
+          description: "{{ $value }} blocks pending Merkle root computation"
+          compliance_ref: "Storage security - Cryptographic verification"
+          
+      # Idempotency key store growing too fast
+      - alert: LedgerIdempotencyKeysGrowing
+        expr: |
+          increase(ledger_idempotency_keys_total[1h]) > 1000000
+        for: 10m
+        labels:
+          severity: high
+          team: ledger-core
+          compliance: "ISO/IEC 27001:2022 A.12.1"
+        annotations:
+          summary: "Idempotency key store growing rapidly"
+          description: "Over 1M new keys in the last hour"
+          
+      # Reconciliation discrepancies found
+      # Compliance: ISO/IEC 27001:2022 A.5.24 - Compliance verification
+      - alert: LedgerReconciliationDiscrepancies
+        expr: ledger_reconciliation_discrepancies_open > 0
+        for: 5m
+        labels:
+          severity: high
+          team: ledger-ops
+          compliance: "ISO/IEC 27001:2022 A.5.24"
+        annotations:
+          summary: "Reconciliation discrepancies detected"
+          description: "{{ $value }} open discrepancies requiring investigation"
+          compliance_ref: "A.5.24 - Information security compliance"
+
+  # ===========================================================================
+  # MEDIUM SEVERITY ALERTS
+  # Compliance: Operational monitoring and capacity planning
+  # ===========================================================================
+  - name: ledger_medium
+    interval: 5m
+    rules:
+      
+      # Moderate replication lag
+      - alert: LedgerReplicationLagWarning
+        expr: pg_replication_lag{job="ledger-postgres"} > 30
+        for: 5m
+        labels:
+          severity: warning
+          team: dba
+          compliance: "ISO/IEC 27031:2025"
+        annotations:
+          summary: "Replication lag elevated"
+          description: "Replication lag is {{ $value }} seconds"
+          
+      # Checkpoint frequency too high
+      - alert: LedgerFrequentCheckpoints
+        expr: rate(pg_stat_bgwriter_checkpoints_req[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          team: dba
+          compliance: "ISO/IEC 27001:2022 A.12.1"
+        annotations:
+          summary: "Frequent checkpoints detected"
+          description: "Requested checkpoints are occurring too frequently"
+          
+      # Vacuum lag on large tables
+      - alert: LedgerVacuumLag
+        expr: |
+          pg_stat_user_tables_n_dead_tup{job="ledger-postgres", relname="transactions"} 
+          / pg_stat_user_tables_n_live_tup{job="ledger-postgres", relname="transactions"} * 100 > 20
+        for: 15m
+        labels:
+          severity: warning
+          team: dba
+          compliance: "ISO/IEC 27040:2024"
+        annotations:
+          summary: "High dead tuple ratio in transactions table"
+          description: "Dead tuple ratio is {{ $value }}%"
+          
+      # Partition creation failures
+      - alert: LedgerPartitionCreationFailed
+        expr: ledger_partition_creation_failures_total > 0
+        for: 0m
+        labels:
+          severity: warning
+          team: dba
+          compliance: "ISO/IEC 27040:2024"
+        annotations:
+          summary: "Partition creation failed"
+          description: "Failed to create required partitions"
+          
+      # EOD processing delay
+      # Compliance: ISO/IEC 27001:2022 A.12.3 - Backup validation timing
+      - alert: LedgerEODProcessingDelay
+        expr: |
+          time() - ledger_eod_last_successful_run > 90000
+        for: 5m
+        labels:
+          severity: warning
+          team: ledger-ops
+          compliance: "ISO/IEC 27001:2022 A.12.3"
+        annotations:
+          summary: "EOD processing is delayed"
+          description: "Last successful EOD was more than 25 hours ago"
+          
+      # Materialized view refresh lag
+      - alert: LedgerMaterializedViewStale
+        expr: |
+          time() - ledger_mv_last_refresh{view_name=~"mv_daily_transaction_summary"} > 600
+        for: 5m
+        labels:
+          severity: warning
+          team: ledger-ops
+          compliance: "ISO/IEC 27001:2022 A.12.1"
+        annotations:
+          summary: "Materialized view is stale"
+          description: "{{ $labels.view_name }} hasn't refreshed in 10 minutes"
+          
+      # Archival job failures
+      # Compliance: ISO/IEC 27001:2022 A.12.3 - Backup/archival
+      - alert: LedgerArchivalFailures
+        expr: increase(ledger_archival_failures_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          team: dba
+          compliance: "ISO/IEC 27001:2022 A.12.3"
+        annotations:
+          summary: "Archival job failures detected"
+          description: "Archival jobs have failed in the last hour"
+
+  # ===========================================================================
+  # LOW SEVERITY / INFO ALERTS
+  # Compliance: Informational monitoring
+  # ===========================================================================
+  - name: ledger_info
+    interval: 15m
+    rules:
+      
+      # Daily transaction volume report
+      - alert: LedgerDailyVolumeReport
+        expr: ledger_transactions_created_total > 0
+        labels:
+          severity: info
+          team: ledger-ops
+          compliance: "ISO/IEC 27001:2022 A.12.1"
+        annotations:
+          summary: "Daily transaction volume"
+          description: "Daily report: {{ $value }} transactions processed"
+          
+      # Storage growth rate
+      - alert: LedgerStorageGrowth
+        expr: |
+          (
+            pg_database_size_bytes{job="ledger-postgres", datname="ledger"} 
+            - pg_database_size_bytes{job="ledger-postgres", datname="ledger"} offset 1d
+          ) / pg_database_size_bytes{job="ledger-postgres", datname="ledger"} offset 1d * 100 > 10
+        for: 1h
+        labels:
+          severity: info
+          team: dba
+          compliance: "ISO/IEC 27040:2024"
+        annotations:
+          summary: "Database growing rapidly"
+          description: "Database size increased by {{ $value }}% in 24 hours"
+          
+      # Long-running transaction warning
+      - alert: LedgerLongRunningTransaction
+        expr: pg_stat_activity_max_tx_duration{job="ledger-postgres"} > 300
+        for: 5m
+        labels:
+          severity: info
+          team: dba
+          compliance: "ISO/IEC 27001:2022 A.12.1"
+        annotations:
+          summary: "Long-running transaction detected"
+          description: "Transaction has been running for {{ $value }} seconds"
+
+  # ===========================================================================
+  # BUSINESS METRICS ALERTS
+  # Compliance: Financial and operational integrity
+  # ===========================================================================
+  - name: ledger_business
+    interval: 5m
+    rules:
+      
+      # Transaction failure rate spike
+      - alert: LedgerTransactionFailureRate
+        expr: |
+          (
+            rate(ledger_transactions_failed_total[5m])
+            / rate(ledger_transactions_created_total[5m])
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: high
+          team: ledger-core
+          compliance: "ISO/IEC 27001:2022 A.12.1"
+        annotations:
+          summary: "Transaction failure rate elevated"
+          description: "Failure rate is {{ $value | humanizePercentage }}"
+          
+      # Balance reconciliation failure
+      # Compliance: ISO/IEC 27001:2022 A.5.24 - Compliance verification
+      - alert: LedgerBalanceReconciliationFail
+        expr: ledger_balance_reconciliation_status != 1
+        for: 2m
+        labels:
+          severity: critical
+          team: ledger-core
+          compliance: "ISO/IEC 27001:2022 A.5.24"
+        annotations:
+          summary: "Balance reconciliation failing"
+          description: "Account balance reconciliation check failed"
+          compliance_ref: "A.5.24 - Information security compliance"
+          
+      # Audit log gap detected
+      # Compliance: ISO/IEC 27001:2022 A.12.4 - Logging integrity
+      - alert: LedgerAuditLogGap
+        expr: |
+          ledger_audit_log_sequence_gap > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: security
+          compliance: "ISO/IEC 27001:2022 A.12.4"
+        annotations:
+          summary: "Audit log sequence gap detected"
+          description: "Possible audit log tampering or data loss"
+          compliance_ref: "A.12.4 - Logging and monitoring"
+
+  # ===========================================================================
+  # INFRASTRUCTURE ALERTS
+  # Compliance: Security and availability monitoring
+  # ===========================================================================
+  - name: ledger_infrastructure
+    interval: 1m
+    rules:
+      
+      # PgBouncer connection pool exhaustion
+      - alert: LedgerPgBouncerPoolExhausted
+        expr: pgbouncer_pools_client_active_connections / pgbouncer_pools_max_connections > 0.9
+        for: 2m
+        labels:
+          severity: high
+          team: dba
+          compliance: "ISO/IEC 27001:2022 A.12.1"
+        annotations:
+          summary: "PgBouncer connection pool near exhaustion"
+          description: "Pool utilization is {{ $value | humanizePercentage }}"
+          
+      # SSL certificate expiry
+      # Compliance: ISO/IEC 27040:2024 - Encryption key management
+      - alert: LedgerSSLCertExpiry
+        expr: (pg_ssl_cert_expiry_seconds - time()) / 86400 < 30
+        for: 1h
+        labels:
+          severity: warning
+          team: dba
+          compliance: "ISO/IEC 27040:2024"
+        annotations:
+          summary: "SSL certificate expiring soon"
+          description: "SSL certificate expires in {{ $value | humanizeDuration }}"
+          compliance_ref: "Storage security - Cryptographic key lifecycle"
+
+# =============================================================================
+# ALERT ROUTING CONFIGURATION - ISO/IEC 27001:2022 A.16.1 (Incident Mgmt)
+# =============================================================================
+# Configure AlertManager with these routes:
+# - critical -> PagerDuty immediately
+# - high -> Slack #alerts-high + PagerDuty (15min delay)
+# - warning -> Slack #alerts-warning
+# - info -> Slack #alerts-info (business hours only)
+#
+# Compliance: All alerts must be logged for audit purposes
+# Retention: Alert history retained for 7 years
+# =============================================================================
