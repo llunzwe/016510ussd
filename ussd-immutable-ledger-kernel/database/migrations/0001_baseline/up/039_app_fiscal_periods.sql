@@ -176,218 +176,233 @@ CLOSING VALIDATION:
 
 
 -- =============================================================================
--- TODO: Create fiscal_years table
+-- IMPLEMENTED: Create fiscal_years table
 -- DESCRIPTION: Fiscal year definitions
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [FP-001] Create app.fiscal_years table
--- INSTRUCTIONS:
---   - Fiscal year boundaries
---   - May differ from calendar year
---   - Per-application configuration
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.fiscal_years (
---       year_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Identity
---       year_number         INTEGER NOT NULL,
---       year_name           VARCHAR(50) NOT NULL,
---       
---       -- Scope
---       application_id      UUID REFERENCES app.applications(application_id),
---       
---       -- Dates
---       start_date          DATE NOT NULL,
---       end_date            DATE NOT NULL,
---       
---       -- Status
---       status              VARCHAR(20) DEFAULT 'OPEN',  -- OPEN, CLOSING, CLOSED
---       
---       -- Closing
---       closed_at           TIMESTAMPTZ,
---       closed_by           UUID REFERENCES core.accounts(account_id),
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
---
+-- [FP-001] Create app.fiscal_years table
+CREATE TABLE app.fiscal_years (
+    year_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Identity
+    year_number         INTEGER NOT NULL,
+    year_name           VARCHAR(50) NOT NULL,
+    
+    -- Scope
+    application_id      UUID REFERENCES app.applications(application_id),
+    
+    -- Dates
+    start_date          DATE NOT NULL,
+    end_date            DATE NOT NULL,
+    
+    -- Status
+    status              VARCHAR(20) DEFAULT 'OPEN',  -- OPEN, CLOSING, CLOSED
+    
+    -- Closing
+    closed_at           TIMESTAMPTZ,
+    closed_by           UUID REFERENCES core.accounts(account_id),
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- CONSTRAINTS:
---   - UNIQUE (application_id, year_number)
---   - CHECK (end_date > start_date)
+CREATE UNIQUE INDEX idx_fiscal_years_app_number 
+    ON app.fiscal_years (application_id, year_number);
+
+ALTER TABLE app.fiscal_years
+    ADD CONSTRAINT chk_fiscal_years_dates 
+        CHECK (end_date > start_date);
+
+COMMENT ON TABLE app.fiscal_years IS 'Fiscal year definitions per application';
 
 -- =============================================================================
--- TODO: Create fiscal_periods table
+-- IMPLEMENTED: Create fiscal_periods table
 -- DESCRIPTION: Individual periods (months, quarters)
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [FP-002] Create app.fiscal_periods table
--- INSTRUCTIONS:
---   - Individual periods within fiscal year
---   - Period locking support
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.fiscal_periods (
---       period_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Identity
---       period_code         VARCHAR(20) NOT NULL,        -- "2024-01", "2024-Q1"
---       period_name         VARCHAR(50) NOT NULL,
---       
---       -- Classification
---       period_type         VARCHAR(20) NOT NULL,        -- MONTH, QUARTER, YEAR, CUSTOM
---       
---       -- Parent
---       fiscal_year_id      UUID REFERENCES app.fiscal_years(year_id),
---       parent_period_id    UUID REFERENCES app.fiscal_periods(period_id),
---       
---       -- Scope
---       application_id      UUID REFERENCES app.applications(application_id),
---       
---       -- Dates
---       start_date          DATE NOT NULL,
---       end_date            DATE NOT NULL,
---       
---       -- Status
---       status              VARCHAR(20) DEFAULT 'OPEN',  -- OPEN, CLOSING, CLOSED, FROZEN
---       
---       -- Closing
---       pre_closed_at       TIMESTAMPTZ,
---       closed_at           TIMESTAMPTZ,
---       closed_by           UUID REFERENCES core.accounts(account_id),
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
---
+-- [FP-002] Create app.fiscal_periods table
+CREATE TABLE app.fiscal_periods (
+    period_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Identity
+    period_code         VARCHAR(20) NOT NULL,        -- "2024-01", "2024-Q1"
+    period_name         VARCHAR(50) NOT NULL,
+    
+    -- Classification
+    period_type         VARCHAR(20) NOT NULL,        -- MONTH, QUARTER, YEAR, CUSTOM
+    
+    -- Parent
+    fiscal_year_id      UUID REFERENCES app.fiscal_years(year_id),
+    parent_period_id    UUID REFERENCES app.fiscal_periods(period_id),
+    
+    -- Scope
+    application_id      UUID REFERENCES app.applications(application_id),
+    
+    -- Dates
+    start_date          DATE NOT NULL,
+    end_date            DATE NOT NULL,
+    
+    -- Status
+    status              VARCHAR(20) DEFAULT 'OPEN',  -- OPEN, CLOSING, CLOSED, FROZEN
+    
+    -- Closing
+    pre_closed_at       TIMESTAMPTZ,
+    closed_at           TIMESTAMPTZ,
+    closed_by           UUID REFERENCES core.accounts(account_id),
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- CONSTRAINTS:
---   - UNIQUE (application_id, period_code)
---   - CHECK (end_date > start_date)
+CREATE UNIQUE INDEX idx_fiscal_periods_app_code 
+    ON app.fiscal_periods (application_id, period_code);
+
+ALTER TABLE app.fiscal_periods
+    ADD CONSTRAINT chk_fiscal_periods_dates 
+        CHECK (end_date > start_date);
+
+COMMENT ON TABLE app.fiscal_periods IS 'Individual fiscal periods (months, quarters) per application';
 
 -- =============================================================================
--- TODO: Create get_current_period function
+-- IMPLEMENTED: Create get_current_period function
 -- DESCRIPTION: Get current fiscal period
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [FP-003] Create get_current_fiscal_period function
--- INSTRUCTIONS:
---   - Find period containing current date
---   - Or latest open period
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.get_current_fiscal_period(
---       p_application_id UUID DEFAULT NULL,
---       p_date DATE DEFAULT CURRENT_DATE
---   ) RETURNS UUID AS $$
---   DECLARE
---       v_period_id UUID;
---   BEGIN
---       SELECT period_id INTO v_period_id
---       FROM app.fiscal_periods
---       WHERE (application_id = p_application_id OR p_application_id IS NULL)
---           AND start_date <= p_date AND end_date >= p_date
---       ORDER BY start_date DESC
---       LIMIT 1;
---       
---       RETURN v_period_id;
---   END;
---   $$ LANGUAGE plpgsql STABLE;
+-- [FP-003] Create get_current_fiscal_period function
+CREATE OR REPLACE FUNCTION app.get_current_fiscal_period(
+    p_application_id UUID DEFAULT NULL,
+    p_date DATE DEFAULT CURRENT_DATE
+) RETURNS UUID AS $$
+DECLARE
+    v_period_id UUID;
+BEGIN
+    SELECT period_id INTO v_period_id
+    FROM app.fiscal_periods
+    WHERE (application_id = p_application_id OR p_application_id IS NULL)
+        AND start_date <= p_date AND end_date >= p_date
+    ORDER BY start_date DESC
+    LIMIT 1;
+    
+    RETURN v_period_id;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION app.get_current_fiscal_period IS 'Gets the current fiscal period for a date';
 
 -- =============================================================================
--- TODO: Create close_period function
+-- IMPLEMENTED: Create close_period function
 -- DESCRIPTION: Close fiscal period
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [FP-004] Create close_fiscal_period function
--- INSTRUCTIONS:
---   - Verify all prior periods closed
---   - Check for unposted transactions
---   - Run accruals
---   - Lock period
---   - Create next period if needed
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.close_fiscal_period(
---       p_period_id UUID,
---       p_closed_by UUID
---   ) RETURNS VARCHAR AS $$
---   DECLARE
---       v_period RECORD;
---       v_unposted INTEGER;
---   BEGIN
---       -- Get period
---       SELECT * INTO v_period FROM app.fiscal_periods WHERE period_id = p_period_id;
---       
---       -- Check prior periods
---       IF EXISTS (
---           SELECT 1 FROM app.fiscal_periods
---           WHERE application_id = v_period.application_id
---               AND end_date < v_period.start_date
---               AND status != 'CLOSED'
---       ) THEN
---           RAISE EXCEPTION 'Prior periods must be closed first';
---       END IF;
---       
---       -- Check for unposted transactions
---       SELECT COUNT(*) INTO v_unposted
---       FROM core.movement_headers
---       WHERE accounting_date BETWEEN v_period.start_date AND v_period.end_date
---           AND status != 'POSTED';
---       
---       IF v_unposted > 0 THEN
---           RAISE EXCEPTION 'Unposted transactions exist in period';
---       END IF;
---       
---       -- Close period
---       UPDATE app.fiscal_periods
---       SET status = 'CLOSED', closed_at = now(), closed_by = p_closed_by
---       WHERE period_id = p_period_id;
---       
---       RETURN 'CLOSED';
---   END;
---   $$ LANGUAGE plpgsql;
+-- [FP-004] Create close_fiscal_period function
+CREATE OR REPLACE FUNCTION app.close_fiscal_period(
+    p_period_id UUID,
+    p_closed_by UUID
+) RETURNS VARCHAR AS $$
+DECLARE
+    v_period RECORD;
+    v_unposted INTEGER;
+BEGIN
+    -- Get period
+    SELECT * INTO v_period FROM app.fiscal_periods WHERE period_id = p_period_id;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Period not found: %', p_period_id;
+    END IF;
+    
+    -- Check prior periods
+    IF EXISTS (
+        SELECT 1 FROM app.fiscal_periods
+        WHERE application_id = v_period.application_id
+            AND end_date < v_period.start_date
+            AND status != 'CLOSED'
+    ) THEN
+        RAISE EXCEPTION 'Prior periods must be closed first';
+    END IF;
+    
+    -- Check for unposted transactions (using movement_headers if available)
+    SELECT COUNT(*) INTO v_unposted
+    FROM core.movement_headers
+    WHERE accounting_date BETWEEN v_period.start_date AND v_period.end_date
+        AND status != 'POSTED';
+    
+    IF v_unposted > 0 THEN
+        RAISE EXCEPTION 'Unposted transactions exist in period';
+    END IF;
+    
+    -- Close period
+    UPDATE app.fiscal_periods
+    SET status = 'CLOSED', closed_at = now(), closed_by = p_closed_by
+    WHERE period_id = p_period_id;
+    
+    RETURN 'CLOSED';
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION app.close_fiscal_period IS 'Closes a fiscal period after validation';
 
 -- =============================================================================
--- TODO: Create period status view
+-- IMPLEMENTED: Create period status view
 -- DESCRIPTION: Period status summary
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [FP-005] Create period_status view
--- INSTRUCTIONS:
---   - Show period status
---   - Transaction counts
---   - Balance summary
+-- [FP-005] Create period_status view
+CREATE VIEW app.period_status AS
+SELECT 
+    fp.*,
+    fy.year_name,
+    CASE 
+        WHEN fp.status = 'OPEN' THEN 'Transactions allowed'
+        WHEN fp.status = 'CLOSING' THEN 'Closing in progress'
+        WHEN fp.status = 'CLOSED' THEN 'Period locked'
+        WHEN fp.status = 'FROZEN' THEN 'Temporarily frozen'
+    END as status_description,
+    CURRENT_DATE BETWEEN fp.start_date AND fp.end_date as is_current_period
+FROM app.fiscal_periods fp
+LEFT JOIN app.fiscal_years fy ON fp.fiscal_year_id = fy.year_id;
+
+COMMENT ON VIEW app.period_status IS 'Fiscal period status summary with year information';
 
 -- =============================================================================
--- TODO: Create fiscal period indexes
+-- IMPLEMENTED: Create fiscal period indexes
 -- DESCRIPTION: Optimize period queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [FP-006] Create fiscal period indexes
--- INDEX LIST:
---   -- Years:
---   - PRIMARY KEY (year_id)
---   - UNIQUE (application_id, year_number)
---   - INDEX on (application_id, status)
---   -- Periods:
---   - PRIMARY KEY (period_id)
---   - UNIQUE (application_id, period_code)
---   - INDEX on (application_id, start_date, end_date)
---   - INDEX on (fiscal_year_id, period_type)
---   - INDEX on (status, application_id)
+-- [FP-006] Create fiscal period indexes
+-- Years:
+-- PRIMARY KEY (year_id) - created with table
+-- UNIQUE (application_id, year_number) - created above
+
+CREATE INDEX idx_fiscal_years_app_status 
+    ON app.fiscal_years (application_id, status);
+
+-- Periods:
+-- PRIMARY KEY (period_id) - created with table
+-- UNIQUE (application_id, period_code) - created above
+
+CREATE INDEX idx_fiscal_periods_app_dates 
+    ON app.fiscal_periods (application_id, start_date, end_date);
+
+CREATE INDEX idx_fiscal_periods_year_type 
+    ON app.fiscal_periods (fiscal_year_id, period_type);
+
+CREATE INDEX idx_fiscal_periods_status_app 
+    ON app.fiscal_periods (status, application_id);
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create fiscal_years table
-□ Create fiscal_periods table
-□ Implement get_current_fiscal_period function
-□ Implement close_fiscal_period function
-□ Create period_status view
-□ Add all indexes for period queries
-□ Test period closing workflow
-□ Test prior period validation
-□ Verify period locking
-□ Add seed fiscal periods
+☑ Create fiscal_years table
+☑ Create fiscal_periods table
+☑ Implement get_current_fiscal_period function
+☑ Implement close_fiscal_period function
+☑ Create period_status view
+☑ Add all indexes for period queries
+☐ Test period closing workflow
+☐ Test prior period validation
+☐ Verify period locking
+☐ Add seed fiscal periods
 ================================================================================
 */

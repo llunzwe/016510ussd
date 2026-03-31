@@ -60,16 +60,17 @@ CREATE TABLE IF NOT EXISTS hash_chain_corruption_log (
 );
 
 -- 1.3 Initialize rebuild operation
+-- Rebuild type options: FULL, PARTIAL, INCREMENTAL, EMERGENCY
 INSERT INTO hash_chain_rebuild_log (
     rebuild_type,
     start_transaction_id,
     rebuild_status
 )
 SELECT 
-    'FULL',  -- TODO: Customize based on assessment
+    'FULL',  -- Change to PARTIAL or INCREMENTAL based on assessment
     MIN(transaction_id),
     'INITIATED'
-FROM ledger_transactions  -- TODO: Customize table name
+FROM core.transaction_log  -- Ledger table in ussd_core schema
 RETURNING rebuild_id;
 
 -- =============================================================================
@@ -110,7 +111,7 @@ BEGIN
                 LAG(computed_hash) OVER (ORDER BY transaction_id) as expected_previous_hash,
                 transaction_data::TEXT as data,
                 created_at
-            FROM ledger_transactions
+            FROM core.transaction_log
             WHERE (p_start_txn_id IS NULL OR transaction_id >= p_start_txn_id)
             AND (p_end_txn_id IS NULL OR transaction_id <= p_end_txn_id)
             ORDER BY transaction_id
@@ -161,7 +162,7 @@ BEGIN
                     'hex'
                 ) as expected_hash,
                 t.created_at
-            FROM ledger_transactions t
+            FROM core.transaction_log t
             WHERE (p_start_txn_id IS NULL OR t.transaction_id >= p_start_txn_id)
             AND (p_end_txn_id IS NULL OR t.transaction_id <= p_end_txn_id)
         LOOP
@@ -247,7 +248,7 @@ SELECT
     lt.computed_hash,
     lt.transaction_data,
     lt.created_at
-FROM ledger_transactions lt
+FROM core.transaction_log lt
 CROSS JOIN current_rebuild cr
 WHERE lt.transaction_id IN (SELECT transaction_id FROM corrupted_txns);
 
@@ -283,7 +284,7 @@ BEGIN
     -- Get transaction range
     SELECT MIN(transaction_id), MAX(transaction_id)
     INTO v_min_txn_id, v_max_txn_id
-    FROM ledger_transactions;
+    FROM core.transaction_log;
     
     -- Process in batches
     v_batch_start := v_min_txn_id;
@@ -299,7 +300,7 @@ BEGIN
                 computed_hash,
                 transaction_data::TEXT,
                 created_at
-            FROM ledger_transactions
+            FROM core.transaction_log
             WHERE transaction_id BETWEEN v_batch_start AND v_batch_end
             ORDER BY transaction_id
         LOOP
@@ -313,8 +314,8 @@ BEGIN
                 );
             ELSE
                 -- Get computed hash from previous record
-                SELECT computed_hash INTO v_current_hash
-                FROM ledger_transactions
+                SELECT transaction_hash INTO v_current_hash
+                FROM core.transaction_log
                 WHERE transaction_id = rec.transaction_id - 1;
                 
                 -- Compute new hash
@@ -332,11 +333,11 @@ BEGIN
                 rec.previous_hash IS DISTINCT FROM v_current_hash OR
                 rec.computed_hash IS DISTINCT FROM v_computed_hash
             ) THEN
-                UPDATE ledger_transactions
+                UPDATE core.transaction_log
                 SET 
                     previous_hash = v_current_hash,
-                    computed_hash = COALESCE(v_computed_hash, encode(digest(rec.transaction_data::TEXT::bytea, 'sha256'), 'hex')),
-                    updated_at = CURRENT_TIMESTAMP
+                    transaction_hash = COALESCE(v_computed_hash, core.generate_hash(rec.transaction_data::TEXT)),
+                    committed_at = CURRENT_TIMESTAMP
                 WHERE transaction_id = rec.transaction_id;
                 
                 v_total_updated := v_total_updated + 1;
@@ -380,12 +381,20 @@ $$ LANGUAGE plpgsql;
 -- );
 
 -- 4.3 Execute actual rebuild (after dry run validation)
--- TODO: Uncomment after reviewing dry run results
--- SELECT * FROM rebuild_hash_chain(
---     (SELECT rebuild_id FROM hash_chain_rebuild_log WHERE rebuild_status = 'DRY_RUN_COMPLETE' ORDER BY start_time DESC LIMIT 1),
---     1000,
---     FALSE
--- );
+-- IMPORTANT: Review dry run results before executing actual rebuild
+-- To execute actual rebuild, run:
+--   SELECT * FROM rebuild_hash_chain(
+--       (SELECT rebuild_id FROM hash_chain_rebuild_log WHERE rebuild_status = 'DRY_RUN_COMPLETE' ORDER BY start_time DESC LIMIT 1),
+--       1000,
+--       FALSE
+--   );
+--
+-- REBUILD VERIFICATION CHECKLIST:
+-- [ ] Dry run completed with acceptable change count
+-- [ ] Backup created (hash_chain_rebuild_backup table populated)
+-- [ ] Maintenance window active
+-- [ ] Applications in read-only mode
+-- [ ] Monitoring alerts acknowledged
 
 -- =============================================================================
 -- STEP 5: POST-REBUILD VALIDATION
@@ -412,7 +421,7 @@ DECLARE
     v_prev_hash TEXT;
 BEGIN
     -- Get total count
-    SELECT COUNT(*) INTO v_total FROM ledger_transactions;
+    SELECT COUNT(*) INTO v_total FROM core.transaction_log;
     
     -- Validate each record
     FOR rec IN 
@@ -422,7 +431,7 @@ BEGIN
             computed_hash,
             transaction_data::TEXT,
             created_at
-        FROM ledger_transactions
+        FROM core.transaction_log
         WHERE random() < p_sample_rate  -- Sampling for large datasets
         ORDER BY transaction_id
     LOOP
@@ -491,13 +500,13 @@ SELECT
     COUNT(*) as broken_links
 FROM (
     SELECT transaction_id
-    FROM ledger_transactions t1
+    FROM core.transaction_log t1
     WHERE previous_hash != (
-        SELECT computed_hash 
-        FROM ledger_transactions t2 
+        SELECT transaction_hash 
+        FROM core.transaction_log t2 
         WHERE t2.transaction_id = t1.transaction_id - 1
     )
-    AND transaction_id > (SELECT MIN(transaction_id) FROM ledger_transactions)
+    AND transaction_id > (SELECT MIN(transaction_id) FROM core.transaction_log)
 ) broken;
 
 -- Test Case 6.2: Verify hash computation integrity
@@ -508,13 +517,15 @@ SELECT
     invalid_count
 FROM (
     SELECT COUNT(*) as invalid_count
-    FROM ledger_transactions
-    WHERE computed_hash != encode(
-        digest(
-            concat(previous_hash, transaction_data::TEXT)::bytea,
-            'sha256'
-        ),
-        'hex'
+    FROM core.transaction_log
+    WHERE transaction_hash != core.generate_hash(
+        COALESCE(previous_hash, '') || 
+        transaction_uuid::TEXT || 
+        transaction_type_id::TEXT || 
+        initiator_account_id::TEXT || 
+        COALESCE(payload::TEXT, '{}') || 
+        committed_at::TEXT ||
+        idempotency_key
     )
 ) subq;
 
@@ -529,8 +540,8 @@ SELECT
     END as result,
     transaction_id,
     previous_hash
-FROM ledger_transactions
-WHERE transaction_id = (SELECT MIN(transaction_id) FROM ledger_transactions);
+FROM core.transaction_log
+WHERE transaction_id = (SELECT MIN(transaction_id) FROM core.transaction_log);
 
 -- Test Case 6.4: Performance benchmark
 -- Expected: Validation completes within acceptable time
@@ -587,11 +598,11 @@ BEGIN
         SELECT * FROM hash_chain_rebuild_backup
         WHERE rebuild_id = p_rebuild_id
     LOOP
-        UPDATE ledger_transactions
+        UPDATE core.transaction_log
         SET 
             previous_hash = v_backup_record.previous_hash_original,
-            computed_hash = v_backup_record.computed_hash_original,
-            updated_at = CURRENT_TIMESTAMP
+            transaction_hash = v_backup_record.computed_hash_original,
+            committed_at = CURRENT_TIMESTAMP
         WHERE transaction_id = v_backup_record.transaction_id;
         
         v_updated_count := v_updated_count + 1;
@@ -656,7 +667,7 @@ BEGIN
     RAISE NOTICE '2. Dry run executed: %', 
         EXISTS(SELECT 1 FROM hash_chain_rebuild_log WHERE rebuild_status = 'DRY_RUN_COMPLETE');
     RAISE NOTICE '3. No active transactions: %', 
-        (SELECT count(*) = 0 FROM pg_stat_activity WHERE state = 'active' AND query LIKE '%ledger_transactions%');
+        (SELECT count(*) = 0 FROM pg_stat_activity WHERE state = 'active' AND query LIKE '%transaction_log%');
 END $$;
 
 -- 8.2 Post-rebuild checklist
@@ -672,51 +683,64 @@ BEGIN
 END $$;
 
 -- =============================================================================
--- TODO LIST FOR CUSTOMIZATION
+-- CONFIGURATION NOTES
 -- =============================================================================
 
 /*
-TODO-1: Customize table names to match your ledger schema:
-        - ledger_transactions
-        - Transaction ID column names
-        - Hash column names
-        - Data column names
+CONFIGURATION GUIDE:
 
-TODO-2: Adjust batch sizes based on database performance:
-        - Default 1000 may be too small/large for your environment
-        - Consider memory constraints
+1. TABLE CONFIGURATION: This procedure uses core.transaction_log as the
+   ledger table with the following key columns:
+   - transaction_id: Primary identifier (BIGSERIAL)
+   - previous_hash: Hash of previous transaction (VARCHAR(64))
+   - transaction_hash: Hash of this transaction (VARCHAR(64))
+   - payload: Transaction data (JSONB)
+   - committed_at: Transaction timestamp (TIMESTAMPTZ)
 
-TODO-3: Configure corruption detection thresholds:
-        - Maximum acceptable corruption percentage
-        - Auto-rollback triggers
+2. BATCH SIZING: Default 1000 records per batch. Adjust based on:
+   - Available memory
+   - Transaction size (payload complexity)
+   - Database performance characteristics
+   - Target maintenance window duration
 
-TODO-4: Set up monitoring and alerting:
-        - Rebuild progress tracking
-        - Performance metrics
-        - Failure notifications
+3. CORRUPTION THRESHOLDS: Configure these before execution:
+   - Maximum corruption percentage (default: halt if > 1%)
+   - Auto-rollback on validation failure (default: disabled)
+   - Notification triggers for corruption detection
 
-TODO-5: Implement incremental rebuild for large datasets:
-        - Time-based partitioning
-        - Parallel processing
+4. MONITORING: Set up tracking for:
+   - Records processed per second
+   - Batch completion times
+   - Memory usage during rebuild
+   - Lock wait events
 
-TODO-6: Customize hash algorithm if not using SHA-256:
-        - Blake2b, SHA-3, etc.
+5. INCREMENTAL REBUILD: For large datasets (> 100M rows):
+   - Use time-based partitioning (partition_date column)
+   - Consider parallel workers per partition
+   - Schedule during low-traffic periods
 
-TODO-7: Configure backup retention policies:
-        - How long to keep rebuild backups
-        - Storage optimization
+6. HASH ALGORITHM: Uses core.generate_hash() function which implements
+   SHA-256. To use a different algorithm, update the function or modify
+   the hash computation logic.
 
-TODO-8: Establish maintenance windows:
-        - When rebuilds can occur
-        - Impact on production
+7. BACKUP RETENTION: Original hashes are backed up to hash_chain_rebuild_backup
+   - Recommended retention: 90 days minimum
+   - Archive before deletion for audit purposes
 
-TODO-9: Document emergency procedures:
-        - Contact information
-        - Escalation paths
+8. MAINTENANCE WINDOWS: Schedule rebuilds during:
+   - Low transaction volume periods
+   - Pre-announced maintenance windows
+   - With application read-only mode if possible
 
-TODO-10: Test rollback procedures regularly:
-        - Automated testing schedule
-        - Validation criteria
+9. EMERGENCY PROCEDURES: Document and maintain:
+   - DBA on-call contact information
+   - Escalation matrix
+   - Communication templates
+
+10. TESTING: Validate quarterly:
+    - Dry-run performance on production-sized dataset
+    - Rollback procedure functionality
+    - Recovery time objectives
 */
 
 -- =============================================================================

@@ -29,8 +29,8 @@
 --   Verification Controls - Continuous integrity monitoring
 -- =============================================================================
 
--- TODO: Ensure pg_cron extension is installed
--- CREATE EXTENSION IF NOT EXISTS pg_cron;
+-- Ensure pg_cron extension is installed
+CREATE EXTENSION IF NOT EXISTS pg_cron;
 
 -- Reconciliation configuration
 CREATE TABLE IF NOT EXISTS ledger.reconciliation_config (
@@ -245,56 +245,353 @@ BEGIN
 END;
 $$;
 
--- Payment gateway reconciliation (placeholder)
+-- Payment gateway reconciliation (Stripe implementation)
+-- PCI DSS: Validate payment processor totals match internal ledger
 CREATE OR REPLACE FUNCTION ledger.reconcile_payment_gateway(
     p_run_id BIGINT, p_start TIMESTAMPTZ, p_end TIMESTAMPTZ
 )
-RETURNS JSONB AS $$
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_source_total NUMERIC := 0;
+    v_target_total NUMERIC := 0;
+    v_discrepancy_count INT := 0;
+    v_stripe_record RECORD;
+    v_ledger_record RECORD;
 BEGIN
-    -- TODO: Implement Stripe/payment gateway API integration
+    -- Calculate internal ledger totals for gateway transactions
+    SELECT 
+        COALESCE(SUM(amount), 0),
+        COUNT(*)
+    INTO v_source_total
+    FROM ledger.transactions t
+    JOIN ledger.payment_methods pm ON t.payment_method_id = pm.method_id
+    WHERE t.created_at BETWEEN p_start AND p_end
+      AND pm.gateway_name = 'STRIPE'
+      AND t.status IN ('COMPLETED', 'SETTLED');
+    
+    -- Query Stripe settlement records (from external_feeds table)
+    SELECT 
+        COALESCE(SUM(settlement_amount), 0),
+        COUNT(*)
+    INTO v_target_total
+    FROM ledger.external_gateway_settlements
+    WHERE gateway_name = 'STRIPE'
+      AND settlement_date BETWEEN DATE(p_start) AND DATE(p_end)
+      AND status = 'SETTLED';
+    
+    -- Check for transaction-level discrepancies
+    FOR v_ledger_record IN
+        SELECT 
+            t.transaction_id,
+            t.external_reference,
+            t.amount,
+            t.fee,
+            t.net_amount
+        FROM ledger.transactions t
+        JOIN ledger.payment_methods pm ON t.payment_method_id = pm.method_id
+        WHERE t.created_at BETWEEN p_start AND p_end
+          AND pm.gateway_name = 'STRIPE'
+          AND t.status IN ('COMPLETED', 'SETTLED')
+    LOOP
+        -- Check if exists in Stripe settlements
+        IF NOT EXISTS (
+            SELECT 1 FROM ledger.external_gateway_settlements s
+            WHERE s.gateway_reference = v_ledger_record.external_reference
+        ) THEN
+            v_discrepancy_count := v_discrepancy_count + 1;
+            
+            INSERT INTO ledger.reconciliation_discrepancies (
+                run_id, discrepancy_type, source_id, source_amount, difference
+            ) VALUES (
+                p_run_id, 'MISSING_TARGET', v_ledger_record.transaction_id::TEXT, 
+                v_ledger_record.amount, v_ledger_record.amount
+            );
+        END IF;
+    END LOOP;
+    
+    -- Check for orphaned Stripe records (not in our ledger)
+    FOR v_stripe_record IN
+        SELECT 
+            s.gateway_reference,
+            s.settlement_amount
+        FROM ledger.external_gateway_settlements s
+        WHERE s.gateway_name = 'STRIPE'
+          AND s.settlement_date BETWEEN DATE(p_start) AND DATE(p_end)
+          AND NOT EXISTS (
+              SELECT 1 FROM ledger.transactions t
+              WHERE t.external_reference = s.gateway_reference
+          )
+    LOOP
+        v_discrepancy_count := v_discrepancy_count + 1;
+        
+        INSERT INTO ledger.reconciliation_discrepancies (
+            run_id, discrepancy_type, target_id, target_amount, difference
+        ) VALUES (
+            p_run_id, 'MISSING_SOURCE', v_stripe_record.gateway_reference,
+            v_stripe_record.settlement_amount, -v_stripe_record.settlement_amount
+        );
+    END LOOP;
+    
+    -- Check for amount mismatches
+    INSERT INTO ledger.reconciliation_discrepancies (
+        run_id, discrepancy_type, source_id, target_id, 
+        source_amount, target_amount, difference
+    )
+    SELECT 
+        p_run_id,
+        'AMOUNT_MISMATCH',
+        t.transaction_id::TEXT,
+        s.gateway_reference,
+        t.net_amount,
+        s.settlement_amount,
+        t.net_amount - s.settlement_amount
+    FROM ledger.transactions t
+    JOIN ledger.payment_methods pm ON t.payment_method_id = pm.method_id
+    JOIN ledger.external_gateway_settlements s ON t.external_reference = s.gateway_reference
+    WHERE t.created_at BETWEEN p_start AND p_end
+      AND pm.gateway_name = 'STRIPE'
+      AND ABS(t.net_amount - s.settlement_amount) > 0.01;
+    
+    GET DIAGNOSTICS v_discrepancy_count = ROW_COUNT;
+    
     RETURN jsonb_build_object(
-        'source_total', 0,
-        'target_total', 0,
-        'difference', 0,
-        'discrepancy_count', 0,
-        'status', 'NOT_IMPLEMENTED'
+        'source_total', v_source_total,
+        'target_total', v_target_total,
+        'difference', v_source_total - v_target_total,
+        'discrepancy_count', v_discrepancy_count,
+        'status', CASE WHEN v_discrepancy_count = 0 THEN 'MATCHED' ELSE 'DISCREPANCIES' END
     );
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
--- Bank settlement reconciliation (placeholder)
+-- Bank settlement reconciliation
+-- ISO/IEC 27001 A.12.4: Validate external financial records
 CREATE OR REPLACE FUNCTION ledger.reconcile_bank_settlement(
     p_run_id BIGINT, p_start TIMESTAMPTZ, p_end TIMESTAMPTZ
 )
-RETURNS JSONB AS $$
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_source_total NUMERIC := 0;
+    v_target_total NUMERIC := 0;
+    v_discrepancy_count INT := 0;
+    v_bank_record RECORD;
+    v_ledger_record RECORD;
 BEGIN
-    -- TODO: Implement bank feed SFTP/API integration
+    -- Calculate internal ledger bank-related totals
+    SELECT 
+        COALESCE(SUM(
+            CASE 
+                WHEN transaction_type = 'BANK_DEPOSIT' THEN amount
+                WHEN transaction_type = 'BANK_WITHDRAWAL' THEN -amount
+                ELSE 0
+            END
+        ), 0)
+    INTO v_source_total
+    FROM ledger.transactions
+    WHERE created_at BETWEEN p_start AND p_end
+      AND transaction_type IN ('BANK_DEPOSIT', 'BANK_WITHDRAWAL')
+      AND status = 'COMPLETED';
+    
+    -- Get bank statement totals from imported feed
+    SELECT 
+        COALESCE(SUM(
+            CASE 
+                WHEN transaction_type = 'CREDIT' THEN amount
+                WHEN transaction_type = 'DEBIT' THEN -amount
+                ELSE 0
+            END
+        ), 0)
+    INTO v_target_total
+    FROM ledger.bank_statement_lines
+    WHERE transaction_date BETWEEN DATE(p_start) AND DATE(p_end)
+      AND reconciliation_status != 'EXCLUDED';
+    
+    -- Match transactions by amount and approximate date
+    FOR v_ledger_record IN
+        SELECT 
+            t.transaction_id,
+            t.amount,
+            t.created_at,
+            t.reference_number
+        FROM ledger.transactions t
+        WHERE t.created_at BETWEEN p_start AND p_end
+          AND t.transaction_type IN ('BANK_DEPOSIT', 'BANK_WITHDRAWAL')
+          AND t.status = 'COMPLETED'
+          AND NOT EXISTS (
+              SELECT 1 FROM ledger.reconciliation_matches m
+              WHERE m.ledger_transaction_id = t.transaction_id
+                AND m.reconciliation_type = 'BANK_SETTLEMENT'
+          )
+    LOOP
+        -- Look for matching bank statement line
+        SELECT * INTO v_bank_record
+        FROM ledger.bank_statement_lines b
+        WHERE b.transaction_date BETWEEN DATE(v_ledger_record.created_at - INTERVAL '3 days')
+                                     AND DATE(v_ledger_record.created_at + INTERVAL '3 days')
+          AND ABS(b.amount - v_ledger_record.amount) < 0.01
+          AND b.reconciliation_status = 'UNRECONCILED'
+        ORDER BY ABS(EXTRACT(EPOCH FROM (b.transaction_date::TIMESTAMPTZ - v_ledger_record.created_at)))
+        LIMIT 1;
+        
+        IF FOUND THEN
+            -- Create match
+            INSERT INTO ledger.reconciliation_matches (
+                reconciliation_type,
+                ledger_transaction_id,
+                external_reference,
+                match_amount,
+                matched_at
+            ) VALUES (
+                'BANK_SETTLEMENT',
+                v_ledger_record.transaction_id,
+                v_bank_record.statement_line_id::TEXT,
+                v_ledger_record.amount,
+                NOW()
+            );
+            
+            -- Update bank statement line status
+            UPDATE ledger.bank_statement_lines
+            SET reconciliation_status = 'RECONCILED',
+                reconciled_transaction_id = v_ledger_record.transaction_id
+            WHERE statement_line_id = v_bank_record.statement_line_id;
+        ELSE
+            -- Record discrepancy
+            v_discrepancy_count := v_discrepancy_count + 1;
+            
+            INSERT INTO ledger.reconciliation_discrepancies (
+                run_id, discrepancy_type, source_id, source_amount, difference
+            ) VALUES (
+                p_run_id, 'MISSING_TARGET', v_ledger_record.transaction_id::TEXT,
+                v_ledger_record.amount, v_ledger_record.amount
+            );
+        END IF;
+    END LOOP;
+    
+    -- Count unreconciled bank statement lines as discrepancies
+    SELECT COUNT(*) INTO v_discrepancy_count
+    FROM ledger.bank_statement_lines
+    WHERE transaction_date BETWEEN DATE(p_start) AND DATE(p_end)
+      AND reconciliation_status = 'UNRECONCILED';
+    
     RETURN jsonb_build_object(
-        'source_total', 0,
-        'target_total', 0,
-        'difference', 0,
-        'discrepancy_count', 0,
-        'status', 'NOT_IMPLEMENTED'
+        'source_total', v_source_total,
+        'target_total', v_target_total,
+        'difference', v_source_total - v_target_total,
+        'discrepancy_count', v_discrepancy_count,
+        'status', CASE WHEN v_discrepancy_count = 0 THEN 'MATCHED' ELSE 'DISCREPANCIES' END
     );
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
--- Inter-system reconciliation (placeholder)
+-- Inter-system reconciliation
+-- ISO/IEC 27031: Cross-datacenter consistency validation
 CREATE OR REPLACE FUNCTION ledger.reconcile_inter_system(
     p_run_id BIGINT, p_start TIMESTAMPTZ, p_end TIMESTAMPTZ
 )
-RETURNS JSONB AS $$
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_primary_hash TEXT;
+    v_replica_hash TEXT;
+    v_source_total NUMERIC;
+    v_target_total NUMERIC;
+    v_mismatched_records INT := 0;
+    v_primary_record RECORD;
 BEGIN
-    -- TODO: Implement cross-datacenter consistency checks
+    -- Calculate hash of primary system transactions
+    SELECT 
+        MD5(string_agg(
+            transaction_id::TEXT || amount::TEXT || status::TEXT, 
+            ',' ORDER BY transaction_id
+        )),
+        COUNT(*),
+        COALESCE(SUM(amount), 0)
+    INTO v_primary_hash, v_source_total
+    FROM ledger.transactions
+    WHERE created_at BETWEEN p_start AND p_end
+      AND status IN ('COMPLETED', 'SETTLED');
+    
+    -- Calculate hash of replica system (using foreign table or dblink)
+    -- Note: This assumes a foreign table 'ledger.transactions_replica' exists
+    SELECT 
+        MD5(string_agg(
+            transaction_id::TEXT || amount::TEXT || status::TEXT, 
+            ',' ORDER BY transaction_id
+        )),
+        COUNT(*),
+        COALESCE(SUM(amount), 0)
+    INTO v_replica_hash, v_target_total
+    FROM ledger.transactions_replica
+    WHERE created_at BETWEEN p_start AND p_end
+      AND status IN ('COMPLETED', 'SETTLED');
+    
+    -- Compare hashes
+    IF v_primary_hash != v_replica_hash THEN
+        -- Find specific mismatched records
+        FOR v_primary_record IN
+            SELECT transaction_id, amount, status, hash
+            FROM (
+                SELECT 
+                    t.*,
+                    MD5(t.transaction_id::TEXT || t.amount::TEXT || t.status::TEXT) as hash
+                FROM ledger.transactions t
+                WHERE t.created_at BETWEEN p_start AND p_end
+            ) primary_data
+            WHERE NOT EXISTS (
+                SELECT 1 FROM (
+                    SELECT 
+                        r.*,
+                        MD5(r.transaction_id::TEXT || r.amount::TEXT || r.status::TEXT) as hash
+                    FROM ledger.transactions_replica r
+                    WHERE r.created_at BETWEEN p_start AND p_end
+                ) replica_data
+                WHERE replica_data.transaction_id = primary_data.transaction_id
+                  AND replica_data.hash = primary_data.hash
+            )
+            LIMIT 100 -- Limit to prevent overwhelming
+        LOOP
+            v_mismatched_records := v_mismatched_records + 1;
+            
+            INSERT INTO ledger.reconciliation_discrepancies (
+                run_id, discrepancy_type, source_id, source_amount
+            ) VALUES (
+                p_run_id, 'REPLICA_MISMATCH', v_primary_record.transaction_id::TEXT,
+                v_primary_record.amount
+            );
+        END LOOP;
+    END IF;
+    
+    -- Log replication lag if applicable
+    INSERT INTO ledger.replication_metrics (
+        measured_at,
+        primary_position,
+        replica_position,
+        lag_bytes,
+        lag_seconds
+    )
+    SELECT 
+        NOW(),
+        pg_current_wal_lsn(),
+        NULL, -- Would come from replica
+        NULL,
+        EXTRACT(EPOCH FROM (NOW() - MAX(created_at)))
+    FROM ledger.transactions_replica;
+    
     RETURN jsonb_build_object(
-        'source_total', 0,
-        'target_total', 0,
-        'difference', 0,
-        'discrepancy_count', 0,
-        'status', 'NOT_IMPLEMENTED'
+        'source_total', v_source_total,
+        'target_total', v_target_total,
+        'difference', v_source_total - v_target_total,
+        'discrepancy_count', v_mismatched_records,
+        'hash_match', v_primary_hash = v_replica_hash,
+        'status', CASE WHEN v_mismatched_records = 0 THEN 'MATCHED' ELSE 'DISCREPANCIES' END
     );
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 -- Reconciliation statistics
 CREATE OR REPLACE FUNCTION ledger.reconciliation_stats(
@@ -342,9 +639,186 @@ BEGIN
 END;
 $$;
 
--- TODO: Schedule reconciliation jobs via pg_cron
--- SELECT cron.schedule('reconciliation-scheduler', '*/15 * * * *', 'SELECT * FROM ledger.schedule_reconciliations()');
+-- Schedule reconciliation jobs via pg_cron
+-- Run reconciliation scheduler every 15 minutes
+DO $$
+BEGIN
+    PERFORM cron.schedule('reconciliation-scheduler', '*/15 * * * *', 'SELECT * FROM ledger.schedule_reconciliations()');
+    RAISE NOTICE 'Reconciliation scheduler scheduled via pg_cron';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Could not schedule reconciliation: %', SQLERRM;
+END;
+$$;
 
--- TODO: Implement external API integrations (Stripe, bank feeds)
--- TODO: Add automatic discrepancy resolution rules
--- TODO: Create alerting for unresolved discrepancies > threshold
+-- Schedule full reconciliation hourly
+DO $$
+BEGIN
+    PERFORM cron.schedule('full-reconciliation', '0 * * * *', 
+        'SELECT ledger.execute_reconciliation(''INTERNAL_LEDGER'')');
+    RAISE NOTICE 'Full reconciliation scheduled via pg_cron';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Could not schedule full reconciliation: %', SQLERRM;
+END;
+$$;
+
+-- Supporting tables for reconciliation
+CREATE TABLE IF NOT EXISTS ledger.external_gateway_settlements (
+    settlement_id BIGSERIAL PRIMARY KEY,
+    gateway_name TEXT NOT NULL,
+    gateway_reference TEXT NOT NULL,
+    settlement_date DATE NOT NULL,
+    gross_amount NUMERIC(20,8) NOT NULL,
+    fees NUMERIC(20,8) NOT NULL DEFAULT 0,
+    settlement_amount NUMERIC(20,8) NOT NULL,
+    currency TEXT DEFAULT 'USD',
+    status TEXT DEFAULT 'PENDING',
+    imported_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(gateway_name, gateway_reference)
+);
+
+CREATE TABLE IF NOT EXISTS ledger.bank_statement_lines (
+    statement_line_id BIGSERIAL PRIMARY KEY,
+    statement_id BIGINT NOT NULL,
+    transaction_date DATE NOT NULL,
+    description TEXT,
+    reference_number TEXT,
+    amount NUMERIC(20,8) NOT NULL,
+    transaction_type TEXT, -- CREDIT, DEBIT
+    reconciliation_status TEXT DEFAULT 'UNRECONCILED',
+    reconciled_transaction_id BIGINT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ledger.reconciliation_matches (
+    match_id BIGSERIAL PRIMARY KEY,
+    reconciliation_type TEXT NOT NULL,
+    ledger_transaction_id BIGINT NOT NULL,
+    external_reference TEXT NOT NULL,
+    match_amount NUMERIC(20,8) NOT NULL,
+    matched_at TIMESTAMPTZ DEFAULT NOW(),
+    matched_by TEXT DEFAULT current_user,
+    UNIQUE(reconciliation_type, ledger_transaction_id, external_reference)
+);
+
+CREATE TABLE IF NOT EXISTS ledger.replication_metrics (
+    metric_id BIGSERIAL PRIMARY KEY,
+    measured_at TIMESTAMPTZ DEFAULT NOW(),
+    primary_position PG_LSN,
+    replica_position PG_LSN,
+    lag_bytes BIGINT,
+    lag_seconds NUMERIC
+);
+
+-- Automatic discrepancy resolution rules
+CREATE TABLE IF NOT EXISTS ledger.auto_resolution_rules (
+    rule_id SERIAL PRIMARY KEY,
+    reconciliation_type TEXT NOT NULL,
+    rule_name TEXT NOT NULL,
+    rule_condition JSONB NOT NULL,
+    auto_resolve BOOLEAN DEFAULT FALSE,
+    resolution_action TEXT, -- CREATE_ADJUSTMENT, MARK_RECONCILED, FLAG_REVIEW
+    max_auto_resolve_amount NUMERIC(20,8) DEFAULT 1.00,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Default auto-resolution rules
+INSERT INTO ledger.auto_resolution_rules (
+    reconciliation_type, rule_name, rule_condition, auto_resolve, 
+    resolution_action, max_auto_resolve_amount
+) VALUES 
+    ('INTERNAL_LEDGER', 'Rounding Differences', 
+     '{"difference_type": "AMOUNT_MISMATCH", "max_abs_difference": 0.01}'::JSONB,
+     TRUE, 'MARK_RECONCILED', 0.01),
+    ('PAYMENT_GATEWAY', 'Pending Settlement', 
+     '{"difference_type": "MISSING_TARGET", "max_age_hours": 72}'::JSONB,
+     FALSE, 'FLAG_REVIEW', 0),
+    ('BANK_SETTLEMENT', 'Timing Difference', 
+     '{"difference_type": "MISSING_TARGET", "max_date_diff_days": 3}'::JSONB,
+     FALSE, 'FLAG_REVIEW', 0)
+ON CONFLICT DO NOTHING;
+
+-- Function to apply automatic resolution rules
+CREATE OR REPLACE FUNCTION ledger.apply_auto_resolution(p_run_id BIGINT)
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_rule RECORD;
+    v_discrepancy RECORD;
+    v_resolved_count INT := 0;
+BEGIN
+    FOR v_rule IN 
+        SELECT * FROM ledger.auto_resolution_rules 
+        WHERE is_active = TRUE AND auto_resolve = TRUE
+    LOOP
+        FOR v_discrepancy IN
+            SELECT * FROM ledger.reconciliation_discrepancies
+            WHERE run_id = p_run_id
+              AND status = 'OPEN'
+              AND discrepancy_type = v_rule.rule_condition->>'difference_type'
+              AND ABS(difference) <= COALESCE((v_rule.rule_condition->>'max_abs_difference')::NUMERIC, v_rule.max_auto_resolve_amount)
+        LOOP
+            -- Apply resolution
+            UPDATE ledger.reconciliation_discrepancies
+            SET status = 'AUTO_RESOLVED',
+                resolution_notes = 'Auto-resolved by rule: ' || v_rule.rule_name,
+                resolved_at = NOW()
+            WHERE discrepancy_id = v_discrepancy.discrepancy_id;
+            
+            v_resolved_count := v_resolved_count + 1;
+        END LOOP;
+    END LOOP;
+    
+    RETURN jsonb_build_object(
+        'run_id', p_run_id,
+        'auto_resolved_count', v_resolved_count,
+        'status', 'COMPLETED'
+    );
+END;
+$$;
+
+-- Alerting function for unresolved discrepancies
+CREATE OR REPLACE FUNCTION ledger.check_discrepancy_alerts()
+RETURNS TABLE(
+    alert_type TEXT,
+    reconciliation_type TEXT,
+    discrepancy_count BIGINT,
+    total_amount NUMERIC,
+    alert_severity TEXT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_threshold_amount NUMERIC := 1000.00;
+    v_threshold_count INT := 10;
+BEGIN
+    RETURN QUERY
+    SELECT 
+        'UNRESOLVED_DISCREPANCIES'::TEXT,
+        d.discrepancy_type::TEXT,
+        COUNT(*)::BIGINT,
+        COALESCE(SUM(ABS(d.difference)), 0)::NUMERIC,
+        CASE 
+            WHEN COUNT(*) > v_threshold_count * 10 OR COALESCE(SUM(ABS(d.difference)), 0) > v_threshold_amount * 10 THEN 'CRITICAL'
+            WHEN COUNT(*) > v_threshold_count OR COALESCE(SUM(ABS(d.difference)), 0) > v_threshold_amount THEN 'HIGH'
+            ELSE 'MEDIUM'
+        END::TEXT
+    FROM ledger.reconciliation_discrepancies d
+    WHERE d.status = 'OPEN'
+      AND d.created_at > NOW() - INTERVAL '24 hours'
+    GROUP BY d.discrepancy_type
+    HAVING COUNT(*) > 5;
+END;
+$$;
+
+-- Schedule discrepancy alert check
+DO $$
+BEGIN
+    PERFORM cron.schedule('discrepancy-alerts', '0 */6 * * *', 
+        'SELECT * FROM ledger.check_discrepancy_alerts()');
+    RAISE NOTICE 'Discrepancy alerts scheduled via pg_cron';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Could not schedule discrepancy alerts: %', SQLERRM;
+END;
+$$;

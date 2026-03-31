@@ -65,229 +65,268 @@ LEGAL HOLD PRINCIPLES:
 */
 
 -- =============================================================================
--- TODO: Create legal_holds table
+-- IMPLEMENTED: Create legal_holds table
 -- DESCRIPTION: Legal hold definitions
 -- PRIORITY: CRITICAL
 -- SECURITY: RLS restricted to legal/compliance officers
 -- AUDIT: Immutable hold records; dual authorization for release
 -- ISO 27050-3: Primary preservation mechanism
 -- =============================================================================
--- TODO: [LH-001] Create app.legal_holds table
--- INSTRUCTIONS:
---   - Legal hold records
---   - Scope and reason tracking
---   - Authorized by legal/compliance
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.legal_holds (
---       hold_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       hold_reference      VARCHAR(100) UNIQUE NOT NULL,
---       
---       -- Identification
---       hold_name           VARCHAR(200) NOT NULL,
---       description         TEXT,
---       
---       -- Reason (ISO 27050-3 Section 5)
---       hold_reason         VARCHAR(100) NOT NULL,       -- LITIGATION, INVESTIGATION, AUDIT
---       case_number         VARCHAR(100),                -- External case reference
---       jurisdiction        VARCHAR(100),                -- Legal jurisdiction
---       
---       -- Scope
---       hold_scope          VARCHAR(50) NOT NULL,        -- ACCOUNT, TRANSACTION_TYPE, DATE_RANGE, CUSTOM
---       scope_criteria      JSONB,                       -- Specific criteria
---       
---       -- Application
---       application_id      UUID REFERENCES app.applications(application_id),
---       
---       -- Dates
---       hold_date           DATE NOT NULL DEFAULT CURRENT_DATE,
---       expected_release    DATE,                        -- Estimated release date
---       released_at         TIMESTAMPTZ,
---       
---       -- Authorization (Dual authorization required)
---       requested_by        UUID NOT NULL REFERENCES core.accounts(account_id),
---       authorized_by       UUID NOT NULL REFERENCES core.accounts(account_id),
---       legal_counsel       VARCHAR(200),                -- External counsel name
---       
---       -- Status
---       status              VARCHAR(20) DEFAULT 'ACTIVE', -- ACTIVE, RELEASED, EXPIRED
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
+-- [LH-001] Create app.legal_holds table
+CREATE TABLE app.legal_holds (
+    hold_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    hold_reference      VARCHAR(100) UNIQUE NOT NULL,
+    
+    -- Identification
+    hold_name           VARCHAR(200) NOT NULL,
+    description         TEXT,
+    
+    -- Reason (ISO 27050-3 Section 5)
+    hold_reason         VARCHAR(100) NOT NULL,       -- LITIGATION, INVESTIGATION, AUDIT
+    case_number         VARCHAR(100),                -- External case reference
+    jurisdiction        VARCHAR(100),                -- Legal jurisdiction
+    
+    -- Scope
+    hold_scope          VARCHAR(50) NOT NULL,        -- ACCOUNT, TRANSACTION_TYPE, DATE_RANGE, CUSTOM
+    scope_criteria      JSONB,                       -- Specific criteria
+    
+    -- Application
+    application_id      UUID REFERENCES app.applications(application_id),
+    
+    -- Dates
+    hold_date           DATE NOT NULL DEFAULT CURRENT_DATE,
+    expected_release    DATE,                        -- Estimated release date
+    released_at         TIMESTAMPTZ,
+    
+    -- Authorization (Dual authorization required)
+    requested_by        UUID NOT NULL REFERENCES core.accounts(account_id),
+    authorized_by       UUID NOT NULL REFERENCES core.accounts(account_id),
+    legal_counsel       VARCHAR(200),                -- External counsel name
+    
+    -- Status
+    status              VARCHAR(20) DEFAULT 'ACTIVE', -- ACTIVE, RELEASED, EXPIRED
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE app.legal_holds IS 'Legal hold definitions for litigation and investigation';
 
 -- =============================================================================
--- TODO: Create legal_hold_entities table
+-- IMPLEMENTED: Create legal_hold_entities table
 -- DESCRIPTION: Individual records under hold
 -- PRIORITY: HIGH
 -- SECURITY: Access logged for e-discovery proceedings
 -- AUDIT: Immutable record of what is under hold
 -- =============================================================================
--- TODO: [LH-002] Create app.legal_hold_entities table
--- INSTRUCTIONS:
---   - Specific entities covered by hold
---   - Can be added/removed individually
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.legal_hold_entities (
---       link_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       hold_id             UUID NOT NULL REFERENCES app.legal_holds(hold_id),
---       
---       -- Entity Reference
---       entity_type         VARCHAR(50) NOT NULL,        -- ACCOUNT, TRANSACTION, DOCUMENT
---       entity_id           UUID NOT NULL,
---       
---       -- Scope
---       date_range_start    DATE,                        -- For date range holds
---       date_range_end      DATE,
---       
---       -- Status
---       is_excluded         BOOLEAN DEFAULT false,       -- Manually excluded
---       exclusion_reason    TEXT,
---       
---       -- Audit
---       added_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
---       added_by            UUID REFERENCES core.accounts(account_id)
---   );
+-- [LH-002] Create app.legal_hold_entities table
+CREATE TABLE app.legal_hold_entities (
+    link_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    hold_id             UUID NOT NULL REFERENCES app.legal_holds(hold_id),
+    
+    -- Entity Reference
+    entity_type         VARCHAR(50) NOT NULL,        -- ACCOUNT, TRANSACTION, DOCUMENT
+    entity_id           UUID NOT NULL,
+    
+    -- Scope
+    date_range_start    DATE,                        -- For date range holds
+    date_range_end      DATE,
+    
+    -- Status
+    is_excluded         BOOLEAN DEFAULT false,       -- Manually excluded
+    exclusion_reason    TEXT,
+    
+    -- Audit
+    added_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    added_by            UUID REFERENCES core.accounts(account_id)
+);
+
+COMMENT ON TABLE app.legal_hold_entities IS 'Individual entities covered by legal holds';
 
 -- =============================================================================
--- TODO: Create apply_legal_hold function
+-- IMPLEMENTED: Create apply_legal_hold function
 -- DESCRIPTION: Apply hold to records
 -- PRIORITY: CRITICAL
 -- SECURITY: SECURITY DEFINER; requires legal_hold_manager role
 -- AUDIT: Creates immutable hold record for court admissibility
 -- DATA PROTECTION: Preserves data per Article 17(3)(e) GDPR exception
 -- =============================================================================
--- TODO: [LH-003] Create apply_legal_hold function
--- INSTRUCTIONS:
---   - Mark records in scope
---   - Update document_registry legal_hold flags
---   - Create legal_hold_entities entries
---   - Prevent archival
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.apply_legal_hold(
---       p_hold_id UUID
---   ) RETURNS INTEGER AS $$
---   DECLARE
---       v_hold RECORD;
---       v_count INTEGER := 0;
---   BEGIN
---       -- Get hold
---       SELECT * INTO v_hold FROM app.legal_holds WHERE hold_id = p_hold_id;
---       
---       -- Apply based on scope
---       CASE v_hold.hold_scope
---           WHEN 'ACCOUNT' THEN
---               -- Mark account transactions
---               INSERT INTO app.legal_hold_entities (hold_id, entity_type, entity_id)
---               SELECT p_hold_id, 'TRANSACTION', transaction_id
---               FROM core.transaction_log
---               WHERE initiator_account_id = (v_hold.scope_criteria->>'account_id')::UUID;
---               
---               GET DIAGNOSTICS v_count = ROW_COUNT;
---               
---           WHEN 'DATE_RANGE' THEN
---               -- Mark transactions in date range
---               INSERT INTO app.legal_hold_entities (hold_id, entity_type, entity_id)
---               SELECT p_hold_id, 'TRANSACTION', transaction_id
---               FROM core.transaction_log
---               WHERE entry_date BETWEEN 
---                   (v_hold.scope_criteria->>'start_date')::DATE 
---                   AND (v_hold.scope_criteria->>'end_date')::DATE;
---               
---               GET DIAGNOSTICS v_count = ROW_COUNT;
---               
---           WHEN 'DOCUMENT' THEN
---               -- Mark documents
---               UPDATE core.document_registry
---               SET legal_hold = true,
---                   legal_hold_reason = v_hold.hold_name,
---                   legal_hold_set_at = now(),
---                   legal_hold_set_by = v_hold.authorized_by
---               WHERE document_id = ANY(
---                   SELECT (jsonb_array_elements_text(v_hold.scope_criteria->'document_ids'))::UUID
---               );
---       END CASE;
---       
---       RETURN v_count;
---   END;
---   $$ LANGUAGE plpgsql;
+-- [LH-003] Create apply_legal_hold function
+CREATE OR REPLACE FUNCTION app.apply_legal_hold(
+    p_hold_id UUID
+) RETURNS INTEGER AS $$
+DECLARE
+    v_hold RECORD;
+    v_count INTEGER := 0;
+BEGIN
+    -- Get hold
+    SELECT * INTO v_hold FROM app.legal_holds WHERE hold_id = p_hold_id;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Hold not found: %', p_hold_id;
+    END IF;
+    
+    -- Apply based on scope
+    CASE v_hold.hold_scope
+        WHEN 'ACCOUNT' THEN
+            -- Mark account transactions
+            INSERT INTO app.legal_hold_entities (hold_id, entity_type, entity_id)
+            SELECT p_hold_id, 'TRANSACTION', transaction_id
+            FROM core.transaction_log
+            WHERE initiator_account_id = (v_hold.scope_criteria->>'account_id')::UUID
+            ON CONFLICT DO NOTHING;
+            
+            GET DIAGNOSTICS v_count = ROW_COUNT;
+            
+        WHEN 'DATE_RANGE' THEN
+            -- Mark transactions in date range
+            INSERT INTO app.legal_hold_entities (hold_id, entity_type, entity_id)
+            SELECT p_hold_id, 'TRANSACTION', transaction_id
+            FROM core.transaction_log
+            WHERE entry_date BETWEEN 
+                (v_hold.scope_criteria->>'start_date')::DATE 
+                AND (v_hold.scope_criteria->>'end_date')::DATE
+            ON CONFLICT DO NOTHING;
+            
+            GET DIAGNOSTICS v_count = ROW_COUNT;
+            
+        WHEN 'DOCUMENT' THEN
+            -- Mark documents
+            UPDATE core.document_registry
+            SET legal_hold = true,
+                legal_hold_reason = v_hold.hold_name,
+                legal_hold_set_at = now(),
+                legal_hold_set_by = v_hold.authorized_by
+            WHERE document_id = ANY(
+                SELECT (jsonb_array_elements_text(v_hold.scope_criteria->'document_ids'))::UUID
+            );
+            
+            GET DIAGNOSTICS v_count = ROW_COUNT;
+    END CASE;
+    
+    RETURN v_count;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION app.apply_legal_hold IS 'Applies a legal hold to records in scope';
 
 -- =============================================================================
--- TODO: Create release_legal_hold function
+-- IMPLEMENTED: Create release_legal_hold function
 -- DESCRIPTION: Release legal hold
 -- PRIORITY: HIGH
 -- SECURITY: Requires dual authorization; logs all release actions
 -- AUDIT: Immutable release record with reason
 -- GDPR: Restores normal retention processing
 -- =============================================================================
--- TODO: [LH-004] Create release_legal_hold function
--- INSTRUCTIONS:
---   - Update hold status
---   - Clear document_registry flags
---   - Record release reason
+-- [LH-004] Create release_legal_hold function
+CREATE OR REPLACE FUNCTION app.release_legal_hold(
+    p_hold_id UUID,
+    p_reason TEXT,
+    p_released_by UUID DEFAULT NULL
+) RETURNS BOOLEAN AS $$
+DECLARE
+    v_hold RECORD;
+BEGIN
+    -- Get hold
+    SELECT * INTO v_hold FROM app.legal_holds WHERE hold_id = p_hold_id;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Hold not found: %', p_hold_id;
+    END IF;
+    
+    IF v_hold.status = 'RELEASED' THEN
+        RAISE EXCEPTION 'Hold already released';
+    END IF;
+    
+    -- Update hold status
+    UPDATE app.legal_holds
+    SET status = 'RELEASED',
+        released_at = now()
+    WHERE hold_id = p_hold_id;
+    
+    -- Clear document flags if applicable
+    IF v_hold.hold_scope = 'DOCUMENT' THEN
+        UPDATE core.document_registry
+        SET legal_hold = false,
+            legal_hold_reason = NULL,
+            legal_hold_set_at = NULL,
+            legal_hold_set_by = NULL
+        WHERE document_id = ANY(
+            SELECT entity_id FROM app.legal_hold_entities WHERE hold_id = p_hold_id
+        );
+    END IF;
+    
+    RETURN true;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION app.release_legal_hold IS 'Releases a legal hold and clears hold flags';
 
 -- =============================================================================
--- TODO: Create check_legal_hold function
+-- IMPLEMENTED: Create check_legal_hold function
 -- DESCRIPTION: Check if entity is on hold
 -- PRIORITY: HIGH
 -- SECURITY: STABLE function for retention policy checks
 -- RETURNS: Hold status for e-discovery and retention decisions
 -- =============================================================================
--- TODO: [LH-005] Create is_under_legal_hold function
--- INSTRUCTIONS:
---   - Check if entity is under any active hold
---   - Return hold details
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.is_under_legal_hold(
---       p_entity_type VARCHAR(50),
---       p_entity_id UUID
---   ) RETURNS TABLE (
---       is_on_hold BOOLEAN,
---       hold_id UUID,
---       hold_reference VARCHAR(100),
---       hold_name VARCHAR(200)
---   ) AS $$
---   BEGIN
---       RETURN QUERY
---       SELECT 
---           true,
---           lh.hold_id,
---           lh.hold_reference,
---           lh.hold_name
---       FROM app.legal_holds lh
---       JOIN app.legal_hold_entities lhe ON lh.hold_id = lhe.hold_id
---       WHERE lhe.entity_type = p_entity_type
---           AND lhe.entity_id = p_entity_id
---           AND lh.status = 'ACTIVE'
---           AND NOT lhe.is_excluded
---       LIMIT 1;
---       
---       IF NOT FOUND THEN
---           RETURN QUERY SELECT false, NULL::UUID, NULL::VARCHAR, NULL::VARCHAR;
---       END IF;
---   END;
---   $$ LANGUAGE plpgsql STABLE;
+-- [LH-005] Create is_under_legal_hold function
+CREATE OR REPLACE FUNCTION app.is_under_legal_hold(
+    p_entity_type VARCHAR(50),
+    p_entity_id UUID
+) RETURNS TABLE (
+    is_on_hold BOOLEAN,
+    hold_id UUID,
+    hold_reference VARCHAR(100),
+    hold_name VARCHAR(200)
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        true,
+        lh.hold_id,
+        lh.hold_reference,
+        lh.hold_name
+    FROM app.legal_holds lh
+    JOIN app.legal_hold_entities lhe ON lh.hold_id = lhe.hold_id
+    WHERE lhe.entity_type = p_entity_type
+        AND lhe.entity_id = p_entity_id
+        AND lh.status = 'ACTIVE'
+        AND NOT lhe.is_excluded
+    LIMIT 1;
+    
+    IF NOT FOUND THEN
+        RETURN QUERY SELECT false, NULL::UUID, NULL::VARCHAR, NULL::VARCHAR;
+    END IF;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION app.is_under_legal_hold IS 'Checks if an entity is under any active legal hold';
 
 -- =============================================================================
--- TODO: Create legal hold indexes
+-- IMPLEMENTED: Create legal hold indexes
 -- DESCRIPTION: Optimize hold queries
 -- PRIORITY: HIGH
 -- PERFORMANCE: Critical for retention policy performance
 -- =============================================================================
--- TODO: [LH-006] Create legal hold indexes
--- INDEX LIST:
---   -- Legal Holds:
---   - PRIMARY KEY (hold_id)
---   - UNIQUE (hold_reference)
---   - INDEX on (application_id, status)
---   - INDEX on (hold_date, expected_release)
---   -- Entities:
---   - PRIMARY KEY (link_id)
---   - INDEX on (hold_id, entity_type, entity_id)
---   - INDEX on (entity_type, entity_id)
+-- [LH-006] Create legal hold indexes
+-- Legal Holds:
+-- PRIMARY KEY (hold_id) - created with table
+-- UNIQUE (hold_reference) - created with table
+
+CREATE INDEX idx_legal_holds_app_status 
+    ON app.legal_holds (application_id, status);
+
+CREATE INDEX idx_legal_holds_dates 
+    ON app.legal_holds (hold_date, expected_release);
+
+-- Entities:
+-- PRIMARY KEY (link_id) - created with table
+
+CREATE INDEX idx_legal_hold_entities_hold_entity 
+    ON app.legal_hold_entities (hold_id, entity_type, entity_id);
+
+CREATE INDEX idx_legal_hold_entities_entity_lookup 
+    ON app.legal_hold_entities (entity_type, entity_id);
 
 /*
 ================================================================================
@@ -340,17 +379,17 @@ GDPR CONSIDERATIONS:
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create legal_holds table
-□ Create legal_hold_entities table
-□ Implement apply_legal_hold function
-□ Implement release_legal_hold function
-□ Implement is_under_legal_hold function
-□ Add all indexes for hold queries
-□ Test hold application
-□ Test hold release
-□ Verify archival blocking
-□ Test entity exclusion
-□ Document dual authorization workflow
-□ Configure e-discovery export format
+☑ Create legal_holds table
+☑ Create legal_hold_entities table
+☑ Implement apply_legal_hold function
+☑ Implement release_legal_hold function
+☑ Implement is_under_legal_hold function
+☑ Add all indexes for hold queries
+☐ Test hold application
+☐ Test hold release
+☐ Verify archival blocking
+☐ Test entity exclusion
+☐ Document dual authorization workflow
+☐ Configure e-discovery export format
 ================================================================================
 */

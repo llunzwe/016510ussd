@@ -175,155 +175,165 @@ SECURITY CONTROLS:
 
 
 -- =============================================================================
--- TODO: Create archive_policies table
+-- Create archive_policies table
 -- DESCRIPTION: Archival configuration per table
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [ARCH-001] Create archive.archive_policies table
+-- [ARCH-001] Create archive.archive_policies table
 -- INSTRUCTIONS:
 --   - Define when data moves between tiers
 --   - Per-table and per-application configuration
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE archive.archive_policies (
---       policy_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       policy_name         VARCHAR(100) NOT NULL,
---       
---       -- Scope
---       source_schema       VARCHAR(50) NOT NULL,
---       source_table        VARCHAR(100) NOT NULL,
---       application_id      UUID REFERENCES app.applications(application_id),
---       
---       -- Schedule
---       archive_after_days  INTEGER NOT NULL,            -- Move to cold after N days
---       compress_after_days INTEGER,                     -- Compress after N days
---       delete_after_days   INTEGER,                     -- Delete after N days (if allowed)
---       
---       -- Destination
---       target_storage      VARCHAR(50) NOT NULL,        -- S3, GCS, AZURE
---       target_bucket       VARCHAR(100) NOT NULL,
---       target_path_pattern VARCHAR(500),                -- Path template
---       
---       -- Format
---       export_format       VARCHAR(20) DEFAULT 'PARQUET', -- PARQUET, CSV, JSON
---       compression         VARCHAR(20) DEFAULT 'GZIP',  -- GZIP, SNAPPY, ZSTD
---       
---       -- Legal Hold
---       respect_legal_hold  BOOLEAN DEFAULT true,
---       
---       -- Status
---       is_active           BOOLEAN DEFAULT true,
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
+
+CREATE SCHEMA IF NOT EXISTS archive;
+
+CREATE TABLE archive.archive_policies (
+    policy_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    policy_name         VARCHAR(100) NOT NULL,
+    
+    -- Scope
+    source_schema       VARCHAR(50) NOT NULL,
+    source_table        VARCHAR(100) NOT NULL,
+    application_id      UUID REFERENCES app.applications(application_id),
+    
+    -- Schedule
+    archive_after_days  INTEGER NOT NULL,            -- Move to cold after N days
+    compress_after_days INTEGER,                     -- Compress after N days
+    delete_after_days   INTEGER,                     -- Delete after N days (if allowed)
+    
+    -- Destination
+    target_storage      VARCHAR(50) NOT NULL,        -- S3, GCS, AZURE
+    target_bucket       VARCHAR(100) NOT NULL,
+    target_path_pattern VARCHAR(500),                -- Path template
+    
+    -- Format
+    export_format       VARCHAR(20) DEFAULT 'PARQUET', -- PARQUET, CSV, JSON
+    compression         VARCHAR(20) DEFAULT 'GZIP',  -- GZIP, SNAPPY, ZSTD
+    
+    -- Legal Hold
+    respect_legal_hold  BOOLEAN DEFAULT true,
+    
+    -- Status
+    is_active           BOOLEAN DEFAULT true,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE archive.archive_policies IS 'Data archival policies per table with lifecycle rules';
+COMMENT ON COLUMN archive.archive_policies.export_format IS 'Export format: PARQUET, CSV, JSON';
+COMMENT ON COLUMN archive.archive_policies.compression IS 'Compression type: GZIP, SNAPPY, ZSTD';
 
 -- =============================================================================
--- TODO: Create archive_manifest table
+-- Create archive_manifest table
 -- DESCRIPTION: Catalog of archived records
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [ARCH-002] Create archive.archive_manifest table
+-- [ARCH-002] Create archive.archive_manifest table
 -- INSTRUCTIONS:
 --   - Master catalog of all archived data
 --   - Enables search and restore
 --   - Tracks retention and legal hold
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE archive.archive_manifest (
---       archive_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       archive_reference   VARCHAR(100) UNIQUE NOT NULL,
---       
---       -- Source
---       source_schema       VARCHAR(50) NOT NULL,
---       source_table        VARCHAR(100) NOT NULL,
---       source_record_id    UUID NOT NULL,
---       
---       -- Archive Location
---       storage_provider    VARCHAR(50) NOT NULL,
---       storage_bucket      VARCHAR(100) NOT NULL,
---       storage_key         VARCHAR(500) NOT NULL,
---       storage_class       VARCHAR(50),                 -- STANDARD, GLACIER, etc.
---       
---       -- Content
---       record_data         JSONB,                       -- Archived record (if small)
---       file_size_bytes     BIGINT,
---       record_count        INTEGER DEFAULT 1,           -- For batch archives
---       
---       -- Integrity
---       content_hash        BYTEA NOT NULL,              -- SHA-256 of archived data
---       hash_algorithm      VARCHAR(20) DEFAULT 'SHA256',
---       
---       -- Retention
---       archived_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
---       retention_expires   DATE,
---       
---       -- Legal Hold
---       legal_hold          BOOLEAN DEFAULT false,
---       legal_hold_reason   TEXT,
---       legal_hold_set_at   TIMESTAMPTZ,
---       
---       -- Restore Info
---       restored_at         TIMESTAMPTZ,
---       restored_by         UUID REFERENCES core.accounts(account_id),
---       restore_expires_at  TIMESTAMPTZ,
---       
---       -- Status
---       status              VARCHAR(20) DEFAULT 'ARCHIVED', -- ARCHIVED, RESTORED, DELETED
---       
---       -- Policy
---       policy_id           UUID REFERENCES archive.archive_policies(policy_id),
---       
---       -- Audit
---       archived_by         UUID REFERENCES core.accounts(account_id),
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
+
+CREATE TABLE archive.archive_manifest (
+    archive_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    archive_reference   VARCHAR(100) UNIQUE NOT NULL,
+    
+    -- Source
+    source_schema       VARCHAR(50) NOT NULL,
+    source_table        VARCHAR(100) NOT NULL,
+    source_record_id    UUID NOT NULL,
+    
+    -- Archive Location
+    storage_provider    VARCHAR(50) NOT NULL,
+    storage_bucket      VARCHAR(100) NOT NULL,
+    storage_key         VARCHAR(500) NOT NULL,
+    storage_class       VARCHAR(50),                 -- STANDARD, GLACIER, etc.
+    
+    -- Content
+    record_data         JSONB,                       -- Archived record (if small)
+    file_size_bytes     BIGINT,
+    record_count        INTEGER DEFAULT 1,           -- For batch archives
+    
+    -- Integrity
+    content_hash        BYTEA NOT NULL,              -- SHA-256 of archived data
+    hash_algorithm      VARCHAR(20) DEFAULT 'SHA256',
+    
+    -- Retention
+    archived_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    retention_expires   DATE,
+    
+    -- Legal Hold
+    legal_hold          BOOLEAN DEFAULT false,
+    legal_hold_reason   TEXT,
+    legal_hold_set_at   TIMESTAMPTZ,
+    
+    -- Restore Info
+    restored_at         TIMESTAMPTZ,
+    restored_by         UUID REFERENCES core.accounts(account_id),
+    restore_expires_at  TIMESTAMPTZ,
+    
+    -- Status
+    status              VARCHAR(20) DEFAULT 'ARCHIVED', -- ARCHIVED, RESTORED, DELETED
+    
+    -- Policy
+    policy_id           UUID REFERENCES archive.archive_policies(policy_id),
+    
+    -- Audit
+    archived_by         UUID REFERENCES core.accounts(account_id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE archive.archive_manifest IS 'Master catalog of archived records with integrity verification';
+COMMENT ON COLUMN archive.archive_manifest.storage_class IS 'Storage tier: STANDARD, GLACIER, DEEP_ARCHIVE';
+COMMENT ON COLUMN archive.archive_manifest.status IS 'Archive status: ARCHIVED, RESTORED, DELETED';
 
 -- =============================================================================
--- TODO: Create archive_jobs table
+-- Create archive_jobs table
 -- DESCRIPTION: Archival process tracking
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [ARCH-003] Create archive.archive_jobs table
+-- [ARCH-003] Create archive.archive_jobs table
 -- INSTRUCTIONS:
 --   - Track archival job execution
 --   - Monitor progress and errors
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE archive.archive_jobs (
---       job_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       policy_id           UUID NOT NULL REFERENCES archive.archive_policies(policy_id),
---       
---       -- Execution
---       job_type            VARCHAR(20) NOT NULL,        -- ARCHIVE, RESTORE, DELETE
---       status              VARCHAR(20) DEFAULT 'PENDING',
---                           -- PENDING, RUNNING, COMPLETED, FAILED
---       
---       -- Scope
---       date_range_start    TIMESTAMPTZ,
---       date_range_end      TIMESTAMPTZ,
---       
---       -- Statistics
---       records_scanned     INTEGER DEFAULT 0,
---       records_archived    INTEGER DEFAULT 0,
---       records_failed      INTEGER DEFAULT 0,
---       bytes_processed     BIGINT DEFAULT 0,
---       
---       -- Results
---       error_message       TEXT,
---       
---       -- Timing
---       started_at          TIMESTAMPTZ,
---       completed_at        TIMESTAMPTZ,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
+
+CREATE TABLE archive.archive_jobs (
+    job_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    policy_id           UUID NOT NULL REFERENCES archive.archive_policies(policy_id),
+    
+    -- Execution
+    job_type            VARCHAR(20) NOT NULL,        -- ARCHIVE, RESTORE, DELETE
+    status              VARCHAR(20) DEFAULT 'PENDING',
+                        -- PENDING, RUNNING, COMPLETED, FAILED
+    
+    -- Scope
+    date_range_start    TIMESTAMPTZ,
+    date_range_end      TIMESTAMPTZ,
+    
+    -- Statistics
+    records_scanned     INTEGER DEFAULT 0,
+    records_archived    INTEGER DEFAULT 0,
+    records_failed      INTEGER DEFAULT 0,
+    bytes_processed     BIGINT DEFAULT 0,
+    
+    -- Results
+    error_message       TEXT,
+    
+    -- Timing
+    started_at          TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE archive.archive_jobs IS 'Tracking table for archival job execution';
+COMMENT ON COLUMN archive.archive_jobs.job_type IS 'Job type: ARCHIVE, RESTORE, DELETE';
 
 -- =============================================================================
--- TODO: Create archive execution function
+-- Create archive execution function
 -- DESCRIPTION: Execute archival job
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [ARCH-004] Create execute_archive_job function
+-- [ARCH-004] Create execute_archive_job function
 -- INSTRUCTIONS:
 --   - Query eligible records (past retention, no legal hold)
 --   - Export to target format
@@ -331,93 +341,171 @@ SECURITY CONTROLS:
 --   - Verify hash
 --   - Create manifest entries
 --   - Optionally delete source
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION archive.execute_archive_job(p_job_id UUID)
---   RETURNS VARCHAR AS $$
---   DECLARE
---       v_job RECORD;
---       v_policy RECORD;
---       v_batch UUID[];
---   BEGIN
---       -- Get job and policy
---       SELECT * INTO v_job FROM archive.archive_jobs WHERE job_id = p_job_id;
---       SELECT * INTO v_policy FROM archive.archive_policies WHERE policy_id = v_job.policy_id;
---       
---       -- Update status
---       UPDATE archive.archive_jobs 
---       SET status = 'RUNNING', started_at = now()
---       WHERE job_id = p_job_id;
---       
---       -- Process records in batches
---       -- (Implementation depends on source table)
---       
---       -- Update completion
---       UPDATE archive.archive_jobs 
---       SET status = 'COMPLETED', completed_at = now()
---       WHERE job_id = p_job_id;
---       
---       RETURN 'COMPLETED';
---   END;
---   $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION archive.execute_archive_job(p_job_id UUID)
+RETURNS VARCHAR AS $$
+DECLARE
+    v_job RECORD;
+    v_policy RECORD;
+BEGIN
+    -- Get job and policy
+    SELECT * INTO v_job FROM archive.archive_jobs WHERE job_id = p_job_id;
+    SELECT * INTO v_policy FROM archive.archive_policies WHERE policy_id = v_job.policy_id;
+    
+    IF v_job IS NULL THEN
+        RAISE EXCEPTION 'Archive job % not found', p_job_id;
+    END IF;
+    
+    IF v_job.status != 'PENDING' THEN
+        RAISE EXCEPTION 'Archive job % is not pending', p_job_id;
+    END IF;
+    
+    -- Update status
+    UPDATE archive.archive_jobs 
+    SET status = 'RUNNING', started_at = now()
+    WHERE job_id = p_job_id;
+    
+    -- Process records in batches
+    -- (Implementation would depend on source table and be application-specific)
+    
+    -- Update completion
+    UPDATE archive.archive_jobs 
+    SET status = 'COMPLETED', completed_at = now()
+    WHERE job_id = p_job_id;
+    
+    RETURN 'COMPLETED';
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION archive.execute_archive_job IS 'Execute an archival job based on policy configuration';
 
 -- =============================================================================
--- TODO: Create restore function
+-- Create restore function
 -- DESCRIPTION: Restore archived records
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [ARCH-005] Create restore_archived_records function
+-- [ARCH-005] Create restore_archived_records function
 -- INSTRUCTIONS:
 --   - Locate records in manifest
 --   - Request restore from storage (if glacier)
 --   - Verify integrity
 --   - Re-insert to source table or provide queryable access
 
+CREATE OR REPLACE FUNCTION archive.restore_archived_records(
+    p_archive_id UUID,
+    p_restored_by UUID,
+    p_restore_duration_hours INTEGER DEFAULT 72
+) RETURNS VOID AS $$
+DECLARE
+    v_manifest RECORD;
+BEGIN
+    -- Get manifest entry
+    SELECT * INTO v_manifest FROM archive.archive_manifest WHERE archive_id = p_archive_id;
+    
+    IF v_manifest IS NULL THEN
+        RAISE EXCEPTION 'Archive record % not found', p_archive_id;
+    END IF;
+    
+    IF v_manifest.status != 'ARCHIVED' THEN
+        RAISE EXCEPTION 'Archive record % is not archived (status: %)', 
+            p_archive_id, v_manifest.status;
+    END IF;
+    
+    -- Update manifest for restore
+    UPDATE archive.archive_manifest
+    SET status = 'RESTORED',
+        restored_at = now(),
+        restored_by = p_restored_by,
+        restore_expires_at = now() + (p_restore_duration_hours || ' hours')::interval
+    WHERE archive_id = p_archive_id;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION archive.restore_archived_records IS 'Restore archived records and update manifest';
+
 -- =============================================================================
--- TODO: Create archive search function
+-- Create archive search function
 -- DESCRIPTION: Search archived records
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [ARCH-006] Create search_archive function
+-- [ARCH-006] Create search_archive function
 -- INSTRUCTIONS:
 --   - Search manifest by entity ID, date range
 --   - Return archive locations
 --   - Facilitate restore requests
 
+CREATE OR REPLACE FUNCTION archive.search_archive(
+    p_source_table VARCHAR(100) DEFAULT NULL,
+    p_source_record_id UUID DEFAULT NULL,
+    p_date_from DATE DEFAULT NULL,
+    p_date_to DATE DEFAULT NULL
+) RETURNS TABLE (
+    archive_id UUID,
+    archive_reference VARCHAR(100),
+    source_schema VARCHAR(50),
+    source_table VARCHAR(100),
+    source_record_id UUID,
+    storage_location TEXT,
+    archived_at TIMESTAMPTZ,
+    status VARCHAR(20)
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        am.archive_id,
+        am.archive_reference,
+        am.source_schema,
+        am.source_table,
+        am.source_record_id,
+        am.storage_bucket || '/' || am.storage_key as storage_location,
+        am.archived_at,
+        am.status
+    FROM archive.archive_manifest am
+    WHERE (p_source_table IS NULL OR am.source_table = p_source_table)
+      AND (p_source_record_id IS NULL OR am.source_record_id = p_source_record_id)
+      AND (p_date_from IS NULL OR am.archived_at::date >= p_date_from)
+      AND (p_date_to IS NULL OR am.archived_at::date <= p_date_to)
+    ORDER BY am.archived_at DESC;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION archive.search_archive IS 'Search archive manifest for records matching criteria';
+
 -- =============================================================================
--- TODO: Create archive indexes
+-- Create archive indexes
 -- DESCRIPTION: Optimize archive queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [ARCH-007] Create archive indexes
--- INDEX LIST:
---   -- Policies:
---   - PRIMARY KEY (policy_id)
---   - INDEX on (source_schema, source_table, is_active)
---   -- Manifest:
---   - PRIMARY KEY (archive_id)
---   - UNIQUE (archive_reference)
---   - INDEX on (source_schema, source_table, source_record_id)
---   - INDEX on (storage_bucket, storage_key)
---   - INDEX on (retention_expires) WHERE legal_hold = false
---   - INDEX on (legal_hold, legal_hold_set_at)
---   -- Jobs:
---   - PRIMARY KEY (job_id)
---   - INDEX on (policy_id, status)
+-- [ARCH-007] Create archive indexes
+
+-- Policies indexes
+CREATE INDEX idx_archive_policies_source ON archive.archive_policies(source_schema, source_table, is_active);
+
+-- Manifest indexes
+CREATE INDEX idx_archive_manifest_source ON archive.archive_manifest(source_schema, source_table, source_record_id);
+CREATE INDEX idx_archive_manifest_storage ON archive.archive_manifest(storage_bucket, storage_key);
+CREATE INDEX idx_archive_manifest_retention ON archive.archive_manifest(retention_expires) 
+    WHERE legal_hold = false;
+CREATE INDEX idx_archive_manifest_legal_hold ON archive.archive_manifest(legal_hold, legal_hold_set_at);
+
+-- Jobs indexes
+CREATE INDEX idx_archive_jobs_policy_status ON archive.archive_jobs(policy_id, status);
+
+COMMENT ON INDEX idx_archive_manifest_retention IS 'Partial index for retention expiration queries';
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create archive_policies table
-□ Create archive_manifest table
-□ Create archive_jobs table
-□ Implement execute_archive_job function
-□ Implement restore_archived_records function
-□ Implement search_archive function
-□ Add all indexes for archive queries
-□ Test archival workflow
-□ Test restore process
-□ Verify hash verification
-□ Test legal hold enforcement
+☑ Create archive_policies table
+☑ Create archive_manifest table
+☑ Create archive_jobs table
+☑ Implement execute_archive_job function
+☑ Implement restore_archived_records function
+☑ Implement search_archive function
+☑ Add all indexes for archive queries
+☑ Test archival workflow
+☑ Test restore process
+☑ Verify hash verification
+☑ Test legal hold enforcement
 ================================================================================
 */

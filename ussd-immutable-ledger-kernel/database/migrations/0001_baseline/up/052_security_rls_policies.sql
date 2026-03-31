@@ -64,160 +64,327 @@ SECURITY PRINCIPLES:
 */
 
 -- =============================================================================
--- TODO: Create RLS policy configuration table
+-- IMPLEMENTED: Create RLS policy configuration table
 -- DESCRIPTION: RLS policy definitions
 -- PRIORITY: HIGH
 -- SECURITY: Restricted to security administrators
 -- AUDIT: All policy changes logged
 -- =============================================================================
--- TODO: [RLS-001] Create security.rls_policies table
--- INSTRUCTIONS:
---   - Document RLS policy configuration
---   - For audit and management
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE security.rls_policies (
---       policy_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Target
---       table_schema        VARCHAR(50) NOT NULL,
---       table_name          VARCHAR(100) NOT NULL,
---       
---       -- Policy Details
---       policy_name         VARCHAR(100) NOT NULL,
---       policy_type         VARCHAR(20) NOT NULL,        -- SELECT, INSERT, UPDATE, DELETE
---       
---       -- Expression
---       using_expression    TEXT NOT NULL,               -- USING clause
---       with_check_expression TEXT,                      -- WITH CHECK clause
---       
---       -- Roles
---       applies_to_roles    VARCHAR(100)[],              -- NULL = all roles
---       
---       -- Status
---       is_active           BOOLEAN DEFAULT true,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
+-- [RLS-001] Create security.rls_policies table
+CREATE SCHEMA IF NOT EXISTS security;
+
+CREATE TABLE security.rls_policies (
+    policy_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Target
+    table_schema        VARCHAR(50) NOT NULL,
+    table_name          VARCHAR(100) NOT NULL,
+    
+    -- Policy Details
+    policy_name         VARCHAR(100) NOT NULL,
+    policy_type         VARCHAR(20) NOT NULL,        -- SELECT, INSERT, UPDATE, DELETE
+    
+    -- Expression
+    using_expression    TEXT NOT NULL,               -- USING clause
+    with_check_expression TEXT,                      -- WITH CHECK clause
+    
+    -- Roles
+    applies_to_roles    VARCHAR(100)[],              -- NULL = all roles
+    
+    -- Status
+    is_active           BOOLEAN DEFAULT true,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by          UUID,
+    updated_at          TIMESTAMPTZ,
+    change_reason       TEXT
+);
+
+COMMENT ON TABLE security.rls_policies IS 'Documentation table for RLS policy configuration';
 
 -- =============================================================================
--- TODO: Enable RLS on core tables
+-- IMPLEMENTED: Enable RLS on core tables
 -- DESCRIPTION: Activate row-level security
 -- PRIORITY: CRITICAL
 -- SECURITY: FORCE RLS for all users including table owners
 -- AUDIT: Log RLS enablement events
 -- =============================================================================
--- TODO: [RLS-002] Enable RLS on tables
--- INSTRUCTIONS:
---   ALTER TABLE core.transaction_log ENABLE ROW LEVEL SECURITY;
---   ALTER TABLE core.accounts ENABLE ROW LEVEL SECURITY;
---   ALTER TABLE core.movement_headers ENABLE ROW LEVEL SECURITY;
---   ALTER TABLE core.movement_legs ENABLE ROW LEVEL SECURITY;
---   -- etc.
+-- [RLS-002] Enable RLS on tables
+
+-- Enable RLS on core tables
+ALTER TABLE IF EXISTS core.transaction_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS core.accounts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS core.movement_headers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS core.movement_legs ENABLE ROW LEVEL SECURITY;
+
+-- Enable RLS on app tables
+ALTER TABLE IF EXISTS app.applications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS app.account_memberships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS app.roles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS app.user_role_assignments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS app.configuration ENABLE ROW LEVEL SECURITY;
+
+-- Enable RLS on USSD tables
+ALTER TABLE ussd.ussd_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ussd.session_data ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ussd.session_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ussd.shortcodes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ussd.shortcode_routes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ussd.route_access_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ussd.menu_definitions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ussd.menu_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ussd.menu_translations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ussd.pending_ussd_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ussd.pending_tx_confirmations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ussd.device_fingerprints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ussd.account_device_links ENABLE ROW LEVEL SECURITY;
 
 -- =============================================================================
--- TODO: Create application isolation policies
+-- IMPLEMENTED: Create application isolation policies
 -- DESCRIPTION: Tenant isolation by application
 -- PRIORITY: CRITICAL
 -- SECURITY: STRICT - users cannot access other tenants' data
 -- PRIVACY: Enforces data segregation per controller
 -- =============================================================================
--- TODO: [RLS-003] Create application isolation policies
--- INSTRUCTIONS:
---   -- Policy: Users can only see their application's transactions
---   CREATE POLICY transaction_application_isolation ON core.transaction_log
---       FOR SELECT
---       USING (application_id = current_setting('app.current_application_id')::UUID);
---   
---   -- Policy: Users can only see accounts they have access to
---   CREATE POLICY account_access_policy ON core.accounts
---       FOR SELECT
---       USING (
---           EXISTS (
---               SELECT 1 FROM app.current_memberships
---               WHERE account_id = accounts.account_id
---           )
---           OR current_setting('app.is_admin')::BOOLEAN = true
---       );
+-- [RLS-003] Create application isolation policies
+
+-- Policy: Users can only see their application's transactions
+CREATE POLICY transaction_application_isolation ON core.transaction_log
+    FOR SELECT
+    USING (
+        application_id = current_setting('app.current_application_id', true)::UUID
+        OR current_setting('app.is_admin', true)::BOOLEAN = true
+    );
+
+CREATE POLICY transaction_application_insert ON core.transaction_log
+    FOR INSERT
+    WITH CHECK (
+        application_id = current_setting('app.current_application_id', true)::UUID
+        OR current_setting('app.is_admin', true)::BOOLEAN = true
+    );
+
+-- Policy: Application-level access to accounts
+CREATE POLICY account_application_isolation ON core.accounts
+    FOR SELECT
+    USING (
+        application_id = current_setting('app.current_application_id', true)::UUID
+        OR application_id IS NULL  -- System accounts
+        OR current_setting('app.is_admin', true)::BOOLEAN = true
+    );
+
+-- Policy: USSD session access limited to same application
+CREATE POLICY session_application_isolation ON ussd.ussd_sessions
+    FOR ALL
+    USING (
+        application_id = current_setting('app.current_application_id', true)::UUID
+        OR current_setting('app.is_admin', true)::BOOLEAN = true
+    );
+
+-- Policy: Menu access limited to application
+CREATE POLICY menu_application_isolation ON ussd.menu_definitions
+    FOR ALL
+    USING (
+        application_id = current_setting('app.current_application_id', true)::UUID
+        OR current_setting('app.is_admin', true)::BOOLEAN = true
+    );
+
+-- Policy: Pending transactions limited by application through session
+CREATE POLICY pending_application_isolation ON ussd.pending_ussd_transactions
+    FOR ALL
+    USING (
+        EXISTS (
+            SELECT 1 FROM ussd.ussd_sessions s
+            WHERE s.session_id = pending_ussd_transactions.session_id
+                AND s.application_id = current_setting('app.current_application_id', true)::UUID
+        )
+        OR current_setting('app.is_admin', true)::BOOLEAN = true
+    );
 
 -- =============================================================================
--- TODO: Create account-based access policies
+-- IMPLEMENTED: Create account-based access policies
 -- DESCRIPTION: Limit access to specific accounts
 -- PRIORITY: HIGH
 -- SECURITY: Membership-based access verification
 -- =============================================================================
--- TODO: [RLS-004] Create account-based policies
--- INSTRUCTIONS:
---   -- Movement access limited to account participants
---   CREATE POLICY movement_account_access ON core.movement_legs
---       FOR SELECT
---       USING (
---           account_id IN (
---               SELECT account_id FROM app.current_memberships
---               WHERE account_id = movement_legs.account_id
---           )
---           OR current_setting('app.is_admin')::BOOLEAN = true
---       );
+-- [RLS-004] Create account-based policies
+
+-- Movement access limited to account participants
+CREATE POLICY movement_account_access ON core.movement_legs
+    FOR SELECT
+    USING (
+        account_id IN (
+            SELECT am.account_id FROM app.account_memberships am
+            WHERE am.account_id = movement_legs.account_id
+                AND am.is_current = true
+        )
+        OR current_setting('app.is_admin', true)::BOOLEAN = true
+    );
+
+-- Account membership access limited to own memberships
+CREATE POLICY membership_account_access ON app.account_memberships
+    FOR ALL
+    USING (
+        account_id = current_setting('app.current_account_id', true)::UUID
+        OR current_setting('app.is_admin', true)::BOOLEAN = true
+    );
+
+-- Device links limited to own account
+CREATE POLICY device_link_account_access ON ussd.account_device_links
+    FOR SELECT
+    USING (
+        account_id = current_setting('app.current_account_id', true)::UUID
+        OR current_setting('app.is_admin', true)::BOOLEAN = true
+    );
+
+-- Session data limited to session owner
+CREATE POLICY session_data_access ON ussd.session_data
+    FOR ALL
+    USING (
+        EXISTS (
+            SELECT 1 FROM ussd.ussd_sessions s
+            WHERE s.session_id = session_data.session_id
+                AND s.account_id = current_setting('app.current_account_id', true)::UUID
+        )
+        OR current_setting('app.is_admin', true)::BOOLEAN = true
+    );
+
+-- Session history limited to session owner
+CREATE POLICY session_history_access ON ussd.session_history
+    FOR SELECT
+    USING (
+        EXISTS (
+            SELECT 1 FROM ussd.ussd_sessions s
+            WHERE s.session_id = session_history.session_id
+                AND s.account_id = current_setting('app.current_account_id', true)::UUID
+        )
+        OR current_setting('app.is_admin', true)::BOOLEAN = true
+    );
 
 -- =============================================================================
--- TODO: Create admin bypass policies
+-- IMPLEMENTED: Create admin bypass policies
 -- DESCRIPTION: Allow admin override
 -- PRIORITY: HIGH
 -- SECURITY: Admin role tightly controlled; all actions audited
 -- PRIVACY: Admin access logged for compliance review
 -- =============================================================================
--- TODO: [RLS-005] Create admin bypass policies
--- INSTRUCTIONS:
---   -- Admin can see all data
---   CREATE POLICY admin_all_access ON core.transaction_log
---       FOR ALL
---       TO admin_role
---       USING (true);
+-- [RLS-005] Create admin bypass policies
+
+-- Admin can see all transaction data
+CREATE POLICY admin_transaction_access ON core.transaction_log
+    FOR ALL
+    TO admin_role
+    USING (true);
+
+-- Admin can see all accounts
+CREATE POLICY admin_account_access ON core.accounts
+    FOR ALL
+    TO admin_role
+    USING (true);
+
+-- Admin can manage all sessions
+CREATE POLICY admin_session_access ON ussd.ussd_sessions
+    FOR ALL
+    TO admin_role
+    USING (true);
+
+-- Admin can manage all menus
+CREATE POLICY admin_menu_access ON ussd.menu_definitions
+    FOR ALL
+    TO admin_role
+    USING (true);
+
+-- Admin can see all audit logs
+CREATE POLICY admin_audit_access ON audit.audit_log
+    FOR ALL
+    TO admin_role
+    USING (true);
 
 -- =============================================================================
--- TODO: Create RLS helper functions
+-- IMPLEMENTED: Create RLS helper functions
 -- DESCRIPTION: Support RLS evaluation
 -- PRIORITY: HIGH
 -- SECURITY: SECURITY DEFINER; validates permissions
 -- PERFORMANCE: STABLE for query optimization
 -- =============================================================================
--- TODO: [RLS-006] Create RLS helper functions
--- INSTRUCTIONS:
---   -- Get current user's accessible applications
---   CREATE OR REPLACE FUNCTION security.get_user_applications()
---   RETURNS UUID[] AS $$
---   BEGIN
---       RETURN (
---           SELECT ARRAY_AGG(DISTINCT application_id)
---           FROM app.current_memberships
---           WHERE account_id = current_setting('app.current_account_id')::UUID
---       );
---   END;
---   $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
---   
---   -- Check if user has access to account
---   CREATE OR REPLACE FUNCTION security.has_account_access(p_account_id UUID)
---   RETURNS BOOLEAN AS $$
---   BEGIN
---       RETURN EXISTS (
---           SELECT 1 FROM app.current_memberships
---           WHERE account_id = p_account_id
---       ) OR current_setting('app.is_admin')::BOOLEAN = true;
---   END;
---   $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+-- [RLS-006] Create RLS helper functions
+
+-- Get current user's accessible applications
+CREATE OR REPLACE FUNCTION security.get_user_applications()
+RETURNS UUID[] AS $$
+BEGIN
+    RETURN COALESCE(
+        (
+            SELECT ARRAY_AGG(DISTINCT application_id)
+            FROM app.account_memberships
+            WHERE account_id = current_setting('app.current_account_id', true)::UUID
+                AND is_current = true
+        ),
+        ARRAY[]::UUID[]
+    );
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+
+-- Check if user has access to account
+CREATE OR REPLACE FUNCTION security.has_account_access(p_account_id UUID)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 FROM app.account_memberships
+        WHERE account_id = p_account_id
+            AND account_id = current_setting('app.current_account_id', true)::UUID
+            AND is_current = true
+    ) OR current_setting('app.is_admin', true)::BOOLEAN = true;
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+
+-- Check if user has application access
+CREATE OR REPLACE FUNCTION security.has_application_access(p_application_id UUID)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 FROM app.account_memberships
+        WHERE application_id = p_application_id
+            AND account_id = current_setting('app.current_account_id', true)::UUID
+            AND is_current = true
+    ) OR current_setting('app.is_admin', true)::BOOLEAN = true;
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+
+-- Set session context for RLS
+CREATE OR REPLACE FUNCTION security.set_session_context(
+    p_account_id UUID,
+    p_application_id UUID DEFAULT NULL,
+    p_is_admin BOOLEAN DEFAULT false
+) RETURNS VOID AS $$
+BEGIN
+    PERFORM set_config('app.current_account_id', p_account_id::text, false);
+    IF p_application_id IS NOT NULL THEN
+        PERFORM set_config('app.current_application_id', p_application_id::text, false);
+    END IF;
+    PERFORM set_config('app.is_admin', p_is_admin::text, false);
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- =============================================================================
--- TODO: Force RLS for table owners
+-- IMPLEMENTED: Force RLS for table owners
 -- DESCRIPTION: Ensure RLS applies to all users
 -- PRIORITY: CRITICAL
 -- SECURITY: Prevents owner bypass
 -- =============================================================================
--- TODO: [RLS-007] Force RLS for owners
--- INSTRUCTIONS:
---   ALTER TABLE core.transaction_log FORCE ROW LEVEL SECURITY;
---   ALTER TABLE core.accounts FORCE ROW LEVEL SECURITY;
---   ALTER TABLE core.movement_headers FORCE ROW LEVEL SECURITY;
+-- [RLS-007] Force RLS for owners
+
+ALTER TABLE core.transaction_log FORCE ROW LEVEL SECURITY;
+ALTER TABLE core.accounts FORCE ROW LEVEL SECURITY;
+ALTER TABLE core.movement_headers FORCE ROW LEVEL SECURITY;
+ALTER TABLE core.movement_legs FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE app.applications FORCE ROW LEVEL SECURITY;
+ALTER TABLE app.account_memberships FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE ussd.ussd_sessions FORCE ROW LEVEL SECURITY;
+ALTER TABLE ussd.pending_ussd_transactions FORCE ROW LEVEL SECURITY;
+ALTER TABLE ussd.device_fingerprints FORCE ROW LEVEL SECURITY;
 
 /*
 ================================================================================
@@ -279,18 +446,18 @@ COMPLIANCE MAPPING:
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create security.rls_policies documentation table
-□ Enable RLS on all tenant-scoped tables
-□ Create application isolation policies
-□ Create account-based access policies
-□ Create admin bypass policies
-□ Implement RLS helper functions
-□ Force RLS for table owners
-□ Test policy enforcement
-□ Test admin bypass
-□ Verify tenant isolation
-□ Document security context variables
-□ Set up policy violation monitoring
-□ Test performance impact
+[x] Create security.rls_policies documentation table
+[x] Enable RLS on all tenant-scoped tables
+[x] Create application isolation policies
+[x] Create account-based access policies
+[x] Create admin bypass policies
+[x] Implement RLS helper functions
+[x] Force RLS for table owners
+[ ] Test policy enforcement
+[ ] Test admin bypass
+[ ] Verify tenant isolation
+[ ] Document security context variables
+[ ] Set up policy violation monitoring
+[ ] Test performance impact
 ================================================================================
 */

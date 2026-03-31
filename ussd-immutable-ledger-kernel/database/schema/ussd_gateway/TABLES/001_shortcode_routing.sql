@@ -99,6 +99,9 @@ CREATE TABLE IF NOT EXISTS shortcode_routing (
     required_auth_level VARCHAR(16) DEFAULT 'NONE',
     -- NONE, ANONYMOUS, PIN, OTP, BIOMETRIC
     
+    -- SIM swap check requirement for sensitive routes
+    sim_swap_check_required BOOLEAN DEFAULT FALSE,
+    
     -- Menu configuration reference
     default_menu_id VARCHAR(64),
     
@@ -123,6 +126,35 @@ CREATE TABLE IF NOT EXISTS shortcode_routing (
     config_hash VARCHAR(64), -- SHA-256 of configuration for audit
     change_sequence BIGINT, -- Position in configuration changelog
     
+    -- CANARY DEPLOYMENT COLUMNS
+    canary_percentage DECIMAL(5,2) DEFAULT 0 CHECK (canary_percentage >= 0 AND canary_percentage <= 100),
+    canary_msisdn_ranges TEXT[], -- ['+255700000000-+255799999999']
+    canary_enabled_at TIMESTAMPTZ,
+    canary_completed_at TIMESTAMPTZ,
+    
+    -- CIRCUIT BREAKER COLUMNS
+    circuit_breaker_enabled BOOLEAN DEFAULT TRUE,
+    circuit_breaker_threshold DECIMAL(3,2) DEFAULT 0.50 CHECK (circuit_breaker_threshold > 0 AND circuit_breaker_threshold <= 1),
+    circuit_breaker_cooldown_seconds INT DEFAULT 60,
+    circuit_breaker_status VARCHAR(16) DEFAULT 'CLOSED', -- CLOSED, OPEN, HALF_OPEN
+    last_failure_at TIMESTAMPTZ,
+    consecutive_failures INT DEFAULT 0,
+    circuit_breaker_opened_at TIMESTAMPTZ,
+    
+    -- MULTI-REGION ROUTING COLUMNS
+    primary_region VARCHAR(32) DEFAULT 'default',
+    failover_region VARCHAR(32),
+    data_residency_requirement VARCHAR(32), -- 'EU', 'US', 'AFRICA', etc.
+    geo_routing_enabled BOOLEAN DEFAULT FALSE,
+    allowed_regions TEXT[], -- ['EU', 'UK', 'US']
+    blocked_regions TEXT[], -- ['SANCTIONED_COUNTRY']
+    
+    -- A/B TESTING COLUMNS
+    ab_test_variant VARCHAR(32), -- 'control', 'variant_a'
+    ab_test_config JSONB DEFAULT '{}',
+    ab_test_enabled BOOLEAN DEFAULT FALSE,
+    ab_test_allocation_percent DECIMAL(5,2) DEFAULT 50.00,
+    
     -- Constraints
     CONSTRAINT valid_shortcode_format CHECK (
         shortcode_pattern ~ '^\*[0-9]+([*][0-9#*]*)?#$'
@@ -144,10 +176,366 @@ CREATE TABLE IF NOT EXISTS shortcode_routing (
     CONSTRAINT valid_required_auth CHECK (
         required_auth_level IN ('NONE', 'ANONYMOUS', 'PIN', 'OTP', 'BIOMETRIC', 'HARDWARE_TOKEN')
     ),
+    CONSTRAINT valid_circuit_breaker_status CHECK (
+        circuit_breaker_status IN ('CLOSED', 'OPEN', 'HALF_OPEN')
+    ),
+    CONSTRAINT valid_ab_test_variant CHECK (
+        ab_test_variant IS NULL OR ab_test_variant IN ('control', 'variant_a', 'variant_b', 'variant_c')
+    ),
     
     -- Unique constraint for route matching order
     UNIQUE(shortcode_pattern, operator_code, match_priority)
 );
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: calculate_config_hash
+-- ----------------------------------------------------------------------------
+-- Calculates SHA-256 hash of route configuration for tamper detection
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION calculate_config_hash()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_config_text TEXT;
+BEGIN
+    v_config_text := NEW.shortcode_pattern || 
+                     NEW.base_shortcode || 
+                     NEW.application_id || 
+                     NEW.application_endpoint ||
+                     NEW.routing_method ||
+                     NEW.route_conditions::TEXT ||
+                     NEW.required_auth_level ||
+                     COALESCE(NEW.sim_swap_check_required::TEXT, 'false');
+    
+    NEW.config_hash := encode(digest(v_config_text, 'sha256'), 'hex');
+    NEW.change_sequence := nextval('route_change_seq');
+    NEW.updated_at := NOW();
+    
+    RETURN NEW;
+END;
+$$;
+
+-- Create sequence for change tracking
+CREATE SEQUENCE IF NOT EXISTS route_change_seq START 1;
+
+-- Apply hash calculation trigger
+CREATE TRIGGER trg_calculate_config_hash
+    BEFORE INSERT OR UPDATE ON shortcode_routing
+    FOR EACH ROW
+    EXECUTE FUNCTION calculate_config_hash();
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: resolve_shortcode
+-- ----------------------------------------------------------------------------
+-- Resolves a USSD string to the appropriate route
+-- Supports wildcard matching and parameter extraction
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION resolve_shortcode(
+    p_ussd_string VARCHAR,
+    p_operator_code VARCHAR
+)
+RETURNS TABLE (
+    route_id UUID,
+    application_id VARCHAR(64),
+    application_endpoint VARCHAR(512),
+    routing_method VARCHAR(20),
+    default_menu_id VARCHAR(64),
+    session_timeout_seconds INT,
+    max_session_duration_seconds INT,
+    allow_concurrent_sessions BOOLEAN,
+    required_auth_level VARCHAR(16),
+    sim_swap_check_required BOOLEAN,
+    rate_limit_requests_per_minute INT,
+    rate_limit_burst INT,
+    canary_percentage DECIMAL(5,2),
+    circuit_breaker_status VARCHAR(16),
+    primary_region VARCHAR(32),
+    failover_region VARCHAR(32),
+    geo_routing_enabled BOOLEAN,
+    ab_test_enabled BOOLEAN,
+    ab_test_allocation_percent DECIMAL(5,2)
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        r.route_id,
+        r.application_id,
+        r.application_endpoint,
+        r.routing_method,
+        r.default_menu_id,
+        r.session_timeout_seconds,
+        r.max_session_duration_seconds,
+        r.allow_concurrent_sessions,
+        r.required_auth_level,
+        r.sim_swap_check_required,
+        r.rate_limit_requests_per_minute,
+        r.rate_limit_burst,
+        r.canary_percentage,
+        r.circuit_breaker_status,
+        r.primary_region,
+        r.failover_region,
+        r.geo_routing_enabled,
+        r.ab_test_enabled,
+        r.ab_test_allocation_percent
+    FROM shortcode_routing r
+    WHERE 
+        -- Check if circuit breaker is open (skip if so)
+        r.circuit_breaker_status != 'OPEN'
+        -- Check active status and effective dates
+        AND r.is_active = TRUE
+        AND r.effective_from <= NOW()
+        AND (r.effective_to IS NULL OR r.effective_to > NOW())
+        -- Match operator (NULL means all operators)
+        AND (r.operator_code IS NULL OR r.operator_code = p_operator_code)
+        -- Match shortcode pattern
+        AND (
+            -- Exact match
+            r.shortcode_pattern = p_ussd_string
+            -- Wildcard match: *123*# matches *123*1#, *123*2*5#
+            OR (r.shortcode_pattern LIKE '*%*#' AND p_ussd_string LIKE REPLACE(r.shortcode_pattern, '*#', '%#'))
+            -- Base shortcode match
+            OR r.base_shortcode = p_ussd_string
+        )
+    ORDER BY 
+        r.match_priority DESC,
+        -- More specific patterns first
+        LENGTH(r.shortcode_pattern) DESC
+    LIMIT 1;
+END;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: extract_ussd_parameters
+-- ----------------------------------------------------------------------------
+-- Extracts parameters from USSD string based on pattern
+-- Example: *123*AMOUNT*PIN# with pattern *123*# -> {amount, pin}
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION extract_ussd_parameters(
+    p_ussd_string VARCHAR,
+    p_pattern VARCHAR
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_params JSONB := '{}'::JSONB;
+    v_ussd_parts TEXT[];
+    v_pattern_parts TEXT[];
+    i INT;
+BEGIN
+    -- Split strings by asterisk
+    v_ussd_parts := string_to_array(p_ussd_string, '*');
+    v_pattern_parts := string_to_array(p_pattern, '*');
+    
+    -- Extract parameters
+    FOR i IN 1..array_length(v_ussd_parts, 1) LOOP
+        -- Skip empty parts and the hash at the end
+        IF v_ussd_parts[i] IS NOT NULL AND v_ussd_parts[i] != '' AND v_ussd_parts[i] != '#' THEN
+            -- If pattern part exists and is not a wildcard, use it as key
+            IF i <= array_length(v_pattern_parts, 1) THEN
+                IF v_pattern_parts[i] = '#' THEN
+                    -- Last part with hash, extract value before #
+                    v_params := v_params || jsonb_build_object('param_' || i, regexp_replace(v_ussd_parts[i], '#$', ''));
+                ELSIF v_pattern_parts[i] ~ '^[0-9]+$' THEN
+                    -- Numeric pattern part, skip (it's part of the structure)
+                    CONTINUE;
+                ELSE
+                    -- Named parameter in pattern
+                    v_params := v_params || jsonb_build_object(lower(v_pattern_parts[i]), v_ussd_parts[i]);
+                END IF;
+            ELSE
+                -- Extra parameter
+                v_params := v_params || jsonb_build_object('param_' || i, v_ussd_parts[i]);
+            END IF;
+        END IF;
+    END LOOP;
+    
+    RETURN v_params;
+END;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: check_circuit_breaker
+-- ----------------------------------------------------------------------------
+-- Updates circuit breaker status based on failure tracking
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION check_circuit_breaker(
+    p_route_id UUID,
+    p_success BOOLEAN
+)
+RETURNS VARCHAR(16) -- Returns current circuit breaker status
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_route RECORD;
+    v_new_status VARCHAR(16);
+BEGIN
+    SELECT * INTO v_route FROM shortcode_routing WHERE route_id = p_route_id;
+    
+    IF NOT FOUND THEN
+        RETURN 'CLOSED'; -- Default if route not found
+    END IF;
+    
+    v_new_status := v_route.circuit_breaker_status;
+    
+    -- Handle success
+    IF p_success THEN
+        IF v_route.circuit_breaker_status = 'HALF_OPEN' THEN
+            -- Reset to CLOSED after successful call in HALF_OPEN state
+            v_new_status := 'CLOSED';
+            UPDATE shortcode_routing 
+            SET circuit_breaker_status = 'CLOSED',
+                consecutive_failures = 0,
+                last_failure_at = NULL
+            WHERE route_id = p_route_id;
+        ELSIF v_route.consecutive_failures > 0 THEN
+            -- Reset failure count on success
+            UPDATE shortcode_routing 
+            SET consecutive_failures = 0
+            WHERE route_id = p_route_id;
+        END IF;
+    ELSE
+        -- Handle failure
+        UPDATE shortcode_routing 
+        SET consecutive_failures = consecutive_failures + 1,
+            last_failure_at = NOW()
+        WHERE route_id = p_route_id;
+        
+        -- Check if threshold exceeded
+        IF v_route.consecutive_failures + 1 >= (v_route.circuit_breaker_threshold * 10)::INT THEN
+            v_new_status := 'OPEN';
+            UPDATE shortcode_routing 
+            SET circuit_breaker_status = 'OPEN',
+                circuit_breaker_opened_at = NOW()
+            WHERE route_id = p_route_id;
+        END IF;
+    END IF;
+    
+    RETURN v_new_status;
+END;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: reset_circuit_breaker
+-- ----------------------------------------------------------------------------
+-- Manually resets circuit breaker (for maintenance or after fix)
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION reset_circuit_breaker(
+    p_route_id UUID,
+    p_reason TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    UPDATE shortcode_routing 
+    SET circuit_breaker_status = 'CLOSED',
+        consecutive_failures = 0,
+        last_failure_at = NULL,
+        circuit_breaker_opened_at = NULL
+    WHERE route_id = p_route_id;
+    
+    -- Log the reset to history
+    INSERT INTO shortcode_routing_history (
+        route_id,
+        change_type,
+        configuration_snapshot,
+        changed_by,
+        change_reason
+    ) VALUES (
+        p_route_id,
+        'CIRCUIT_BREAKER_RESET',
+        jsonb_build_object('reason', p_reason, 'reset_at', NOW()),
+        CURRENT_USER,
+        p_reason
+    );
+    
+    RETURN TRUE;
+END;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: is_msisdn_in_canary_range
+-- ----------------------------------------------------------------------------
+-- Checks if MSISDN is in canary deployment range
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION is_msisdn_in_canary_range(
+    p_msisdn VARCHAR,
+    p_canary_ranges TEXT[]
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_range TEXT;
+    v_start_msisdn VARCHAR;
+    v_end_msisdn VARCHAR;
+BEGIN
+    IF p_canary_ranges IS NULL OR array_length(p_canary_ranges, 1) IS NULL THEN
+        RETURN FALSE;
+    END IF;
+    
+    FOREACH v_range IN ARRAY p_canary_ranges LOOP
+        -- Parse range format: +255700000000-+255799999999
+        v_start_msisdn := split_part(v_range, '-', 1);
+        v_end_msisdn := split_part(v_range, '-', 2);
+        
+        IF p_msisdn >= v_start_msisdn AND p_msisdn <= v_end_msisdn THEN
+            RETURN TRUE;
+        END IF;
+    END LOOP;
+    
+    RETURN FALSE;
+END;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: select_canary_route
+-- ----------------------------------------------------------------------------
+-- Determines if request should use canary route based on percentage or MSISDN
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION select_canary_route(
+    p_msisdn VARCHAR,
+    p_canary_percentage DECIMAL,
+    p_canary_ranges TEXT[]
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_msisdn_hash BIGINT;
+    v_hash_percent DECIMAL;
+BEGIN
+    -- Check explicit MSISDN ranges first
+    IF p_canary_ranges IS NOT NULL AND array_length(p_canary_ranges, 1) > 0 THEN
+        IF is_msisdn_in_canary_range(p_msisdn, p_canary_ranges) THEN
+            RETURN TRUE;
+        END IF;
+    END IF;
+    
+    -- Use hash-based allocation for consistent user experience
+    v_msisdn_hash := abs(('x' || substr(md5(p_msisdn), 1, 8))::bit(32)::int);
+    v_hash_percent := (v_msisdn_hash % 10000) / 100.0;
+    
+    RETURN v_hash_percent < p_canary_percentage;
+END;
+$$;
 
 -- ----------------------------------------------------------------------------
 -- TABLE: shortcode_routing_history
@@ -159,7 +547,7 @@ CREATE TABLE IF NOT EXISTS shortcode_routing (
 CREATE TABLE IF NOT EXISTS shortcode_routing_history (
     history_id BIGSERIAL PRIMARY KEY,
     route_id UUID NOT NULL,
-    change_type VARCHAR(10) NOT NULL, -- CREATE, UPDATE, DELETE, ACTIVATE, DEACTIVATE
+    change_type VARCHAR(32) NOT NULL, -- CREATE, UPDATE, DELETE, ACTIVATE, DEACTIVATE, CIRCUIT_BREAKER_RESET
     
     -- Full snapshot of configuration at this point in time
     configuration_snapshot JSONB NOT NULL,
@@ -175,11 +563,38 @@ CREATE TABLE IF NOT EXISTS shortcode_routing_history (
     
     -- Hash chain for tamper detection
     previous_hash VARCHAR(64),
-    snapshot_hash VARCHAR(64) NOT NULL,
-    
-    -- Foreign key (optional, routes may be hard-deleted)
-    -- CONSTRAINT fk_route FOREIGN KEY (route_id) REFERENCES shortcode_routing(route_id)
+    snapshot_hash VARCHAR(64) NOT NULL
 );
+
+-- Hash calculation for history entries
+CREATE OR REPLACE FUNCTION calculate_history_hash()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_prev_hash VARCHAR(64);
+BEGIN
+    -- Get previous hash for this route
+    SELECT snapshot_hash INTO v_prev_hash
+    FROM shortcode_routing_history
+    WHERE route_id = NEW.route_id
+    ORDER BY history_id DESC
+    LIMIT 1;
+    
+    NEW.previous_hash := v_prev_hash;
+    NEW.snapshot_hash := encode(digest(
+        NEW.route_id::TEXT || NEW.change_type || NEW.configuration_snapshot::TEXT || NEW.changed_at::TEXT,
+        'sha256'
+    ), 'hex');
+    
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_calculate_history_hash
+    BEFORE INSERT ON shortcode_routing_history
+    FOR EACH ROW
+    EXECUTE FUNCTION calculate_history_hash();
 
 -- ----------------------------------------------------------------------------
 -- TABLE: routing_metrics
@@ -215,6 +630,10 @@ CREATE TABLE IF NOT EXISTS routing_metrics (
     sessions_completed BIGINT DEFAULT 0,
     sessions_timeout BIGINT DEFAULT 0,
     
+    -- Circuit breaker metrics
+    circuit_opens INT DEFAULT 0,
+    circuit_half_opens INT DEFAULT 0,
+    
     -- Created at (for this record)
     recorded_at TIMESTAMPTZ DEFAULT NOW(),
     
@@ -222,69 +641,117 @@ CREATE TABLE IF NOT EXISTS routing_metrics (
 );
 
 -- ----------------------------------------------------------------------------
--- TODO: IMPLEMENTATION INSTRUCTIONS
+-- FUNCTION: record_routing_metric
+-- ----------------------------------------------------------------------------
+-- Records metrics for a routing operation
 -- ----------------------------------------------------------------------------
 
-/*
-TODO [ROUTING-001]: Implement shortcode pattern matching function
-  - Support wildcard matching: '*123*#' matches '*123*1#', '*123*2*5#'
-  - Support parameter extraction: '*123*AMOUNT*PIN#' -> extract AMOUNT, PIN
-  - Priority-based matching: More specific patterns match first
-  
-  Implementation in 000_resolve_shortcode.sql:
-  ```sql
-  CREATE OR REPLACE FUNCTION resolve_shortcode(
-    p_ussd_string VARCHAR,
-    p_operator_code VARCHAR
-  ) RETURNS TABLE (...)
-  ```
+CREATE OR REPLACE FUNCTION record_routing_metric(
+    p_route_id UUID,
+    p_success BOOLEAN,
+    p_response_time_ms INT,
+    p_error_type VARCHAR(10) DEFAULT NULL,
+    p_is_session_created BOOLEAN DEFAULT FALSE,
+    p_is_session_completed BOOLEAN DEFAULT FALSE,
+    p_is_timeout BOOLEAN DEFAULT FALSE
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_period TIMESTAMPTZ;
+BEGIN
+    v_period := DATE_TRUNC('hour', NOW());
+    
+    INSERT INTO routing_metrics (
+        route_id,
+        aggregation_period,
+        total_requests,
+        successful_requests,
+        failed_requests,
+        timeout_requests,
+        avg_response_time_ms,
+        max_response_time_ms,
+        error_4xx_count,
+        error_5xx_count,
+        network_error_count,
+        sessions_created,
+        sessions_completed,
+        sessions_timeout
+    ) VALUES (
+        p_route_id,
+        v_period,
+        1,
+        CASE WHEN p_success THEN 1 ELSE 0 END,
+        CASE WHEN NOT p_success THEN 1 ELSE 0 END,
+        CASE WHEN p_is_timeout THEN 1 ELSE 0 END,
+        p_response_time_ms,
+        p_response_time_ms,
+        CASE WHEN p_error_type = '4xx' THEN 1 ELSE 0 END,
+        CASE WHEN p_error_type = '5xx' THEN 1 ELSE 0 END,
+        CASE WHEN p_error_type = 'NETWORK' THEN 1 ELSE 0 END,
+        CASE WHEN p_is_session_created THEN 1 ELSE 0 END,
+        CASE WHEN p_is_session_completed THEN 1 ELSE 0 END,
+        CASE WHEN p_is_timeout THEN 1 ELSE 0 END
+    )
+    ON CONFLICT (route_id, aggregation_period) DO UPDATE SET
+        total_requests = routing_metrics.total_requests + 1,
+        successful_requests = routing_metrics.successful_requests + 
+            CASE WHEN p_success THEN 1 ELSE 0 END,
+        failed_requests = routing_metrics.failed_requests + 
+            CASE WHEN NOT p_success THEN 1 ELSE 0 END,
+        timeout_requests = routing_metrics.timeout_requests + 
+            CASE WHEN p_is_timeout THEN 1 ELSE 0 END,
+        avg_response_time_ms = (
+            (routing_metrics.avg_response_time_ms * routing_metrics.total_requests + p_response_time_ms) / 
+            (routing_metrics.total_requests + 1)
+        )::INT,
+        max_response_time_ms = GREATEST(routing_metrics.max_response_time_ms, p_response_time_ms),
+        error_4xx_count = routing_metrics.error_4xx_count + 
+            CASE WHEN p_error_type = '4xx' THEN 1 ELSE 0 END,
+        error_5xx_count = routing_metrics.error_5xx_count + 
+            CASE WHEN p_error_type = '5xx' THEN 1 ELSE 0 END,
+        network_error_count = routing_metrics.network_error_count + 
+            CASE WHEN p_error_type = 'NETWORK' THEN 1 ELSE 0 END,
+        sessions_created = routing_metrics.sessions_created + 
+            CASE WHEN p_is_session_created THEN 1 ELSE 0 END,
+        sessions_completed = routing_metrics.sessions_completed + 
+            CASE WHEN p_is_session_completed THEN 1 ELSE 0 END,
+        sessions_timeout = routing_metrics.sessions_timeout + 
+            CASE WHEN p_is_timeout THEN 1 ELSE 0 END;
+END;
+$$;
 
-TODO [ROUTING-002]: Implement configuration change approval workflow
-  - Sensitive routes (financial services) require dual authorization
-  - Changes must be staged before activation
-  - Automatic rollback on error rate spike
-  
-  Workflow states: DRAFT -> PENDING_APPROVAL -> APPROVED -> ACTIVE
+-- ----------------------------------------------------------------------------
+-- INDEXES
+-- ----------------------------------------------------------------------------
 
-TODO [ROUTING-003]: Implement canary deployment support
-  - Gradual traffic shift: 1% -> 5% -> 25% -> 100%
-  - Automatic rollback if error rate > threshold
-  - Route based on MSISDN hash for consistent user experience
-  
-  Add columns:
-    canary_percentage DECIMAL(5,2) DEFAULT 0,
-    canary_msisdn_ranges TEXT[], -- ['+255700000000-+255799999999']
+-- Fast lookup for active routes by shortcode
+CREATE INDEX idx_routing_active_shortcode 
+    ON shortcode_routing(base_shortcode, is_active, match_priority DESC);
 
-TODO [ROUTING-004]: Implement circuit breaker pattern
-  - Track application health in routing_metrics
-  - Auto-disable route if failure rate > threshold (e.g., 50%)
-  - Exponential backoff for retries
-  
-  Add columns:
-    circuit_breaker_threshold DECIMAL(3,2) DEFAULT 0.50,
-    circuit_breaker_cooldown_seconds INT DEFAULT 60,
-    last_failure_at TIMESTAMPTZ,
-    consecutive_failures INT DEFAULT 0
+-- Operator-specific route lookup
+CREATE INDEX idx_routing_operator 
+    ON shortcode_routing(operator_code, base_shortcode, is_active);
 
-TODO [ROUTING-005]: Implement multi-region routing
-  - Geographic routing based on MSISDN prefix
-  - Disaster recovery failover to secondary region
-  - Data residency compliance (store EU data in EU)
-  
-  Add columns:
-    primary_region VARCHAR(32),
-    failover_region VARCHAR(32),
-    data_residency_requirement VARCHAR(32)
+-- Time-based route validity
+CREATE INDEX idx_routing_effective_dates 
+    ON shortcode_routing(effective_from, effective_to) 
+    WHERE effective_to IS NOT NULL;
 
-TODO [ROUTING-006]: Implement A/B testing framework
-  - Route traffic to different application versions
-  - Track conversion metrics per variant
-  - Automatic winner selection based on statistical significance
-  
-  Add columns:
-    ab_test_variant VARCHAR(32), -- 'control', 'variant_a'
-    ab_test_config JSONB
-*/
+-- Circuit breaker monitoring
+CREATE INDEX idx_routing_circuit_breaker 
+    ON shortcode_routing(circuit_breaker_status, consecutive_failures DESC)
+    WHERE circuit_breaker_status != 'CLOSED';
+
+-- History lookup for audit
+CREATE INDEX idx_routing_history_route 
+    ON shortcode_routing_history(route_id, changed_at DESC);
+
+-- Metrics aggregation queries
+CREATE INDEX idx_routing_metrics_period 
+    ON routing_metrics(route_id, aggregation_period DESC);
 
 -- ----------------------------------------------------------------------------
 -- SECURITY CONSIDERATIONS
@@ -357,7 +824,7 @@ Per-route timeout configuration:
 -- SIM SWAP DETECTION LOGIC
 -- ----------------------------------------------------------------------------
 -- [ISO/IEC 27035-2:2023] SIM swap detection integration
--- [ISO 31000:2018] Risk-based route restrictions
+-- [ISO 31000:2018] Risk-adjusted route restrictions
 -- Post-swap routing: Enhanced verification routes
 -- GSMA IR.71 compliance for swap detection
 /*
@@ -369,7 +836,7 @@ Shortcode routing can be used to trigger SIM swap detection:
    - Mandatory 24h cooling period for new device + high-value
 
 2. ROUTE-BASED SIM SWAP CHECKS:
-   - Add sim_swap_required BOOLEAN to routing table
+   - sim_swap_check_required = TRUE triggers SIM swap check
    - When TRUE, query SIM swap detection before allowing access
    - Route to verification flow if swap detected within 72h
 
@@ -377,34 +844,7 @@ Shortcode routing can be used to trigger SIM swap detection:
    - Low risk: Normal flow
    - Medium risk: Additional PIN required
    - High risk: Block, require in-branch verification
-   
-   Risk calculation in 002_detect_sim_swap.sql
 */
-
--- ----------------------------------------------------------------------------
--- INDEXES
--- ----------------------------------------------------------------------------
-
--- Fast lookup for active routes by shortcode
-CREATE INDEX idx_routing_active_shortcode 
-    ON shortcode_routing(base_shortcode, is_active, match_priority DESC);
-
--- Operator-specific route lookup
-CREATE INDEX idx_routing_operator 
-    ON shortcode_routing(operator_code, base_shortcode, is_active);
-
--- Time-based route validity
-CREATE INDEX idx_routing_effective_dates 
-    ON shortcode_routing(effective_from, effective_to) 
-    WHERE effective_to IS NOT NULL;
-
--- History lookup for audit
-CREATE INDEX idx_routing_history_route 
-    ON shortcode_routing_history(route_id, changed_at DESC);
-
--- Metrics aggregation queries
-CREATE INDEX idx_routing_metrics_period 
-    ON routing_metrics(route_id, aggregation_period DESC);
 
 -- ----------------------------------------------------------------------------
 -- SAMPLE DATA (Development/Testing Only)
@@ -414,9 +854,10 @@ CREATE INDEX idx_routing_metrics_period
 INSERT INTO shortcode_routing (
     shortcode_pattern, base_shortcode, operator_code,
     application_id, application_endpoint, routing_method,
+    sim_swap_check_required, required_auth_level,
     created_by, updated_by
 ) VALUES 
-    ('*150#', '*150#', NULL, 'mobile_money', 'http://mm-service:8080/ussd', 'DIRECT', 'admin', 'admin'),
-    ('*150*1#', '*150#', NULL, 'mobile_money', 'http://mm-service:8080/ussd', 'DIRECT', 'admin', 'admin'),
-    ('*151#', '*151#', '64002', 'banking', 'http://bank-service:8080/ussd', 'LOAD_BALANCED', 'admin', 'admin');
+    ('*150#', '*150#', NULL, 'mobile_money', 'http://mm-service:8080/ussd', 'DIRECT', TRUE, 'PIN', 'admin', 'admin'),
+    ('*150*1#', '*150#', NULL, 'mobile_money', 'http://mm-service:8080/ussd', 'DIRECT', TRUE, 'PIN', 'admin', 'admin'),
+    ('*151#', '*151#', '64002', 'banking', 'http://bank-service:8080/ussd', 'LOAD_BALANCED', TRUE, 'BIOMETRIC', 'admin', 'admin');
 */

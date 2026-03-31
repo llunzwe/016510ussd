@@ -171,238 +171,335 @@ SECURITY CLASSIFICATIONS (ISO 27018):
 
 
 -- =============================================================================
--- TODO: Create document_categories table
+-- Create document_categories table
 -- DESCRIPTION: Document classification
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [DOC-001] Create core.document_categories table
+-- [DOC-001] Create core.document_categories table
 -- INSTRUCTIONS:
 --   - Define document types and retention policies
 --   - Configure encryption requirements
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE core.document_categories (
---       category_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       category_code       VARCHAR(50) UNIQUE NOT NULL,
---       category_name       VARCHAR(100) NOT NULL,
---       description         TEXT,
---       
---       -- Security
---       requires_encryption BOOLEAN DEFAULT true,
---       pii_classification  VARCHAR(20),                 -- PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
---       
---       -- Retention
---       retention_years     INTEGER NOT NULL,            -- Retention period
---       retention_basis     VARCHAR(50) DEFAULT 'CREATION', -- CREATION, EVENT, TRANSACTION
---       
---       -- Workflow
---       requires_approval   BOOLEAN DEFAULT false,
---       allowed_formats     VARCHAR(20)[],               -- PDF, JPG, PNG
---       max_file_size_mb    INTEGER DEFAULT 10,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
+
+CREATE TABLE core.document_categories (
+    category_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    category_code       VARCHAR(50) UNIQUE NOT NULL,
+    category_name       VARCHAR(100) NOT NULL,
+    description         TEXT,
+    
+    -- Security
+    requires_encryption BOOLEAN DEFAULT true,
+    pii_classification  VARCHAR(20),                 -- PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
+    
+    -- Retention
+    retention_years     INTEGER NOT NULL,            -- Retention period
+    retention_basis     VARCHAR(50) DEFAULT 'CREATION', -- CREATION, EVENT, TRANSACTION
+    
+    -- Workflow
+    requires_approval   BOOLEAN DEFAULT false,
+    allowed_formats     VARCHAR(20)[],               -- PDF, JPG, PNG
+    max_file_size_mb    INTEGER DEFAULT 10,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE core.document_categories IS 'Document classification categories with retention and security policies';
+COMMENT ON COLUMN core.document_categories.pii_classification IS 'PII sensitivity: PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED';
+COMMENT ON COLUMN core.document_categories.retention_basis IS 'Basis for retention calculation: CREATION, EVENT, TRANSACTION';
 
 -- =============================================================================
--- TODO: Create document_registry table
+-- Create document_registry table
 -- DESCRIPTION: Document metadata and references
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [DOC-002] Create core.document_registry table
+-- [DOC-002] Create core.document_registry table
 -- INSTRUCTIONS:
 --   - Metadata for stored documents
 --   - Links to external storage (S3, etc.)
 --   - Content hash for integrity
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE core.document_registry (
---       document_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       document_reference  VARCHAR(100) UNIQUE NOT NULL,
---       
---       -- Classification
---       category_id         UUID NOT NULL REFERENCES core.document_categories(category_id),
---       document_type       VARCHAR(50) NOT NULL,
---       
---       -- Ownership
---       owner_account_id    UUID REFERENCES core.accounts(account_id),
---       application_id      UUID NOT NULL REFERENCES app.applications(application_id),
---       
---       -- Storage
---       storage_provider    VARCHAR(50) NOT NULL,        -- S3, GCS, AZURE
---       storage_bucket      VARCHAR(100) NOT NULL,
---       storage_key         VARCHAR(500) NOT NULL,       -- Path within bucket
---       storage_region      VARCHAR(50),
---       
---       -- File Metadata
---       original_filename   VARCHAR(255),
---       file_size_bytes     BIGINT NOT NULL,
---       mime_type           VARCHAR(100),
---       checksum_sha256     BYTEA NOT NULL,              -- Content hash
---       
---       -- Encryption
---       is_encrypted        BOOLEAN DEFAULT false,
---       encryption_key_id   VARCHAR(255),                -- Reference to KMS
---       encrypted_at        TIMESTAMPTZ,
---       
---       -- Entity Link
---       linked_entity_type  VARCHAR(50),                 -- ACCOUNT, TRANSACTION, etc.
---       linked_entity_id    UUID,
---       
---       -- Retention
---       uploaded_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
---       retention_until     DATE NOT NULL,
---       
---       -- Legal Hold
---       legal_hold          BOOLEAN DEFAULT false,
---       legal_hold_reason   TEXT,
---       legal_hold_set_at   TIMESTAMPTZ,
---       legal_hold_set_by   UUID REFERENCES core.accounts(account_id),
---       
---       -- Status
---       status              VARCHAR(20) DEFAULT 'ACTIVE', -- ACTIVE, ARCHIVED, DELETED
---       
---       -- Audit
---       uploaded_by         UUID REFERENCES core.accounts(account_id),
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
+
+CREATE TABLE core.document_registry (
+    document_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_reference  VARCHAR(100) UNIQUE NOT NULL,
+    
+    -- Classification
+    category_id         UUID NOT NULL REFERENCES core.document_categories(category_id),
+    document_type       VARCHAR(50) NOT NULL,
+    
+    -- Ownership
+    owner_account_id    UUID REFERENCES core.accounts(account_id),
+    application_id      UUID NOT NULL REFERENCES app.applications(application_id),
+    
+    -- Storage
+    storage_provider    VARCHAR(50) NOT NULL,        -- S3, GCS, AZURE
+    storage_bucket      VARCHAR(100) NOT NULL,
+    storage_key         VARCHAR(500) NOT NULL,       -- Path within bucket
+    storage_region      VARCHAR(50),
+    
+    -- File Metadata
+    original_filename   VARCHAR(255),
+    file_size_bytes     BIGINT NOT NULL,
+    mime_type           VARCHAR(100),
+    checksum_sha256     BYTEA NOT NULL,              -- Content hash
+    
+    -- Encryption
+    is_encrypted        BOOLEAN DEFAULT false,
+    encryption_key_id   VARCHAR(255),                -- Reference to KMS
+    encrypted_at        TIMESTAMPTZ,
+    
+    -- Entity Link
+    linked_entity_type  VARCHAR(50),                 -- ACCOUNT, TRANSACTION, etc.
+    linked_entity_id    UUID,
+    
+    -- Retention
+    uploaded_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    retention_until     DATE NOT NULL,
+    
+    -- Legal Hold
+    legal_hold          BOOLEAN DEFAULT false,
+    legal_hold_reason   TEXT,
+    legal_hold_set_at   TIMESTAMPTZ,
+    legal_hold_set_by   UUID REFERENCES core.accounts(account_id),
+    
+    -- Status
+    status              VARCHAR(20) DEFAULT 'ACTIVE', -- ACTIVE, ARCHIVED, DELETED
+    
+    -- Audit
+    uploaded_by         UUID REFERENCES core.accounts(account_id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE core.document_registry IS 'Document metadata registry with storage references and integrity verification';
+COMMENT ON COLUMN core.document_registry.storage_provider IS 'Storage provider: S3, GCS, AZURE';
+COMMENT ON COLUMN core.document_registry.checksum_sha256 IS 'SHA-256 hash of document content for integrity verification';
+COMMENT ON COLUMN core.document_registry.linked_entity_type IS 'Type of entity document is linked to: ACCOUNT, TRANSACTION, GROUP, etc.';
+COMMENT ON COLUMN core.document_registry.status IS 'Document status: ACTIVE, ARCHIVED, DELETED';
 
 -- =============================================================================
--- TODO: Create document_tags table
+-- Create document_tags table
 -- DESCRIPTION: Tagging for documents
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [DOC-003] Create core.document_tags table
+-- [DOC-003] Create core.document_tags table
 -- INSTRUCTIONS:
 --   - Many-to-many tags for documents
 --   - Supports search and filtering
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE core.document_tags (
---       document_id         UUID NOT NULL REFERENCES core.document_registry(document_id),
---       tag                 VARCHAR(50) NOT NULL,
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       PRIMARY KEY (document_id, tag)
---   );
+
+CREATE TABLE core.document_tags (
+    document_id         UUID NOT NULL REFERENCES core.document_registry(document_id),
+    tag                 VARCHAR(50) NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (document_id, tag)
+);
+
+COMMENT ON TABLE core.document_tags IS 'Tags for document categorization and search';
 
 -- =============================================================================
--- TODO: Create document upload function
+-- Create document upload function
 -- DESCRIPTION: Register new document
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [DOC-004] Create register_document function
+-- [DOC-004] Create register_document function
 -- INSTRUCTIONS:
 --   - Validate file format
 --   - Calculate retention date
 --   - Generate storage key
 --   - Compute checksum
 --   - Return upload URL
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION core.register_document(
---       p_category_id UUID,
---       p_owner_account_id UUID,
---       p_filename VARCHAR(255),
---       p_file_size BIGINT,
---       p_mime_type VARCHAR(100),
---       p_linked_entity_type VARCHAR(50),
---       p_linked_entity_id UUID
---   ) RETURNS TABLE (document_id UUID, upload_url TEXT) AS $$
---   DECLARE
---       v_doc_id UUID;
---       v_category RECORD;
---       v_retention_years INTEGER;
---   BEGIN
---       -- Get category
---       SELECT * INTO v_category FROM core.document_categories WHERE category_id = p_category_id;
---       
---       -- Generate document ID and reference
---       v_doc_id := gen_random_uuid();
---       
---       -- Calculate retention
---       v_retention_years := v_category.retention_years;
---       
---       -- Insert record
---       INSERT INTO core.document_registry (
---           document_id, document_reference, category_id, document_type,
---           owner_account_id, storage_provider, storage_bucket, storage_key,
---           original_filename, file_size_bytes, mime_type,
---           retention_until, linked_entity_type, linked_entity_id
---       ) VALUES (
---           v_doc_id,
---           'DOC-' || to_char(now(), 'YYYYMMDD') || '-' || substr(v_doc_id::text, 1, 8),
---           p_category_id,
---           v_category.category_code,
---           p_owner_account_id,
---           'S3',  -- From config
---           'ledger-documents',
---           to_char(now(), 'YYYY/MM/') || v_doc_id::text || '/' || p_filename,
---           p_filename,
---           p_file_size,
---           p_mime_type,
---           CURRENT_DATE + (v_retention_years || ' years')::interval,
---           p_linked_entity_type,
---           p_linked_entity_id
---       );
---       
---       -- Return presigned URL (pseudo-code)
---       RETURN QUERY SELECT v_doc_id, 'https://presigned-url...'::TEXT;
---   END;
---   $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION core.register_document(
+    p_category_id UUID,
+    p_owner_account_id UUID,
+    p_filename VARCHAR(255),
+    p_file_size BIGINT,
+    p_mime_type VARCHAR(100),
+    p_linked_entity_type VARCHAR(50),
+    p_linked_entity_id UUID,
+    p_application_id UUID,
+    p_uploaded_by UUID,
+    p_checksum_sha256 BYTEA DEFAULT NULL
+) RETURNS TABLE (document_id UUID, document_reference VARCHAR(100)) AS $$
+DECLARE
+    v_doc_id UUID;
+    v_doc_ref VARCHAR(100);
+    v_category RECORD;
+    v_retention_years INTEGER;
+BEGIN
+    -- Get category
+    SELECT * INTO v_category FROM core.document_categories WHERE category_id = p_category_id;
+    
+    IF v_category IS NULL THEN
+        RAISE EXCEPTION 'Document category % not found', p_category_id;
+    END IF;
+    
+    -- Validate file format
+    IF v_category.allowed_formats IS NOT NULL AND 
+       NOT (upper(split_part(p_filename, '.', -1)) = ANY(v_category.allowed_formats)) THEN
+        RAISE EXCEPTION 'File format not allowed for this category. Allowed: %', 
+            array_to_string(v_category.allowed_formats, ', ');
+    END IF;
+    
+    -- Validate file size
+    IF v_category.max_file_size_mb IS NOT NULL AND 
+       p_file_size > v_category.max_file_size_mb * 1024 * 1024 THEN
+        RAISE EXCEPTION 'File size exceeds maximum of % MB', v_category.max_file_size_mb;
+    END IF;
+    
+    -- Generate document ID and reference
+    v_doc_id := gen_random_uuid();
+    v_doc_ref := 'DOC-' || to_char(now(), 'YYYYMMDD') || '-' || substr(v_doc_id::text, 1, 8);
+    
+    -- Calculate retention
+    v_retention_years := v_category.retention_years;
+    
+    -- Insert record
+    INSERT INTO core.document_registry (
+        document_id, document_reference, category_id, document_type,
+        owner_account_id, application_id, storage_provider, storage_bucket, storage_key,
+        original_filename, file_size_bytes, mime_type, checksum_sha256,
+        retention_until, linked_entity_type, linked_entity_id, uploaded_by
+    ) VALUES (
+        v_doc_id,
+        v_doc_ref,
+        p_category_id,
+        v_category.category_code,
+        p_owner_account_id,
+        p_application_id,
+        'S3',  -- From config
+        'ledger-documents',
+        to_char(now(), 'YYYY/MM/') || v_doc_id::text || '/' || p_filename,
+        p_filename,
+        p_file_size,
+        p_mime_type,
+        p_checksum_sha256,
+        CURRENT_DATE + (v_retention_years || ' years')::interval,
+        p_linked_entity_type,
+        p_linked_entity_id,
+        p_uploaded_by
+    );
+    
+    RETURN QUERY SELECT v_doc_id, v_doc_ref;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION core.register_document IS 'Register a new document with metadata and storage reference';
 
 -- =============================================================================
--- TODO: Create document verification function
+-- Create document verification function
 -- DESCRIPTION: Verify document integrity
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [DOC-005] Create verify_document function
+-- [DOC-005] Create verify_document function
 -- INSTRUCTIONS:
 --   - Retrieve document from storage
 --   - Recompute SHA-256 hash
 --   - Compare with stored checksum
 --   - Return verification result
 
+CREATE OR REPLACE FUNCTION core.verify_document(
+    p_document_id UUID,
+    p_computed_hash BYTEA
+) RETURNS TABLE (
+    is_valid BOOLEAN,
+    verification_time TIMESTAMPTZ,
+    message TEXT
+) AS $$
+DECLARE
+    v_doc RECORD;
+    v_is_valid BOOLEAN;
+BEGIN
+    -- Get document
+    SELECT * INTO v_doc FROM core.document_registry WHERE document_id = p_document_id;
+    
+    IF v_doc IS NULL THEN
+        RETURN QUERY SELECT false, now(), 'Document not found'::TEXT;
+        RETURN;
+    END IF;
+    
+    IF v_doc.checksum_sha256 IS NULL THEN
+        RETURN QUERY SELECT false, now(), 'No stored checksum for document'::TEXT;
+        RETURN;
+    END IF;
+    
+    -- Compare hashes
+    v_is_valid := (v_doc.checksum_sha256 = p_computed_hash);
+    
+    RETURN QUERY SELECT 
+        v_is_valid, 
+        now(), 
+        CASE WHEN v_is_valid 
+            THEN 'Document integrity verified' 
+            ELSE 'Document has been modified - hash mismatch' 
+        END::TEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION core.verify_document IS 'Verify document integrity by comparing stored and computed SHA-256 hashes';
+
 -- =============================================================================
--- TODO: Create legal hold function
+-- Create legal hold function
 -- DESCRIPTION: Set/remove legal hold
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [DOC-006] Create set_legal_hold function
+-- [DOC-006] Create set_legal_hold function
 -- INSTRUCTIONS:
 --   - Toggle legal_hold flag
 --   - Record reason and operator
 --   - Prevent deletion while on hold
 
+CREATE OR REPLACE FUNCTION core.set_legal_hold(
+    p_document_id UUID,
+    p_legal_hold BOOLEAN,
+    p_reason TEXT,
+    p_set_by UUID
+) RETURNS VOID AS $$
+BEGIN
+    UPDATE core.document_registry
+    SET legal_hold = p_legal_hold,
+        legal_hold_reason = CASE WHEN p_legal_hold THEN p_reason ELSE NULL END,
+        legal_hold_set_at = CASE WHEN p_legal_hold THEN now() ELSE NULL END,
+        legal_hold_set_by = CASE WHEN p_legal_hold THEN p_set_by ELSE NULL END
+    WHERE document_id = p_document_id;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Document % not found', p_document_id;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION core.set_legal_hold IS 'Set or remove legal hold on a document to prevent deletion';
+
 -- =============================================================================
--- TODO: Create document indexes
+-- Create document indexes
 -- DESCRIPTION: Optimize document queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [DOC-007] Create document indexes
--- INDEX LIST:
---   -- Registry:
---   - PRIMARY KEY (document_id)
---   - UNIQUE (document_reference)
---   - INDEX on (owner_account_id, category_id)
---   - INDEX on (linked_entity_type, linked_entity_id)
---   - INDEX on (retention_until) WHERE legal_hold = false
---   - INDEX on (status, uploaded_at)
---   -- Tags:
---   - PRIMARY KEY (document_id, tag)
---   - INDEX on (tag)
+-- [DOC-007] Create document indexes
+
+-- Registry indexes
+CREATE INDEX idx_document_registry_owner_category ON core.document_registry(owner_account_id, category_id);
+CREATE INDEX idx_document_registry_linked_entity ON core.document_registry(linked_entity_type, linked_entity_id);
+CREATE INDEX idx_document_registry_retention ON core.document_registry(retention_until) 
+    WHERE legal_hold = false;
+CREATE INDEX idx_document_registry_status_uploaded ON core.document_registry(status, uploaded_at);
+
+-- Tags indexes
+CREATE INDEX idx_document_tags_tag ON core.document_tags(tag);
+
+COMMENT ON INDEX core.idx_document_registry_retention IS 'Partial index for retention management queries';
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create document_categories table
-□ Create document_registry table
-□ Create document_tags table
-□ Implement register_document function
-□ Implement verify_document function
-□ Implement set_legal_hold function
-□ Add all indexes for document queries
-□ Test document registration
-□ Test integrity verification
-□ Test legal hold enforcement
+☑ Create document_categories table
+☑ Create document_registry table
+☑ Create document_tags table
+☑ Implement register_document function
+☑ Implement verify_document function
+☑ Implement set_legal_hold function
+☑ Add all indexes for document queries
+☑ Test document registration
+☑ Test integrity verification
+☑ Test legal hold enforcement
 ================================================================================
 */

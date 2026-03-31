@@ -175,200 +175,238 @@ FUNCTIONS:
 
 
 -- =============================================================================
--- TODO: Create cutoff_times table
+-- IMPLEMENTED: Create cutoff_times table
 -- DESCRIPTION: Cut-off time definitions
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [CUTOFF-001] Create app.cutoff_times table
--- INSTRUCTIONS:
---   - Per-transaction-type cut-off configuration
---   - Business day rules
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.cutoff_times (
---       cutoff_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Scope
---       application_id      UUID NOT NULL REFERENCES app.applications(application_id),
---       transaction_type_id UUID REFERENCES core.transaction_types(transaction_type_id),
---       
---       -- Cut-off Time
---       cutoff_time         TIME NOT NULL,               -- e.g., '16:00'
---       timezone            VARCHAR(50) DEFAULT 'UTC',
---       
---       -- Business Day Rule
---       if_after_cutoff     VARCHAR(20) DEFAULT 'NEXT_DAY', -- NEXT_DAY, NEXT_HOUR, REJECT
---       next_day_offset     INTEGER DEFAULT 1,           -- 1 = next business day
---       
---       -- Grace Period
---       grace_minutes       INTEGER DEFAULT 0,
---       
---       -- Message
---       cutoff_message      VARCHAR(255),                -- User-facing message
---       
---       -- Validity
---       valid_from          DATE NOT NULL DEFAULT CURRENT_DATE,
---       valid_to            DATE,
---       
---       -- Status
---       is_active           BOOLEAN DEFAULT true,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       created_by          UUID REFERENCES core.accounts(account_id)
---   );
+-- [CUTOFF-001] Create app.cutoff_times table
+CREATE TABLE app.cutoff_times (
+    cutoff_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Scope
+    application_id      UUID NOT NULL REFERENCES app.applications(application_id),
+    transaction_type_id UUID REFERENCES core.transaction_types(transaction_type_id),
+    
+    -- Cut-off Time
+    cutoff_time         TIME NOT NULL,               -- e.g., '16:00'
+    timezone            VARCHAR(50) DEFAULT 'UTC',
+    
+    -- Business Day Rule
+    if_after_cutoff     VARCHAR(20) DEFAULT 'NEXT_DAY', -- NEXT_DAY, NEXT_HOUR, REJECT
+    next_day_offset     INTEGER DEFAULT 1,           -- 1 = next business day
+    
+    -- Grace Period
+    grace_minutes       INTEGER DEFAULT 0,
+    
+    -- Message
+    cutoff_message      VARCHAR(255),                -- User-facing message
+    
+    -- Validity
+    valid_from          DATE NOT NULL DEFAULT CURRENT_DATE,
+    valid_to            DATE,
+    
+    -- Status
+    is_active           BOOLEAN DEFAULT true,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by          UUID REFERENCES core.accounts(account_id)
+);
+
+COMMENT ON TABLE app.cutoff_times IS 'Cut-off time definitions per transaction type';
 
 -- =============================================================================
--- TODO: Create cutoff_exceptions table
+-- IMPLEMENTED: Create cutoff_exceptions table
 -- DESCRIPTION: Exception dates for cut-offs
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [CUTOFF-002] Create app.cutoff_exceptions table
--- INSTRUCTIONS:
---   - Special cut-off times for specific dates
---   - Early closures, extended hours
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.cutoff_exceptions (
---       exception_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       cutoff_id           UUID NOT NULL REFERENCES app.cutoff_times(cutoff_id),
---       
---       -- Date
---       exception_date      DATE NOT NULL,
---       
---       -- Exception Details
---       cutoff_time         TIME,                        -- NULL = no cutoff (always accept)
---       is_closed           BOOLEAN DEFAULT false,       -- No transactions this day
---       
---       -- Reason
---       reason              VARCHAR(255),
---       
---       UNIQUE (cutoff_id, exception_date)
---   );
+-- [CUTOFF-002] Create app.cutoff_exceptions table
+CREATE TABLE app.cutoff_exceptions (
+    exception_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cutoff_id           UUID NOT NULL REFERENCES app.cutoff_times(cutoff_id),
+    
+    -- Date
+    exception_date      DATE NOT NULL,
+    
+    -- Exception Details
+    cutoff_time         TIME,                        -- NULL = no cutoff (always accept)
+    is_closed           BOOLEAN DEFAULT false,       -- No transactions this day
+    
+    -- Reason
+    reason              VARCHAR(255),
+    
+    UNIQUE (cutoff_id, exception_date)
+);
+
+COMMENT ON TABLE app.cutoff_exceptions IS 'Exception dates for cut-off times';
 
 -- =============================================================================
--- TODO: Create check_cutoff function
+-- IMPLEMENTED: Create check_cutoff function
 -- DESCRIPTION: Check if transaction is before cut-off
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [CUTOFF-003] Create check_cutoff_time function
--- INSTRUCTIONS:
---   - Get applicable cut-off for transaction type
---   - Check current time against cut-off
---   - Return effective date
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.check_cutoff_time(
---       p_application_id UUID,
---       p_transaction_type_id UUID,
---       p_timestamp TIMESTAMPTZ DEFAULT now()
---   ) RETURNS TABLE (
---       is_before_cutoff BOOLEAN,
---       effective_date DATE,
---       cutoff_time TIMESTAMPTZ,
---       message TEXT
---   ) AS $$
---   DECLARE
---       v_cutoff RECORD;
---       v_exception RECORD;
---       v_effective_date DATE;
---       v_is_before BOOLEAN;
---       v_cutoff_ts TIMESTAMPTZ;
---   BEGIN
---       -- Get cut-off configuration
---       SELECT * INTO v_cutoff
---       FROM app.cutoff_times
---       WHERE application_id = p_application_id
---           AND (transaction_type_id = p_transaction_type_id OR transaction_type_id IS NULL)
---           AND is_active = true
---           AND valid_from <= CURRENT_DATE
---           AND (valid_to IS NULL OR valid_to >= CURRENT_DATE)
---       ORDER BY transaction_type_id IS NULL  -- Prefer specific over general
---       LIMIT 1;
---       
---       IF v_cutoff IS NULL THEN
---           -- No cut-off defined, use current date
---           RETURN QUERY SELECT true, CURRENT_DATE, NULL::TIMESTAMPTZ, NULL::TEXT;
---           RETURN;
---       END IF;
---       
---       -- Check for exception
---       SELECT * INTO v_exception
---       FROM app.cutoff_exceptions
---       WHERE cutoff_id = v_cutoff.cutoff_id
---           AND exception_date = CURRENT_DATE;
---       
---       IF v_exception IS NOT NULL THEN
---           IF v_exception.is_closed THEN
---               RETURN QUERY SELECT false, (CURRENT_DATE + 1)::DATE, NULL::TIMESTAMPTZ, 
---                          'Transactions not accepted today'::TEXT;
---               RETURN;
---           END IF;
---           IF v_exception.cutoff_time IS NOT NULL THEN
---               v_cutoff.cutoff_time := v_exception.cutoff_time;
---           END IF;
---       END IF;
---       
---       -- Calculate cut-off timestamp
---       v_cutoff_ts := (CURRENT_DATE + v_cutoff.cutoff_time)::TIMESTAMPTZ 
---                      AT TIME ZONE v_cutoff.timezone;
---       
---       -- Check if before cut-off
---       v_is_before := p_timestamp <= v_cutoff_ts + (v_cutoff.grace_minutes || ' minutes')::INTERVAL;
---       
---       -- Calculate effective date
---       IF v_is_before THEN
---           v_effective_date := CURRENT_DATE;
---       ELSE
---           v_effective_date := app.next_business_day(
---               CURRENT_DATE, v_cutoff.next_day_offset, NULL
---           );
---       END IF;
---       
---       RETURN QUERY SELECT 
---           v_is_before, 
---           v_effective_date, 
---           v_cutoff_ts,
---           v_cutoff.cutoff_message;
---   END;
---   $$ LANGUAGE plpgsql STABLE;
+-- [CUTOFF-003] Create check_cutoff_time function
+CREATE OR REPLACE FUNCTION app.check_cutoff_time(
+    p_application_id UUID,
+    p_transaction_type_id UUID,
+    p_timestamp TIMESTAMPTZ DEFAULT now()
+) RETURNS TABLE (
+    is_before_cutoff BOOLEAN,
+    effective_date DATE,
+    cutoff_time TIMESTAMPTZ,
+    message TEXT
+) AS $$
+DECLARE
+    v_cutoff RECORD;
+    v_exception RECORD;
+    v_effective_date DATE;
+    v_is_before BOOLEAN;
+    v_cutoff_ts TIMESTAMPTZ;
+BEGIN
+    -- Get cut-off configuration
+    SELECT * INTO v_cutoff
+    FROM app.cutoff_times
+    WHERE application_id = p_application_id
+        AND (transaction_type_id = p_transaction_type_id OR transaction_type_id IS NULL)
+        AND is_active = true
+        AND valid_from <= CURRENT_DATE
+        AND (valid_to IS NULL OR valid_to >= CURRENT_DATE)
+    ORDER BY transaction_type_id IS NULL  -- Prefer specific over general
+    LIMIT 1;
+    
+    IF v_cutoff IS NULL THEN
+        -- No cut-off defined, use current date
+        RETURN QUERY SELECT true, CURRENT_DATE, NULL::TIMESTAMPTZ, NULL::TEXT;
+        RETURN;
+    END IF;
+    
+    -- Check for exception
+    SELECT * INTO v_exception
+    FROM app.cutoff_exceptions
+    WHERE cutoff_id = v_cutoff.cutoff_id
+        AND exception_date = CURRENT_DATE;
+    
+    IF v_exception IS NOT NULL THEN
+        IF v_exception.is_closed THEN
+            RETURN QUERY SELECT false, (CURRENT_DATE + 1)::DATE, NULL::TIMESTAMPTZ, 
+                       'Transactions not accepted today'::TEXT;
+            RETURN;
+        END IF;
+        IF v_exception.cutoff_time IS NOT NULL THEN
+            v_cutoff.cutoff_time := v_exception.cutoff_time;
+        END IF;
+    END IF;
+    
+    -- Calculate cut-off timestamp
+    v_cutoff_ts := (CURRENT_DATE + v_cutoff.cutoff_time)::TIMESTAMPTZ 
+                   AT TIME ZONE v_cutoff.timezone;
+    
+    -- Check if before cut-off
+    v_is_before := p_timestamp <= v_cutoff_ts + (v_cutoff.grace_minutes || ' minutes')::INTERVAL;
+    
+    -- Calculate effective date
+    IF v_is_before THEN
+        v_effective_date := CURRENT_DATE;
+    ELSE
+        v_effective_date := app.next_business_day(
+            CURRENT_DATE, v_cutoff.next_day_offset, NULL
+        );
+    END IF;
+    
+    RETURN QUERY SELECT 
+        v_is_before, 
+        v_effective_date, 
+        v_cutoff_ts,
+        v_cutoff.cutoff_message;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION app.check_cutoff_time IS 'Checks if a transaction is before the cut-off time';
 
 -- =============================================================================
--- TODO: Create cutoff notification function
+-- IMPLEMENTED: Create cutoff notification function
 -- DESCRIPTION: Get upcoming cut-off warning
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [CUTOFF-004] Create get_cutoff_warning function
--- INSTRUCTIONS:
---   - Check if approaching cut-off
---   - Return warning message and time remaining
+-- [CUTOFF-004] Create get_cutoff_warning function
+CREATE OR REPLACE FUNCTION app.get_cutoff_warning(
+    p_application_id UUID,
+    p_transaction_type_id UUID DEFAULT NULL,
+    p_timestamp TIMESTAMPTZ DEFAULT now()
+) RETURNS TABLE (
+    warning_message TEXT,
+    minutes_remaining INTEGER,
+    cutoff_at TIMESTAMPTZ
+) AS $$
+DECLARE
+    v_cutoff RECORD;
+    v_cutoff_ts TIMESTAMPTZ;
+    v_minutes INTEGER;
+BEGIN
+    -- Get cut-off configuration
+    SELECT * INTO v_cutoff
+    FROM app.cutoff_times
+    WHERE application_id = p_application_id
+        AND (transaction_type_id = p_transaction_type_id OR transaction_type_id IS NULL)
+        AND is_active = true
+    ORDER BY transaction_type_id IS NULL
+    LIMIT 1;
+    
+    IF v_cutoff IS NULL THEN
+        RETURN QUERY SELECT NULL::TEXT, NULL::INTEGER, NULL::TIMESTAMPTZ;
+        RETURN;
+    END IF;
+    
+    -- Calculate cut-off timestamp
+    v_cutoff_ts := (CURRENT_DATE + v_cutoff.cutoff_time)::TIMESTAMPTZ 
+                   AT TIME ZONE v_cutoff.timezone;
+    
+    -- Calculate minutes remaining
+    v_minutes := EXTRACT(EPOCH FROM (v_cutoff_ts - p_timestamp)) / 60;
+    
+    IF v_minutes > 0 AND v_minutes <= 60 THEN
+        RETURN QUERY SELECT 
+            format('Cut-off in %s minutes', v_minutes)::TEXT,
+            v_minutes::INTEGER,
+            v_cutoff_ts;
+    ELSE
+        RETURN QUERY SELECT NULL::TEXT, NULL::INTEGER, NULL::TIMESTAMPTZ;
+    END IF;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION app.get_cutoff_warning IS 'Returns warning if approaching cut-off time';
 
 -- =============================================================================
--- TODO: Create cutoff indexes
+-- IMPLEMENTED: Create cutoff indexes
 -- DESCRIPTION: Optimize cutoff queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [CUTOFF-005] Create cutoff indexes
--- INDEX LIST:
---   -- Cut-off times:
---   - PRIMARY KEY (cutoff_id)
---   - INDEX on (application_id, transaction_type_id, is_active)
---   - INDEX on (valid_from, valid_to)
---   -- Exceptions:
---   - PRIMARY KEY (exception_id)
---   - UNIQUE (cutoff_id, exception_date)
+-- [CUTOFF-005] Create cutoff indexes
+-- Cut-off times:
+-- PRIMARY KEY (cutoff_id) - created with table
+
+CREATE INDEX idx_cutoff_times_app_type_active 
+    ON app.cutoff_times (application_id, transaction_type_id, is_active);
+
+CREATE INDEX idx_cutoff_times_validity 
+    ON app.cutoff_times (valid_from, valid_to);
+
+-- Exceptions:
+-- PRIMARY KEY (exception_id) - created with table
+-- UNIQUE (cutoff_id, exception_date) - created with table
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create cutoff_times table
-□ Create cutoff_exceptions table
-□ Implement check_cutoff_time function
-□ Implement get_cutoff_warning function
-□ Add all indexes for cutoff queries
-□ Test cut-off calculation
-□ Test exception handling
-□ Test grace periods
-□ Test business day rules
+☑ Create cutoff_times table
+☑ Create cutoff_exceptions table
+☑ Implement check_cutoff_time function
+☑ Implement get_cutoff_warning function
+☑ Add all indexes for cutoff queries
+☐ Test cut-off calculation
+☐ Test exception handling
+☐ Test grace periods
+☐ Test business day rules
 ================================================================================
 */

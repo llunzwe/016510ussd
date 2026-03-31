@@ -62,6 +62,7 @@
  * 
  * CHANGE LOG:
  *   1.0.0 - Initial function creation
+ *   1.0.1 - Implemented TODOs: Secret decryption via KMS integration
  * =============================================================================
  */
 
@@ -78,16 +79,16 @@
 -- ============================================================================
 -- CODING PRACTICES:
 -- - Use parameterized queries to prevent SQL injection
--- - Implement proper error handling with transaction rollback
--- - Use SECURITY DEFINER for privileged operations
--- - Enforce RLS policies for multi-tenant data isolation
--- - Use explicit column lists (avoid SELECT *)
--- - Add audit logging for all security-relevant operations
--- - Use UUIDs for primary identifiers to prevent enumeration
--- - Implement optimistic locking with version columns
--- - Use TIMESTAMPTZ for all timestamp columns
--- - Validate all inputs with CHECK constraints
--- ============================================================================
+ * - Implement proper error handling with transaction rollback
+ * - Use SECURITY DEFINER for privileged operations
+ * - Enforce RLS policies for multi-tenant data isolation
+ * - Use explicit column lists (avoid SELECT *)
+ * - Add audit logging for all security-relevant operations
+ * - Use UUIDs for primary identifiers to prevent enumeration
+ * - Implement optimistic locking with version columns
+ * - Use TIMESTAMPTZ for all timestamp columns
+ * - Validate all inputs with CHECK constraints
+ * ============================================================================
 
 -- =============================================================================
 -- FUNCTION: app.get_app_config()
@@ -101,7 +102,7 @@ CREATE OR REPLACE FUNCTION app.get_app_config(
 )
 RETURNS JSONB
 LANGUAGE plpgsql
-SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged execution context
+SECURITY DEFINER
 STABLE
 SET search_path = app, core, public
 AS $$
@@ -109,7 +110,9 @@ DECLARE
     v_config_record RECORD;
     v_value JSONB;
     v_decrypted_value TEXT;
-BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+    v_encryption_key_id UUID;
+    v_kms_response RECORD;
+BEGIN
     -- ========================================================================
     -- VALIDATE APPLICATION
     -- ========================================================================
@@ -117,7 +120,7 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
         SELECT 1 FROM app.t_application_registry
         WHERE app_id = p_app_id AND status = 'active'
     ) THEN
-        RAISE EXCEPTION  -- [ERROR] ISO 27001: Secure error handling -- [ERROR] ISO 27001: Secure error handling - no sensitive data exposure 'Application not found or not active';
+        RAISE EXCEPTION 'Application not found or not active';
     END IF;
     
     -- ========================================================================
@@ -150,6 +153,34 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
     END IF;
     
     IF v_config_record IS NULL THEN
+        -- Log config not found for security monitoring
+        INSERT INTO core.audit_trail (
+            audit_category,
+            audit_level,
+            audit_event,
+            audit_description,
+            action,
+            action_status,
+            table_schema,
+            table_name,
+            record_id,
+            new_data
+        ) VALUES (
+            'SECURITY',
+            'DEBUG',
+            'config_not_found',
+            'Configuration key not found',
+            'CONFIG_LOOKUP',
+            'FAILURE',
+            'app',
+            't_configuration_store',
+            p_app_id::TEXT,
+            jsonb_build_object(
+                'config_key', p_config_key,
+                'environment', p_environment,
+                'scope_id', p_scope_id
+            )
+        );
         RETURN NULL;
     END IF;
     
@@ -157,16 +188,109 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
     -- DECRYPT IF ENCRYPTED
     -- ========================================================================
     IF v_config_record.is_encrypted THEN
-        -- TODO: Call encryption service to decrypt
-        -- v_decrypted_value := core.decrypt_value(...)
-        -- v_value := to_jsonb(v_decrypted_value);
+        -- Get the encryption key ID from config or app registry
+        v_encryption_key_id := COALESCE(
+            v_config_record.encryption_key_id,
+            (SELECT encryption_key_id FROM app.t_application_registry WHERE app_id = p_app_id)
+        );
+        
+        IF v_encryption_key_id IS NULL THEN
+            RAISE EXCEPTION 'Encrypted configuration value but no encryption key configured';
+        END IF;
+        
+        -- Call KMS decryption function (core schema)
+        BEGIN
+            -- Attempt decryption via external KMS
+            SELECT decrypted_value INTO v_decrypted_value
+            FROM core.decrypt_value(
+                encrypted_data => v_config_record.value_encrypted,
+                key_id => v_encryption_key_id,
+                key_context => jsonb_build_object(
+                    'app_id', p_app_id,
+                    'config_key', p_config_key,
+                    'purpose', 'config_retrieval'
+                )
+            );
+            
+            -- Parse decrypted value based on value_type
+            CASE v_config_record.value_type
+                WHEN 'string' THEN v_value := to_jsonb(v_decrypted_value);
+                WHEN 'json' THEN v_value := v_decrypted_value::JSONB;
+                WHEN 'number' THEN v_value := to_jsonb(v_decrypted_value::NUMERIC);
+                WHEN 'boolean' THEN v_value := to_jsonb(v_decrypted_value::BOOLEAN);
+                ELSE v_value := to_jsonb(v_decrypted_value);
+            END CASE;
+            
+        EXCEPTION WHEN OTHERS THEN
+            -- Log decryption failure
+            INSERT INTO core.audit_trail (
+                audit_category,
+                audit_level,
+                audit_event,
+                audit_description,
+                action,
+                action_status,
+                table_schema,
+                table_name,
+                record_id,
+                new_data,
+                error_message
+            ) VALUES (
+                'SECURITY',
+                'ERROR',
+                'config_decryption_failed',
+                'Failed to decrypt configuration value',
+                'CONFIG_DECRYPTION',
+                'FAILURE',
+                'app',
+                't_configuration_store',
+                v_config_record.config_id::TEXT,
+                jsonb_build_object(
+                    'config_key', p_config_key,
+                    'encryption_key_id', v_encryption_key_id
+                ),
+                SQLERRM
+            );
+            RAISE EXCEPTION 'Failed to decrypt configuration: %', SQLERRM;
+        END;
         
         -- Audit secret access
-        INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (action, entity_type, entity_id, details)
-        VALUES ('secret_accessed', 'configuration', v_config_record.config_id,
-            jsonb_build_object('key', p_config_key, 'app_id', p_app_id));
+        INSERT INTO core.audit_trail (
+            audit_category,
+            audit_level,
+            audit_event,
+            audit_description,
+            actor_account_id,
+            actor_type,
+            action,
+            action_status,
+            table_schema,
+            table_name,
+            record_id,
+            application_id,
+            new_data
+        ) VALUES (
+            'SECURITY',
+            'INFO',
+            'secret_accessed',
+            'Encrypted configuration value accessed',
+            COALESCE(current_setting('app.current_user_id', TRUE)::UUID, v_config_record.created_by),
+            'USER',
+            'SECRET_ACCESS',
+            'SUCCESS',
+            'app',
+            't_configuration_store',
+            v_config_record.config_id::TEXT,
+            p_app_id,
+            jsonb_build_object(
+                'key', p_config_key,
+                'app_id', p_app_id,
+                'encryption_key_id', v_encryption_key_id,
+                'scope_level', v_config_record.scope_level
+            )
+        );
         
-        RETURN NULL; -- Placeholder
+        RETURN v_value;
     ELSE
         -- Return appropriate value type
         CASE v_config_record.value_type
@@ -183,6 +307,63 @@ END;
 $$;
 
 -- =============================================================================
+-- FUNCTION: app.get_app_config_with_fallback()
+-- Extended version with multiple fallback keys
+-- =============================================================================
+CREATE OR REPLACE FUNCTION app.get_app_config_with_fallback(
+    p_app_id UUID,
+    p_config_keys TEXT[],
+    p_environment TEXT DEFAULT 'default',
+    p_scope_id UUID DEFAULT NULL
+)
+RETURNS TABLE (
+    config_key TEXT,
+    config_value JSONB,
+    found BOOLEAN
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+AS $$
+DECLARE
+    v_key TEXT;
+    v_value JSONB;
+BEGIN
+    FOREACH v_key IN ARRAY p_config_keys
+    LOOP
+        v_value := app.get_app_config(p_app_id, v_key, p_environment, p_scope_id);
+        config_key := v_key;
+        config_value := v_value;
+        found := (v_value IS NOT NULL);
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+
+-- =============================================================================
+-- FUNCTION: app.refresh_config_cache()
+-- Trigger cache refresh notification
+-- =============================================================================
+CREATE OR REPLACE FUNCTION app.refresh_config_cache(
+    p_app_id UUID,
+    p_config_key TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    PERFORM pg_notify('config_cache_refresh', jsonb_build_object(
+        'app_id', p_app_id,
+        'config_key', p_config_key,
+        'timestamp', NOW()
+    )::TEXT);
+    
+    RETURN TRUE;
+END;
+$$;
+
+-- =============================================================================
 -- COMMENTS
 -- =============================================================================
 COMMENT ON FUNCTION app.get_app_config(UUID, TEXT, TEXT, UUID) IS 
@@ -192,11 +373,14 @@ COMMENT ON FUNCTION app.get_app_config(UUID, TEXT, TEXT, UUID) IS
     'Security: Secret access logged, decryption via KMS. ' ||
     'Resolution: user > organization > application > platform.';
 
+COMMENT ON FUNCTION app.get_app_config_with_fallback(UUID, TEXT[], TEXT, UUID) IS
+    'Retrieve multiple configuration values with fallback support. Returns table of key/value/found status.';
+
 -- =============================================================================
 -- IMPLEMENTATION NOTES
 -- =============================================================================
 -- 1. Hierarchical resolution: user > organization > application > platform
--- 2. Encrypted values decrypted using key management service
+-- 2. Encrypted values decrypted using key management service (core.decrypt_value)
 -- 3. Secret access logged for security audit
 -- 4. Environment fallback: specific -> default
 -- 5. Results should be cached at application layer

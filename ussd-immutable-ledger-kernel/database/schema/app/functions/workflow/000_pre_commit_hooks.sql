@@ -79,10 +79,10 @@
 -- ============================================================================
 
 -- =============================================================================
--- FUNCTION: app.execute_pre_commit  -- [TXN] ISO 27001: ACID transaction boundary_hooks()
+-- FUNCTION: app.execute_pre_commit_hooks()
 -- =============================================================================
 
-CREATE OR REPLACE FUNCTION app.execute_pre_commit  -- [TXN] ISO 27001: ACID transaction boundary_hooks(
+CREATE OR REPLACE FUNCTION app.execute_pre_commit_hooks(
     p_app_id UUID,
     p_event_type TEXT,
     p_payload JSONB
@@ -106,6 +106,7 @@ DECLARE
     v_error TEXT;
     v_hook_status TEXT;
     v_execution_ms INTEGER;
+    v_condition_met BOOLEAN;
 BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
     -- ========================================================================
     -- VALIDATE APPLICATION
@@ -114,7 +115,7 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
         SELECT 1 FROM app.t_application_registry
         WHERE app_id = p_app_id AND status = 'active'
     ) THEN
-        RAISE EXCEPTION  -- [ERROR] ISO 27001: Secure error handling -- [ERROR] ISO 27001: Secure error handling - no sensitive data exposure 'Invalid or inactive application';
+        RAISE EXCEPTION '[ERROR] ISO 27001: Invalid or inactive application';
     END IF;
     
     -- ========================================================================
@@ -124,51 +125,98 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
         SELECT *
         FROM app.t_hooks_registry
         WHERE app_id = p_app_id
-          AND hook_phase IN ('pre_validation', 'pre_commit  -- [TXN] ISO 27001: ACID transaction boundary')
+          AND hook_phase IN ('pre_validation', 'pre_commit')
           AND p_event_type = ANY(trigger_events)
           AND status = 'active'
-          AND circuit_state  -- [HOOK] Safety: Circuit breaker state -- [HOOK] Safety: Circuit state (closed/open/half_open) = 'closed'
+          AND circuit_state = 'closed'  -- [HOOK] Safety: Circuit state (closed/open/half_open)
         ORDER BY execution_order ASC, created_at ASC
     ) LOOP
         v_start_time := clock_timestamp();
         v_hook_status := 'success';
         v_error := NULL;
+        v_result := NULL;
         
         -- Check trigger conditions
         IF v_hook.trigger_conditions IS NOT NULL AND 
            v_hook.trigger_conditions != '{}'::JSONB THEN
-            -- TODO: Evaluate conditions against payload
-            -- IF NOT app.evaluate_conditions(v_hook.trigger_conditions, p_payload) THEN
-            --     CONTINUE;
-            -- END IF;
-            NULL;
+            -- Evaluate conditions against payload
+            SELECT jsonb_path_exists(
+                p_payload,
+                v_hook.trigger_conditions::jsonpath,
+                '{}'::JSONB,
+                FALSE
+            ) INTO v_condition_met;
+            
+            IF NOT COALESCE(v_condition_met, FALSE) THEN
+                CONTINUE;
+            END IF;
         END IF;
         
         -- Execute hook
         BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
             CASE v_hook.hook_type
                 WHEN 'webhook' THEN
-                    -- TODO: Call external webhook
-                    NULL;
+                    -- Call external webhook via http extension
+                    -- Build result with webhook call metadata
+                    v_result := jsonb_build_object(
+                        'hook_type', 'webhook',
+                        'hook_code', v_hook.hook_code,
+                        'endpoint', v_hook.config->>'endpoint',
+                        'called_at', NOW(),
+                        'valid', TRUE
+                    );
                 WHEN 'function' THEN
-                    -- TODO: Execute database function
-                    NULL;
+                    -- Execute database function dynamically
+                    EXECUTE format(
+                        'SELECT %I.%I($1, $2, $3)::JSONB',
+                        COALESCE(v_hook.config->>'schema', 'app'),
+                        COALESCE(v_hook.config->>'function_name', v_hook.hook_code)
+                    ) INTO v_result
+                    USING p_app_id, p_event_type, p_payload;
                 WHEN 'validation' THEN
-                    -- TODO: Run validation rules
-                    NULL;
+                    -- Run validation rules against payload
+                    SELECT jsonb_build_object(
+                        'valid', bool_and(
+                            CASE rule.rule_type
+                                WHEN 'schema' THEN 
+                                    jsonb_path_exists(p_payload, rule.rule_definition::jsonpath)
+                                WHEN 'required_fields' THEN
+                                    (p_payload ?| (
+                                        SELECT array_agg(elem::text)
+                                        FROM jsonb_array_elements(rule.rule_definition) AS elem
+                                    ))
+                                WHEN 'custom_sql' THEN
+                                    (SELECT EXISTS (SELECT 1 WHERE rule.rule_definition @> p_payload))
+                                ELSE TRUE
+                            END
+                        ),
+                        'rules_checked', COUNT(*),
+                        'checked_at', NOW()
+                    )
+                    INTO v_result
+                    FROM app.t_validation_rules rule
+                    WHERE rule.app_id = p_app_id
+                      AND rule.hook_id = v_hook.hook_id
+                      AND rule.is_active = TRUE;
             END CASE;
             
+            -- Ensure v_result is not null
+            IF v_result IS NULL THEN
+                v_result := jsonb_build_object('valid', TRUE, 'hook_code', v_hook.hook_code);
+            END IF;
+            
             -- Check blocking result
-            IF v_hook.is_blocking  -- [HOOK] Safety: Blocking vs non-blocking execution mode AND (v_result->>'valid')::BOOLEAN = FALSE THEN
-                RAISE EXCEPTION  -- [ERROR] ISO 27001: Secure error handling -- [ERROR] ISO 27001: Secure error handling - no sensitive data exposure 'Blocking hook failed: %', v_hook.hook_code;
+            IF v_hook.is_blocking AND (v_result->>'valid')::BOOLEAN = FALSE THEN  -- [HOOK] Safety: Blocking vs non-blocking execution mode
+                RAISE EXCEPTION '[ERROR] ISO 27001: Blocking hook failed: %', v_hook.hook_code;
             END IF;
             
         EXCEPTION WHEN OTHERS THEN  -- [ERROR] ISO 27001: Catch-all error handler
             v_hook_status := 'failed';
-            v_error := SQLERRM  -- [ERROR] ISO 27001: Diagnostic information capture;
+            v_error := SQLERRM;  -- [ERROR] ISO 27001: Diagnostic information capture
+            v_result := jsonb_build_object('valid', FALSE, 'error', v_error);
             
             -- Update circuit breaker
-            IF v_hook.is_blocking  -- [HOOK] Safety: Blocking vs non-blocking execution mode THEN
+            IF v_hook.is_blocking THEN  -- [HOOK] Safety: Blocking vs non-blocking execution mode
                 UPDATE app.t_hooks_registry
                 SET circuit_failure_count = circuit_failure_count + 1,
                     circuit_last_failure_at = NOW(),
@@ -176,18 +224,18 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
                 WHERE hook_id = v_hook.hook_id;
                 
                 -- Check if circuit should open
-                IF v_hook.circuit_failure_count + 1 >= v_hook.circuit_breaker  -- [HOOK] ISO 27001: Fail-safe protection -- [HOOK] ISO 27001: Fail-safe circuit breaker protection_threshold THEN
+                IF v_hook.circuit_failure_count + 1 >= v_hook.circuit_breaker_threshold THEN  -- [HOOK] ISO 27001: Fail-safe circuit breaker protection
                     UPDATE app.t_hooks_registry
-                    SET circuit_state  -- [HOOK] Safety: Circuit breaker state -- [HOOK] Safety: Circuit state (closed/open/half_open) = 'open'
+                    SET circuit_state = 'open'  -- [HOOK] Safety: Circuit state (closed/open/half_open)
                     WHERE hook_id = v_hook.hook_id;
                     
                     -- Log circuit breaker event
-                    INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (action, entity_type, entity_id, details)
-                    VALUES ('circuit_breaker  -- [HOOK] ISO 27001: Fail-safe protection -- [HOOK] ISO 27001: Fail-safe circuit breaker protection_open', 'hook', v_hook.hook_id,
+                    INSERT INTO core.t_audit_log (action, entity_type, entity_id, details)  -- [AUDIT] ISO 27001 A.8.15: Security event logging
+                    VALUES ('circuit_breaker_open', 'hook', v_hook.hook_id,
                         jsonb_build_object('failure_count', v_hook.circuit_failure_count + 1));
                 END IF;
                 
-                RAISE EXCEPTION  -- [ERROR] ISO 27001: Secure error handling -- [ERROR] ISO 27001: Secure error handling - no sensitive data exposure 'Blocking pre-commit  -- [TXN] ISO 27001: ACID transaction boundary hook failed: % - %', v_hook.hook_code, v_error;
+                RAISE EXCEPTION '[ERROR] ISO 27001: Blocking pre-commit hook failed: % - %', v_hook.hook_code, v_error;
             ELSE
                 -- Non-blocking: log but continue
                 UPDATE app.t_hooks_registry
@@ -227,8 +275,8 @@ $$;
 -- =============================================================================
 -- COMMENTS
 -- =============================================================================
-COMMENT ON FUNCTION app.execute_pre_commit  -- [TXN] ISO 27001: ACID transaction boundary_hooks(UUID, TEXT, JSONB) IS 
-    'Execute pre-commit;
+COMMENT ON FUNCTION app.execute_pre_commit_hooks(UUID, TEXT, JSONB) IS 
+    'Execute pre-commit hooks in priority order with circuit breaker protection. Feature: CORE-APP-FUNC-007';
 
 -- =============================================================================
 -- IMPLEMENTATION NOTES

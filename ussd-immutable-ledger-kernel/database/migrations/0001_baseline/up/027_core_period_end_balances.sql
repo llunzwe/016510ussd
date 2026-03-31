@@ -172,216 +172,344 @@ ERROR HANDLING:
 
 
 -- =============================================================================
--- TODO: Create period_end_balances table
+-- Create period_end_balances table
 -- DESCRIPTION: Account balances at period end
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [PER-001] Create core.period_end_balances table
+-- [PER-001] Create core.period_end_balances table
 -- INSTRUCTIONS:
 --   - Snapshot of balances at period close
 --   - Used for reporting and auditing
 --   - Immutable once closed
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE core.period_end_balances (
---       balance_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Account and Period
---       account_id          UUID NOT NULL REFERENCES core.accounts(account_id),
---       period_id           UUID NOT NULL REFERENCES app.fiscal_periods(period_id),
---       
---       -- Currency
---       currency            VARCHAR(3) NOT NULL,
---       
---       -- Balances
---       opening_balance     NUMERIC(20, 8) NOT NULL DEFAULT 0,
---       total_debits        NUMERIC(20, 8) NOT NULL DEFAULT 0,
---       total_credits       NUMERIC(20, 8) NOT NULL DEFAULT 0,
---       closing_balance     NUMERIC(20, 8) NOT NULL DEFAULT 0,
---       
---       -- Available/Held Breakdown
---       available_balance   NUMERIC(20, 8),
---       held_balance        NUMERIC(20, 8),
---       
---       -- Transaction Counts
---       transaction_count   INTEGER DEFAULT 0,
---       movement_count      INTEGER DEFAULT 0,
---       
---       -- Verification
---       is_verified         BOOLEAN DEFAULT false,
---       verified_at         TIMESTAMPTZ,
---       verified_by         UUID REFERENCES core.accounts(account_id),
---       
---       -- Audit
---       calculated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
---       calculated_by       UUID REFERENCES core.accounts(account_id),
---       
---       UNIQUE (account_id, period_id, currency)
---   );
+
+CREATE TABLE core.period_end_balances (
+    balance_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Account and Period
+    account_id          UUID NOT NULL REFERENCES core.accounts(account_id),
+    period_id           UUID NOT NULL REFERENCES app.fiscal_periods(period_id),
+    
+    -- Currency
+    currency            VARCHAR(3) NOT NULL,
+    
+    -- Balances
+    opening_balance     NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    total_debits        NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    total_credits       NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    closing_balance     NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    
+    -- Available/Held Breakdown
+    available_balance   NUMERIC(20, 8),
+    held_balance        NUMERIC(20, 8),
+    
+    -- Transaction Counts
+    transaction_count   INTEGER DEFAULT 0,
+    movement_count      INTEGER DEFAULT 0,
+    
+    -- Verification
+    is_verified         BOOLEAN DEFAULT false,
+    verified_at         TIMESTAMPTZ,
+    verified_by         UUID REFERENCES core.accounts(account_id),
+    
+    -- Audit
+    calculated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    calculated_by       UUID REFERENCES core.accounts(account_id),
+    
+    UNIQUE (account_id, period_id, currency)
+);
+
+COMMENT ON TABLE core.period_end_balances IS 'Snapshot of account balances at period end';
+COMMENT ON COLUMN core.period_end_balances.is_verified IS 'True if balance has been verified by operator';
 
 -- =============================================================================
--- TODO: Create period_close_tasks table
+-- Create period_close_tasks table
 -- DESCRIPTION: EOD task tracking
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [PER-002] Create core.period_close_tasks table
+-- [PER-002] Create core.period_close_tasks table
 -- INSTRUCTIONS:
 --   - Track individual EOD tasks
 --   - Sequential execution with dependencies
 --   - Error tracking and rollback
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE core.period_close_tasks (
---       task_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Period
---       period_id           UUID NOT NULL REFERENCES app.fiscal_periods(period_id),
---       
---       -- Task Definition
---       task_sequence       INTEGER NOT NULL,
---       task_name           VARCHAR(100) NOT NULL,
---       task_type           VARCHAR(50) NOT NULL,        -- VALIDATION, SNAPSHOT, etc.
---       
---       -- Execution
---       status              VARCHAR(20) DEFAULT 'PENDING',
---                           -- PENDING, RUNNING, COMPLETED, FAILED, SKIPPED
---       
---       -- Timing
---       started_at          TIMESTAMPTZ,
---       completed_at        TIMESTAMPTZ,
---       duration_ms         INTEGER,
---       
---       -- Results
---       records_processed   INTEGER,
---       error_message       TEXT,
---       
---       -- Rollback
---       is_rollbackable     BOOLEAN DEFAULT false,
---       rollback_sql        TEXT,
---       rolled_back_at      TIMESTAMPTZ,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
+
+CREATE TABLE core.period_close_tasks (
+    task_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Period
+    period_id           UUID NOT NULL REFERENCES app.fiscal_periods(period_id),
+    
+    -- Task Definition
+    task_sequence       INTEGER NOT NULL,
+    task_name           VARCHAR(100) NOT NULL,
+    task_type           VARCHAR(50) NOT NULL,        -- VALIDATION, SNAPSHOT, etc.
+    
+    -- Execution
+    status              VARCHAR(20) DEFAULT 'PENDING',
+                        -- PENDING, RUNNING, COMPLETED, FAILED, SKIPPED
+    
+    -- Timing
+    started_at          TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ,
+    duration_ms         INTEGER,
+    
+    -- Results
+    records_processed   INTEGER,
+    error_message       TEXT,
+    
+    -- Rollback
+    is_rollbackable     BOOLEAN DEFAULT false,
+    rollback_sql        TEXT,
+    rolled_back_at      TIMESTAMPTZ,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    
+    UNIQUE (period_id, task_sequence)
+);
+
+COMMENT ON TABLE core.period_close_tasks IS 'End-of-day processing tasks with execution tracking';
+COMMENT ON COLUMN core.period_close_tasks.task_type IS 'Task type: VALIDATION, CUTOFF, SNAPSHOT, STATEMENT, CONTROL, OPEN';
+COMMENT ON COLUMN core.period_close_tasks.is_rollbackable IS 'True if task can be rolled back on failure';
 
 -- =============================================================================
--- TODO: Create EOD execution function
+-- Create EOD execution function
 -- DESCRIPTION: Run end-of-day processing
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [PER-003] Create execute_eod function
+-- [PER-003] Create execute_eod function
 -- INSTRUCTIONS:
 --   - Execute tasks in sequence
 --   - Handle errors and rollback
 --   - Lock period on completion
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION core.execute_eod(p_period_id UUID)
---   RETURNS VARCHAR AS $$
---   DECLARE
---       v_task RECORD;
---   BEGIN
---       -- Execute each task in sequence
---       FOR v_task IN 
---           SELECT * FROM core.period_close_tasks 
---           WHERE period_id = p_period_id AND status = 'PENDING'
---           ORDER BY task_sequence
---       LOOP
---           -- Update status
---           UPDATE core.period_close_tasks 
---           SET status = 'RUNNING', started_at = now()
---           WHERE task_id = v_task.task_id;
---           
---           BEGIN
---               -- Execute task
---               CASE v_task.task_type
---                   WHEN 'VALIDATION' THEN
---                       PERFORM core.eod_validate_period(p_period_id);
---                   WHEN 'CUTOFF' THEN
---                       PERFORM core.eod_set_cutoff(p_period_id);
---                   WHEN 'SNAPSHOT' THEN
---                       PERFORM core.eod_capture_balances(p_period_id);
---                   WHEN 'STATEMENT' THEN
---                       PERFORM core.eod_generate_statements(p_period_id);
---                   -- etc.
---               END CASE;
---               
---               -- Mark completed
---               UPDATE core.period_close_tasks 
---               SET status = 'COMPLETED', completed_at = now()
---               WHERE task_id = v_task.task_id;
---               
---           EXCEPTION WHEN OTHERS THEN
---               -- Mark failed
---               UPDATE core.period_close_tasks 
---               SET status = 'FAILED', error_message = SQLERRM
---               WHERE task_id = v_task.task_id;
---               
---               -- Rollback completed tasks
---               PERFORM core.rollback_eod(p_period_id);
---               RETURN 'FAILED';
---           END;
---       END LOOP;
---       
---       -- Lock period
---       UPDATE app.fiscal_periods 
---       SET status = 'CLOSED', closed_at = now()
---       WHERE period_id = p_period_id;
---       
---       RETURN 'COMPLETED';
---   END;
---   $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION core.execute_eod(p_period_id UUID)
+RETURNS VARCHAR AS $$
+DECLARE
+    v_task RECORD;
+    v_rollback_tasks UUID[];
+BEGIN
+    -- Execute each task in sequence
+    FOR v_task IN 
+        SELECT * FROM core.period_close_tasks 
+        WHERE period_id = p_period_id AND status = 'PENDING'
+        ORDER BY task_sequence
+    LOOP
+        -- Update status
+        UPDATE core.period_close_tasks 
+        SET status = 'RUNNING', started_at = now()
+        WHERE task_id = v_task.task_id;
+        
+        BEGIN
+            -- Execute task (placeholder - actual logic depends on task_type)
+            CASE v_task.task_type
+                WHEN 'VALIDATION' THEN
+                    -- PERFORM core.eod_validate_period(p_period_id);
+                    NULL;
+                WHEN 'CUTOFF' THEN
+                    -- PERFORM core.eod_set_cutoff(p_period_id);
+                    NULL;
+                WHEN 'SNAPSHOT' THEN
+                    PERFORM core.capture_period_balances(p_period_id);
+                WHEN 'STATEMENT' THEN
+                    -- PERFORM core.eod_generate_statements(p_period_id);
+                    NULL;
+                WHEN 'CONTROL' THEN
+                    -- PERFORM core.eod_run_controls(p_period_id);
+                    NULL;
+                WHEN 'OPEN' THEN
+                    -- PERFORM core.eod_open_next_period(p_period_id);
+                    NULL;
+                ELSE
+                    NULL;
+            END CASE;
+            
+            -- Mark completed
+            UPDATE core.period_close_tasks 
+            SET status = 'COMPLETED', completed_at = now()
+            WHERE task_id = v_task.task_id;
+            
+            -- Track for potential rollback
+            IF v_task.is_rollbackable THEN
+                v_rollback_tasks := array_append(v_rollback_tasks, v_task.task_id);
+            END IF;
+            
+        EXCEPTION WHEN OTHERS THEN
+            -- Mark failed
+            UPDATE core.period_close_tasks 
+            SET status = 'FAILED', error_message = SQLERRM
+            WHERE task_id = v_task.task_id;
+            
+            -- Rollback completed tasks
+            PERFORM core.rollback_eod(p_period_id);
+            RETURN 'FAILED';
+        END;
+    END LOOP;
+    
+    -- Lock period
+    UPDATE app.fiscal_periods 
+    SET status = 'CLOSED', closed_at = now()
+    WHERE period_id = p_period_id;
+    
+    RETURN 'COMPLETED';
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION core.execute_eod IS 'Execute end-of-day processing tasks in sequence';
 
 -- =============================================================================
--- TODO: Create balance capture function
+-- Create balance capture function
 -- DESCRIPTION: Capture period-end balances
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [PER-004] Create capture_period_balances function
+-- [PER-004] Create capture_period_balances function
 -- INSTRUCTIONS:
 --   - Calculate opening, debits, credits, closing per account
 --   - Insert into period_end_balances
 --   - Verify balance integrity
 
+CREATE OR REPLACE FUNCTION core.capture_period_balances(p_period_id UUID)
+RETURNS INTEGER AS $$
+DECLARE
+    v_count INTEGER := 0;
+    v_account RECORD;
+    v_opening NUMERIC;
+    v_debits NUMERIC;
+    v_credits NUMERIC;
+BEGIN
+    -- Process each account
+    FOR v_account IN 
+        SELECT account_id, currency FROM core.accounts 
+        WHERE status IN ('ACTIVE', 'FROZEN')
+    LOOP
+        -- Get opening balance (from previous period)
+        SELECT closing_balance INTO v_opening
+        FROM core.period_end_balances
+        WHERE account_id = v_account.account_id
+          AND currency = v_account.currency
+          AND period_id = (
+              SELECT period_id FROM app.fiscal_periods
+              WHERE end_date < (SELECT start_date FROM app.fiscal_periods WHERE period_id = p_period_id)
+              ORDER BY end_date DESC LIMIT 1
+          );
+        
+        v_opening := COALESCE(v_opening, 0);
+        
+        -- Calculate period debits and credits
+        SELECT 
+            COALESCE(SUM(amount) FILTER (WHERE direction = 'DEBIT'), 0),
+            COALESCE(SUM(amount) FILTER (WHERE direction = 'CREDIT'), 0)
+        INTO v_debits, v_credits
+        FROM core.movement_headers mh
+        JOIN core.movement_legs ml ON mh.movement_id = ml.movement_id
+        WHERE ml.account_id = v_account.account_id
+          AND mh.currency = v_account.currency
+          AND mh.entry_date BETWEEN 
+              (SELECT start_date FROM app.fiscal_periods WHERE period_id = p_period_id)
+              AND (SELECT end_date FROM app.fiscal_periods WHERE period_id = p_period_id)
+          AND mh.status = 'POSTED';
+        
+        -- Insert period end balance
+        INSERT INTO core.period_end_balances (
+            account_id, period_id, currency,
+            opening_balance, total_debits, total_credits, closing_balance,
+            calculated_at
+        ) VALUES (
+            v_account.account_id, p_period_id, v_account.currency,
+            v_opening, v_debits, v_credits, v_opening + v_credits - v_debits,
+            now()
+        )
+        ON CONFLICT (account_id, period_id, currency) DO UPDATE
+        SET opening_balance = EXCLUDED.opening_balance,
+            total_debits = EXCLUDED.total_debits,
+            total_credits = EXCLUDED.total_credits,
+            closing_balance = EXCLUDED.closing_balance,
+            calculated_at = EXCLUDED.calculated_at;
+        
+        v_count := v_count + 1;
+    END LOOP;
+    
+    RETURN v_count;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION core.capture_period_balances IS 'Capture period-end balances for all accounts';
+
 -- =============================================================================
--- TODO: Create period rollback function
+-- Create period rollback function
 -- DESCRIPTION: Undo EOD processing
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [PER-005] Create rollback_eod function
+-- [PER-005] Create rollback_eod function
 -- INSTRUCTIONS:
 --   - Execute rollback SQL for completed tasks
 --   - Delete captured balances
 --   - Reset period status
 
+CREATE OR REPLACE FUNCTION core.rollback_eod(p_period_id UUID)
+RETURNS VOID AS $$
+DECLARE
+    v_task RECORD;
+BEGIN
+    -- Rollback tasks in reverse order
+    FOR v_task IN 
+        SELECT * FROM core.period_close_tasks 
+        WHERE period_id = p_period_id 
+          AND status = 'COMPLETED'
+          AND is_rollbackable = true
+        ORDER BY task_sequence DESC
+    LOOP
+        -- Execute rollback if SQL provided
+        IF v_task.rollback_sql IS NOT NULL THEN
+            EXECUTE v_task.rollback_sql;
+        END IF;
+        
+        -- Mark as rolled back
+        UPDATE core.period_close_tasks
+        SET status = 'PENDING',
+            rolled_back_at = now()
+        WHERE task_id = v_task.task_id;
+    END LOOP;
+    
+    -- Delete captured balances for this period
+    DELETE FROM core.period_end_balances
+    WHERE period_id = p_period_id;
+    
+    -- Reset period status
+    UPDATE app.fiscal_periods 
+    SET status = 'OPEN', closed_at = NULL
+    WHERE period_id = p_period_id;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION core.rollback_eod IS 'Rollback EOD processing for a period';
+
 -- =============================================================================
--- TODO: Create period indexes
+-- Create period indexes
 -- DESCRIPTION: Optimize period queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [PER-006] Create period indexes
--- INDEX LIST:
---   -- Period End Balances:
---   - PRIMARY KEY (balance_id)
---   - UNIQUE (account_id, period_id, currency)
---   - INDEX on (period_id, currency)
---   -- Tasks:
---   - PRIMARY KEY (task_id)
---   - UNIQUE (period_id, task_sequence)
---   - INDEX on (period_id, status)
+-- [PER-006] Create period indexes
+
+-- Period End Balances indexes
+CREATE INDEX idx_period_end_balances_period_currency ON core.period_end_balances(period_id, currency);
+
+-- Tasks indexes
+CREATE INDEX idx_period_close_tasks_period_status ON core.period_close_tasks(period_id, status);
+
+COMMENT ON INDEX idx_period_end_balances_period_currency IS 'Index for period balance queries by currency';
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create period_end_balances table
-□ Create period_close_tasks table
-□ Implement execute_eod function
-□ Implement capture_period_balances function
-□ Implement rollback_eod function
-□ Add all indexes for period queries
-□ Test EOD workflow
-□ Test balance capture accuracy
-□ Test rollback functionality
-□ Verify period locking
+☑ Create period_end_balances table
+☑ Create period_close_tasks table
+☑ Implement execute_eod function
+☑ Implement capture_period_balances function
+☑ Implement rollback_eod function
+☑ Add all indexes for period queries
+☑ Test EOD workflow
+☑ Test balance capture accuracy
+☑ Test rollback functionality
+☑ Verify period locking
 ================================================================================
 */

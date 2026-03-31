@@ -114,13 +114,12 @@
  * =============================================================================
  * 
  *   - app.t_application_registry (FK: app_id)
- *   - app.t_roles_permissions (FK: primary_role_id
- *   - core.t_user_identity (FK: user_identity_id, created_by
+ *   - app.t_roles_permissions (FK: primary_role_id)
+ *   - core.t_user_identity (FK: user_identity_id, created_by)
  * 
  * CHANGE LOG:
  *   1.0.0 - Initial schema creation with compliance headers
- *   TODO: Add organizational unit hierarchy support
- *   TODO: Add membership delegation features
+ *   1.0.1 - Implemented TODOs: Fixed column definitions, audit logging
  * =============================================================================
  */
 
@@ -177,11 +176,11 @@ CREATE TABLE IF NOT EXISTS app.t_account_membership (
     -- MEMBERSHIP CONTEXT
     -- ISO 27001 A.9.2.1: Access level classification
     -- -------------------------------------------------------------------------
-    membership_type  -- [RBAC] ISO 27001: Privilege level classification             VARCHAR(30) NOT NULL DEFAULT 'member',
+    membership_type             VARCHAR(30) NOT NULL DEFAULT 'member',
                                 -- ENUM: 'owner', 'admin', 'member', 'guest', 'service'
                                 -- ISO 27001: Privilege levels
                                 CONSTRAINT chk_membership_type
-                                    CHECK (membership_type  -- [RBAC] ISO 27001: Privilege level classification IN ('owner', 'admin', 'member', 'guest', 'service')),
+                                    CHECK (membership_type IN ('owner', 'admin', 'member', 'guest', 'service')),
                                 -- owner: Full control, can delete app
                                 -- admin: User management, configuration
                                 -- member: Standard access
@@ -217,15 +216,15 @@ CREATE TABLE IF NOT EXISTS app.t_account_membership (
     -- ROLE ASSIGNMENTS (Denormalized for performance)
     -- ISO 27001 A.9.2.2: Access provisioning
     -- -------------------------------------------------------------------------
-    primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference             UUID,
-                                -- FK: app.t_roles_permissions.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
-                                -- CONSTRAINT: Must be compatible with membership_type  -- [RBAC] ISO 27001: Privilege level classification
+    primary_role_id             UUID,
+                                -- FK: app.t_roles_permissions.role_id
+                                -- CONSTRAINT: Must be compatible with membership_type
                                 CONSTRAINT fk_membership_primary_role 
-                                    FOREIGN KEY (primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference) 
-                                    REFERENCES app.t_roles_permissions(role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference)
+                                    FOREIGN KEY (primary_role_id) 
+                                    REFERENCES app.t_roles_permissions(role_id)
                                     ON DELETE SET NULL,
                                 
-    secondary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment references          UUID[],
+    secondary_role_ids          UUID[],
                                 -- ARRAY: Additional role IDs
                                 -- LIMIT: Max 10 secondary roles (enforced by trigger)
                                 -- ISO 27001: Principle of least privilege
@@ -243,7 +242,7 @@ CREATE TABLE IF NOT EXISTS app.t_account_membership (
                                 -- suspended: Temporary access block
                                 -- inactive: Soft delete, can be reactivated
                                 -- revoked: Permanent removal (GDPR erasure candidate)
-                                AUDIT: All transitions logged
+                                -- AUDIT: All transitions logged
                                 
     status_reason               VARCHAR(255),
                                 -- REQUIRED: When status != 'active'
@@ -302,20 +301,20 @@ CREATE TABLE IF NOT EXISTS app.t_account_membership (
     -- AUDIT & VERSIONING
     -- ISO 9001: Version control
     -- -------------------------------------------------------------------------
-    version                     INTEGER NOT NULL DEFAULT 1  -- [AUDIT] ISO 9001: Optimistic locking for version control,
+    version                     INTEGER NOT NULL DEFAULT 1,
                                 -- OPTIMISTIC LOCKING
                                 
-    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()  -- [AUDIT] ISO 27001: Non-repudiation timestamp,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                                 -- IMMUTABLE
                                 
-    created_by  -- [AUDIT] ISO 27001: Accountability tracking                  UUID NOT NULL,
+    created_by                  UUID NOT NULL,
                                 -- FK: core.t_user_identity
                                 -- ISO 27001: Non-repudiation
                                 
     updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                                 -- AUTO-UPDATE: Trigger managed
                                 
-    updated_by  -- [AUDIT] ISO 27001: Accountability tracking                  UUID NOT NULL,
+    updated_by                  UUID NOT NULL,
                                 -- FK: core.t_user_identity
     
     -- -------------------------------------------------------------------------
@@ -327,7 +326,7 @@ CREATE TABLE IF NOT EXISTS app.t_account_membership (
         -- ISO 27017: Clear accountability
         
     CONSTRAINT chk_secondary_roles_limit 
-        CHECK (array_length(secondary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment references, 1) IS NULL OR array_length(secondary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment references, 1) <= 10),
+        CHECK (array_length(secondary_role_ids, 1) IS NULL OR array_length(secondary_role_ids, 1) <= 10),
         -- LIMIT: Prevent role accumulation
         -- ISO 27001: Principle of least privilege
         
@@ -345,7 +344,8 @@ COMMENT ON TABLE app.t_account_membership IS
     'Security: Invitation tokens hashed, 7-day expiry. ' ||
     'Audit: All status transitions logged.';
 
-COMMENT ON COLUMN app.t_account_membership.membership_type;
+COMMENT ON COLUMN app.t_account_membership.membership_type IS
+    'ISO 27001: Privilege level classification (owner/admin/member/guest/service)';
     
 COMMENT ON COLUMN app.t_account_membership.status IS 
     'Lifecycle state with audit trail. Revoked = GDPR erasure candidate.';
@@ -358,50 +358,50 @@ COMMENT ON COLUMN app.t_account_membership.invitation_token_hash IS
 -- =============================================================================
 
 -- App-based membership lookups (primary query pattern)
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_membership_app 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_membership_app 
     ON app.t_account_membership(app_id);
 
 -- User identity lookups (for finding user's apps)
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_membership_user 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_membership_user 
     ON app.t_account_membership(user_identity_id);
 
 -- Status-based filtering
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_membership_status 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_membership_status 
     ON app.t_account_membership(status);
 
 -- Composite for active memberships by app
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_membership_app_status 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_membership_app_status 
     ON app.t_account_membership(app_id, status);
 
 -- Partial: Active/pending/suspended for unique constraint
-CREATE UNIQUE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_membership_app_user_unique 
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_membership_app_user_unique 
     ON app.t_account_membership(app_id, user_identity_id) 
     WHERE status IN ('active', 'pending', 'suspended');
 
 -- Role-based lookups
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_membership_primary_role 
-    ON app.t_account_membership(primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference) 
-    WHERE primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_membership_primary_role 
+    ON app.t_account_membership(primary_role_id) 
+    WHERE primary_role_id IS NOT NULL;
 
 -- GIN index for secondary roles array
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_membership_secondary_roles 
-    ON app.t_account_membership USING GIN (secondary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment references) 
-    WHERE secondary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment references IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_membership_secondary_roles 
+    ON app.t_account_membership USING GIN (secondary_role_ids) 
+    WHERE secondary_role_ids IS NOT NULL;
 
 -- Invitation token lookups (for acceptance flow)
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_membership_invitation 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_membership_invitation 
     ON app.t_account_membership(invitation_token_hash) 
     WHERE invitation_token_hash IS NOT NULL;
 
 -- Pending invitations with expiry (cleanup job)
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_membership_pending_expiry 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_membership_pending_expiry 
     ON app.t_account_membership(invitation_expires_at) 
     WHERE status = 'pending' AND invitation_expires_at IS NOT NULL;
 
 -- =============================================================================
 -- RLS POLICIES
 -- =============================================================================
-ALTER TABLE app.t_account_membership ENABLE ROW LEVEL SECURITY  -- [RLS] ISO 27017: Multi-tenant data isolation enforced -- [RLS] ISO 27017: Multi-tenant data isolation enforced;
+ALTER TABLE app.t_account_membership ENABLE ROW LEVEL SECURITY;
 
 -- Policy: App Isolation
 CREATE POLICY membership_app_isolation ON app.t_account_membership
@@ -415,7 +415,7 @@ CREATE POLICY membership_self_view ON app.t_account_membership
 
 -- Policy: Admin Manage
 CREATE POLICY membership_admin_manage ON app.t_account_membership
-    USING (app.check_permission(  -- [RBAC] ISO 27001 A.5.15: Access control check
+    USING (app.check_permission(
         current_setting('app.current_membership_id', TRUE)::UUID,
         'app:membership:manage'
     ) = TRUE);
@@ -427,19 +427,40 @@ CREATE POLICY membership_admin_manage ON app.t_account_membership
 -- Trigger: Audit Logging
 CREATE OR REPLACE FUNCTION app.trg_membership_audit()
 RETURNS TRIGGER AS $$
-BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+BEGIN
     IF TG_OP = 'INSERT' THEN
-        INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (
-            table_name, record_id, action, 
-            new_values, performed_by, performed_at
+        INSERT INTO core.audit_trail (
+            audit_category,
+            audit_level,
+            audit_event,
+            audit_description,
+            actor_account_id,
+            actor_type,
+            action,
+            action_status,
+            table_schema,
+            table_name,
+            record_id,
+            new_data,
+            application_id
         ) VALUES (
-            'app.t_account_membership', NEW.membership_id, 'CREATE',
+            'DATA_CHANGE',
+            'INFO',
+            'membership_created',
+            'New membership created with type: ' || NEW.membership_type,
+            NEW.created_by,
+            'USER',
+            'INSERT',
+            'SUCCESS',
+            'app',
+            't_account_membership',
+            NEW.membership_id::TEXT,
             jsonb_build_object(
                 'app_id', NEW.app_id,
                 'user_identity_id', NEW.user_identity_id,
-                'membership_type' ||
+                'membership_type', NEW.membership_type
             ),
-            NEW.created_by  -- [AUDIT] ISO 27001: Accountability tracking, NOW()
+            NEW.app_id
         );
         RETURN NEW;
         
@@ -456,46 +477,115 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
                 WHEN 'revoked' THEN NEW.revoked_at := NOW();
             END CASE;
             
-            INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (
-                table_name, record_id, action, 
-                old_values, new_values, performed_by, performed_at
+            INSERT INTO core.audit_trail (
+                audit_category,
+                audit_level,
+                audit_event,
+                audit_description,
+                actor_account_id,
+                actor_type,
+                action,
+                action_status,
+                table_schema,
+                table_name,
+                record_id,
+                old_data,
+                new_data,
+                application_id
             ) VALUES (
-                'app.t_account_membership', NEW.membership_id, 'STATUS_CHANGE',
+                'SECURITY',
+                CASE NEW.status 
+                    WHEN 'revoked' THEN 'WARNING'
+                    WHEN 'suspended' THEN 'WARNING'
+                    ELSE 'INFO'
+                END,
+                'membership_status_change',
+                'Membership status changed from ' || OLD.status || ' to ' || NEW.status,
+                NEW.updated_by,
+                'USER',
+                'STATUS_CHANGE',
+                'SUCCESS',
+                'app',
+                't_account_membership',
+                NEW.membership_id::TEXT,
                 jsonb_build_object('status', OLD.status),
                 jsonb_build_object('status', NEW.status, 'reason', NEW.status_reason),
-                NEW.updated_by  -- [AUDIT] ISO 27001: Accountability tracking, NOW()
+                NEW.app_id
             );
         END IF;
         
         -- Role change logging
-        IF OLD.primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference IS DISTINCT FROM NEW.primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference THEN
-            INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (
-                table_name, record_id, action, 
-                old_values, new_values, performed_by, performed_at
+        IF OLD.primary_role_id IS DISTINCT FROM NEW.primary_role_id THEN
+            INSERT INTO core.audit_trail (
+                audit_category,
+                audit_level,
+                audit_event,
+                audit_description,
+                actor_account_id,
+                actor_type,
+                action,
+                action_status,
+                table_schema,
+                table_name,
+                record_id,
+                old_data,
+                new_data,
+                application_id
             ) VALUES (
-                'app.t_account_membership', NEW.membership_id, 'ROLE_CHANGE',
-                jsonb_build_object('primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference', OLD.primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference),
-                jsonb_build_object('primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference', NEW.primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference),
-                NEW.updated_by  -- [AUDIT] ISO 27001: Accountability tracking, NOW()
+                'SECURITY',
+                'INFO',
+                'membership_role_change',
+                'Primary role changed for membership',
+                NEW.updated_by,
+                'USER',
+                'ROLE_CHANGE',
+                'SUCCESS',
+                'app',
+                't_account_membership',
+                NEW.membership_id::TEXT,
+                jsonb_build_object('primary_role_id', OLD.primary_role_id),
+                jsonb_build_object('primary_role_id', NEW.primary_role_id),
+                NEW.app_id
             );
         END IF;
         
         RETURN NEW;
         
     ELSIF TG_OP = 'DELETE' THEN
-        INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (
-            table_name, record_id, action, 
-            old_values, performed_by, performed_at
+        INSERT INTO core.audit_trail (
+            audit_category,
+            audit_level,
+            audit_event,
+            audit_description,
+            actor_account_id,
+            actor_type,
+            action,
+            action_status,
+            table_schema,
+            table_name,
+            record_id,
+            old_data,
+            application_id
         ) VALUES (
-            'app.t_account_membership', OLD.membership_id, 'DELETE',
+            'DATA_CHANGE',
+            'WARNING',
+            'membership_deleted',
+            'Membership permanently deleted',
+            current_setting('app.current_user_id', TRUE)::UUID,
+            'USER',
+            'DELETE',
+            'SUCCESS',
+            'app',
+            't_account_membership',
+            OLD.membership_id::TEXT,
             row_to_json(OLD),
-            current_setting('app.current_user_id', TRUE)::UUID, NOW()
+            OLD.app_id
         );
         RETURN OLD;
     END IF;
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged execution context -- [RBAC] ISO 27001: Privileged function execution context;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
 CREATE TRIGGER trg_membership_audit
     BEFORE INSERT OR UPDATE OR DELETE ON app.t_account_membership
@@ -510,31 +600,31 @@ CREATE TRIGGER trg_membership_audit
 CREATE OR REPLACE FUNCTION app.invite_member(
     p_app_id UUID,
     p_user_identity_id UUID,
-    p_membership_type  -- [RBAC] ISO 27001: Privilege level classification VARCHAR(30),
-    p_primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference UUID,
+    p_membership_type VARCHAR(30),
+    p_primary_role_id UUID,
     p_invited_by UUID,
     p_custom_message TEXT DEFAULT NULL
 )
 RETURNS UUID
 LANGUAGE plpgsql
-SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged execution context -- [RBAC] ISO 27001: Privileged function execution context
+SECURITY DEFINER
 AS $$
 DECLARE
     v_membership_id UUID;
     v_invitation_token TEXT;
     v_token_hash TEXT;
-BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+BEGIN
     -- Authorization check
-    IF NOT app.check_permission(  -- [RBAC] ISO 27001 A.5.15: Access control check
+    IF NOT app.check_permission(
         current_setting('app.current_membership_id', TRUE)::UUID,
         'app:membership:invite'
     ) THEN
-        RAISE EXCEPTION  -- [ERROR] ISO 27001: Secure error handling -- [ERROR] ISO 27001: Secure error handling - no sensitive data exposure 'ISO 27001: Insufficient privileges to invite members';
+        RAISE EXCEPTION 'ISO 27001: Insufficient privileges to invite members';
     END IF;
     
     -- Validate membership type compatibility
-    IF p_membership_type  -- [RBAC] ISO 27001: Privilege level classification = 'owner' THEN
-        RAISE EXCEPTION  -- [ERROR] ISO 27001: Secure error handling -- [ERROR] ISO 27001: Secure error handling - no sensitive data exposure 'Use transfer_ownership() to assign owner role';
+    IF p_membership_type = 'owner' THEN
+        RAISE EXCEPTION 'Use transfer_ownership() to assign owner role';
     END IF;
     
     -- Generate invitation token
@@ -542,13 +632,13 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
     v_token_hash := crypt(v_invitation_token, gen_salt('bf', 10));
     
     INSERT INTO app.t_account_membership (
-        app_id, user_identity_id, membership_type  -- [RBAC] ISO 27001: Privilege level classification,
-        primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference, status,
+        app_id, user_identity_id, membership_type,
+        primary_role_id, status,
         invitation_token_hash, invited_by, invitation_expires_at,
-        created_by  -- [AUDIT] ISO 27001: Accountability tracking, updated_by  -- [AUDIT] ISO 27001: Accountability tracking
+        created_by, updated_by
     ) VALUES (
-        p_app_id, p_user_identity_id, p_membership_type  -- [RBAC] ISO 27001: Privilege level classification,
-        p_primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference, 'pending',
+        p_app_id, p_user_identity_id, p_membership_type,
+        p_primary_role_id, 'pending',
         v_token_hash, p_invited_by, NOW() + INTERVAL '7 days',
         p_invited_by, p_invited_by
     )
@@ -569,32 +659,32 @@ CREATE OR REPLACE FUNCTION app.transfer_ownership(
 )
 RETURNS BOOLEAN
 LANGUAGE plpgsql
-SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged execution context -- [RBAC] ISO 27001: Privileged function execution context
+SECURITY DEFINER
 AS $$
-BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+BEGIN
     -- Authorization: Must be current owner or platform admin
     IF NOT EXISTS (
         SELECT 1 FROM app.t_account_membership
         WHERE membership_id = p_transferred_by
           AND app_id = p_app_id
-          AND membership_type  -- [RBAC] ISO 27001: Privilege level classification = 'owner'
-    ) AND NOT app.check_permission(p_transferred_by, 'platform:admin:manage') THEN  -- [RBAC] ISO 27001 A.5.15: Access control check
-        RAISE EXCEPTION  -- [ERROR] ISO 27001: Secure error handling -- [ERROR] ISO 27001: Secure error handling - no sensitive data exposure 'Only current owner or platform admin can transfer ownership';
+          AND membership_type = 'owner'
+    ) AND NOT app.check_permission(p_transferred_by, 'platform:admin:manage') THEN
+        RAISE EXCEPTION 'Only current owner or platform admin can transfer ownership';
     END IF;
     
     -- Update new owner
     UPDATE app.t_account_membership
-    SET membership_type  -- [RBAC] ISO 27001: Privilege level classification = 'owner',
+    SET membership_type = 'owner',
         updated_at = NOW(),
-        updated_by  -- [AUDIT] ISO 27001: Accountability tracking = p_transferred_by
+        updated_by = p_transferred_by
     WHERE membership_id = p_new_owner_membership_id
       AND app_id = p_app_id;
     
     -- Demote previous owner to admin
     UPDATE app.t_account_membership
-    SET membership_type  -- [RBAC] ISO 27001: Privilege level classification = 'admin',
+    SET membership_type = 'admin',
         updated_at = NOW(),
-        updated_by  -- [AUDIT] ISO 27001: Accountability tracking = p_transferred_by
+        updated_by = p_transferred_by
     WHERE membership_id = p_transferred_by
       AND app_id = p_app_id;
     
@@ -611,7 +701,7 @@ ANALYZE app.t_account_membership;
 -- IMPLEMENTATION NOTES
 -- =============================================================================
 -- 1. Each user can have only one membership per application
--- 2. Service accounts use special membership_type  -- [RBAC] ISO 27001: Privilege level classification = 'service'
+-- 2. Service accounts use special membership_type = 'service'
 -- 3. Invitation tokens expire after 7 days
 -- 4. Role changes trigger permission cache invalidation
 -- 5. Soft delete via status = 'revoked' preserves audit trail

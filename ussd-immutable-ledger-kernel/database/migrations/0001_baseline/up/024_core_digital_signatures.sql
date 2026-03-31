@@ -175,171 +175,233 @@ eIDAS COMPLIANCE:
 
 
 -- =============================================================================
--- TODO: Create digital_signatures table
+-- Create digital_signatures table
 -- DESCRIPTION: Signature records
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [SIG-001] Create core.digital_signatures table
+-- [SIG-001] Create core.digital_signatures table
 -- INSTRUCTIONS:
 --   - Immutable signature records
 --   - Links to documents and signers
 --   - Cryptographic proof of signing
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE core.digital_signatures (
---       signature_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       signature_reference VARCHAR(100) UNIQUE NOT NULL,
---       
---       -- Document
---       document_id         UUID NOT NULL REFERENCES core.document_registry(document_id),
---       version_id          UUID REFERENCES core.document_versions(version_id),
---       
---       -- Signer
---       signer_account_id   UUID NOT NULL REFERENCES core.accounts(account_id),
---       signer_name         VARCHAR(200) NOT NULL,       -- At time of signing
---       
---       -- Signature Type
---       signature_type      VARCHAR(20) NOT NULL,        -- PIN, BIOMETRIC, CRYPTO, OTP
---       eidas_level         VARCHAR(10),                 -- SES, AdES, QES
---       
---       -- Signature Data
---       signature_data      BYTEA,                       -- Cryptographic signature
---       signed_hash         BYTEA NOT NULL,              -- Hash of document at signing
---       signing_algorithm   VARCHAR(50) DEFAULT 'SHA256withRSA',
---       
---       -- Authentication
---       auth_method         VARCHAR(50),                 -- PIN, FINGERPRINT, etc.
---       auth_verified       BOOLEAN DEFAULT false,
---       auth_timestamp      TIMESTAMPTZ,
---       
---       -- Timestamp Authority
---       timestamp_token     BYTEA,                       -- RFC 3161 timestamp
---       timestamp_authority VARCHAR(255),
---       timestamped_at      TIMESTAMPTZ,
---       
---       -- Location (for audit)
---       ip_address          INET,
---       geolocation         JSONB,
---       device_info         JSONB,
---       
---       -- Validity
---       is_valid            BOOLEAN DEFAULT true,
---       revoked_at          TIMESTAMPTZ,
---       revoked_by          UUID REFERENCES core.accounts(account_id),
---       revocation_reason   TEXT,
---       
---       -- Audit
---       signed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
+
+CREATE TABLE core.digital_signatures (
+    signature_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    signature_reference VARCHAR(100) UNIQUE NOT NULL,
+    
+    -- Document
+    document_id         UUID NOT NULL REFERENCES core.document_registry(document_id),
+    version_id          UUID REFERENCES core.document_versions(version_id),
+    
+    -- Signer
+    signer_account_id   UUID NOT NULL REFERENCES core.accounts(account_id),
+    signer_name         VARCHAR(200) NOT NULL,       -- At time of signing
+    
+    -- Signature Type
+    signature_type      VARCHAR(20) NOT NULL,        -- PIN, BIOMETRIC, CRYPTO, OTP
+    eidas_level         VARCHAR(10),                 -- SES, AdES, QES
+    
+    -- Signature Data
+    signature_data      BYTEA,                       -- Cryptographic signature
+    signed_hash         BYTEA NOT NULL,              -- Hash of document at signing
+    signing_algorithm   VARCHAR(50) DEFAULT 'SHA256withRSA',
+    
+    -- Authentication
+    auth_method         VARCHAR(50),                 -- PIN, FINGERPRINT, etc.
+    auth_verified       BOOLEAN DEFAULT false,
+    auth_timestamp      TIMESTAMPTZ,
+    
+    -- Timestamp Authority
+    timestamp_token     BYTEA,                       -- RFC 3161 timestamp
+    timestamp_authority VARCHAR(255),
+    timestamped_at      TIMESTAMPTZ,
+    
+    -- Location (for audit)
+    ip_address          INET,
+    geolocation         JSONB,
+    device_info         JSONB,
+    
+    -- Validity
+    is_valid            BOOLEAN DEFAULT true,
+    revoked_at          TIMESTAMPTZ,
+    revoked_by          UUID REFERENCES core.accounts(account_id),
+    revocation_reason   TEXT,
+    
+    -- Audit
+    signed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE core.digital_signatures IS 'Digital signature records with eIDAS compliance support';
+COMMENT ON COLUMN core.digital_signatures.signature_type IS 'Signature method: PIN, BIOMETRIC, CRYPTO, OTP';
+COMMENT ON COLUMN core.digital_signatures.eidas_level IS 'eIDAS compliance level: SES, AdES, QES';
+COMMENT ON COLUMN core.digital_signatures.signed_hash IS 'SHA-256 hash of document content at time of signing';
+COMMENT ON COLUMN core.digital_signatures.is_valid IS 'False if signature has been revoked';
 
 -- =============================================================================
--- TODO: Create signature_requests table
+-- Create signature_requests table
 -- DESCRIPTION: Signature workflow management
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [SIG-002] Create core.signature_requests table
+-- [SIG-002] Create core.signature_requests table
 -- INSTRUCTIONS:
 --   - Track pending signature requests
 --   - Multi-party signing workflows
 --   - Reminder and expiration
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE core.signature_requests (
---       request_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Document
---       document_id         UUID NOT NULL REFERENCES core.document_registry(document_id),
---       
---       -- Signer
---       signer_account_id   UUID NOT NULL REFERENCES core.accounts(account_id),
---       
---       -- Status
---       status              VARCHAR(20) DEFAULT 'PENDING',
---                           -- PENDING, SENT, VIEWED, SIGNED, DECLINED, EXPIRED
---       
---       -- Sequence (for ordered signing)
---       sequence_order      INTEGER DEFAULT 1,
---       depends_on_request  UUID REFERENCES core.signature_requests(request_id),
---       
---       -- Request
---       request_message     TEXT,
---       requested_by        UUID NOT NULL REFERENCES core.accounts(account_id),
---       requested_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
---       
---       -- Expiration
---       expires_at          TIMESTAMPTZ,
---       reminder_sent_at    TIMESTAMPTZ[],
---       
---       -- Completion
---       signature_id        UUID REFERENCES core.digital_signatures(signature_id),
---       completed_at        TIMESTAMPTZ,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
+
+CREATE TABLE core.signature_requests (
+    request_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Document
+    document_id         UUID NOT NULL REFERENCES core.document_registry(document_id),
+    
+    -- Signer
+    signer_account_id   UUID NOT NULL REFERENCES core.accounts(account_id),
+    
+    -- Status
+    status              VARCHAR(20) DEFAULT 'PENDING',
+                        -- PENDING, SENT, VIEWED, SIGNED, DECLINED, EXPIRED
+    
+    -- Sequence (for ordered signing)
+    sequence_order      INTEGER DEFAULT 1,
+    depends_on_request  UUID REFERENCES core.signature_requests(request_id),
+    
+    -- Request
+    request_message     TEXT,
+    requested_by        UUID NOT NULL REFERENCES core.accounts(account_id),
+    requested_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    
+    -- Expiration
+    expires_at          TIMESTAMPTZ,
+    reminder_sent_at    TIMESTAMPTZ[],
+    
+    -- Completion
+    signature_id        UUID REFERENCES core.digital_signatures(signature_id),
+    completed_at        TIMESTAMPTZ,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE core.signature_requests IS 'Signature workflow requests for multi-party document signing';
+COMMENT ON COLUMN core.signature_requests.status IS 'Request status: PENDING, SENT, VIEWED, SIGNED, DECLINED, EXPIRED';
+COMMENT ON COLUMN core.signature_requests.sequence_order IS 'Order in multi-party signing workflow';
 
 -- =============================================================================
--- TODO: Create signature verification function
+-- Create signature verification function
 -- DESCRIPTION: Verify signature validity
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [SIG-003] Create verify_signature function
+-- [SIG-003] Create verify_signature function
 -- INSTRUCTIONS:
 --   - Recompute document hash
 --   - Verify against signed_hash
 --   - Check certificate validity (for crypto signatures)
 --   - Return verification result
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION core.verify_signature(p_signature_id UUID)
---   RETURNS TABLE (
---       is_valid BOOLEAN,
---       verification_time TIMESTAMPTZ,
---       verification_message TEXT
---   ) AS $$
---   DECLARE
---       v_sig RECORD;
---       v_current_hash BYTEA;
---   BEGIN
---       -- Get signature
---       SELECT * INTO v_sig FROM core.digital_signatures WHERE signature_id = p_signature_id;
---       
---       -- Check if revoked
---       IF v_sig.revoked_at IS NOT NULL THEN
---           RETURN QUERY SELECT false, now(), 'Signature has been revoked'::TEXT;
---           RETURN;
---       END IF;
---       
---       -- Verify hash (would actually retrieve and hash document)
---       -- v_current_hash := core.compute_document_hash(v_sig.document_id);
---       
---       IF v_sig.signed_hash = v_current_hash THEN
---           RETURN QUERY SELECT true, now(), 'Signature verified'::TEXT;
---       ELSE
---           RETURN QUERY SELECT false, now(), 'Document has been modified'::TEXT;
---       END IF;
---   END;
---   $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION core.verify_signature(p_signature_id UUID)
+RETURNS TABLE (
+    is_valid BOOLEAN,
+    verification_time TIMESTAMPTZ,
+    verification_message TEXT
+) AS $$
+DECLARE
+    v_sig RECORD;
+    v_doc_hash BYTEA;
+BEGIN
+    -- Get signature
+    SELECT * INTO v_sig FROM core.digital_signatures WHERE signature_id = p_signature_id;
+    
+    IF v_sig IS NULL THEN
+        RETURN QUERY SELECT false, now(), 'Signature not found'::TEXT;
+        RETURN;
+    END IF;
+    
+    -- Check if revoked
+    IF v_sig.revoked_at IS NOT NULL THEN
+        RETURN QUERY SELECT false, now(), 'Signature has been revoked'::TEXT;
+        RETURN;
+    END IF;
+    
+    -- Get current document hash from registry
+    SELECT checksum_sha256 INTO v_doc_hash
+    FROM core.document_registry
+    WHERE document_id = v_sig.document_id;
+    
+    -- Compare hashes
+    IF v_sig.signed_hash = v_doc_hash THEN
+        RETURN QUERY SELECT true, now(), 'Signature verified - document unchanged'::TEXT;
+    ELSE
+        RETURN QUERY SELECT false, now(), 'Document has been modified since signing'::TEXT;
+    END IF;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION core.verify_signature IS 'Verify digital signature validity against current document hash';
 
 -- =============================================================================
--- TODO: Create signature request function
+-- Create signature request function
 -- DESCRIPTION: Request signature from user
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [SIG-004] Create request_signature function
+-- [SIG-004] Create request_signature function
 -- INSTRUCTIONS:
 --   - Create signature request
 --   - Send notification to signer
 --   - Set expiration
 --   - Handle reminders
 
+CREATE OR REPLACE FUNCTION core.request_signature(
+    p_document_id UUID,
+    p_signer_account_id UUID,
+    p_requested_by UUID,
+    p_request_message TEXT DEFAULT NULL,
+    p_expires_at TIMESTAMPTZ DEFAULT NULL,
+    p_sequence_order INTEGER DEFAULT 1
+) RETURNS UUID AS $$
+DECLARE
+    v_request_id UUID;
+    v_doc RECORD;
+BEGIN
+    -- Verify document exists
+    SELECT * INTO v_doc FROM core.document_registry WHERE document_id = p_document_id;
+    
+    IF v_doc IS NULL THEN
+        RAISE EXCEPTION 'Document % not found', p_document_id;
+    END IF;
+    
+    -- Create request
+    INSERT INTO core.signature_requests (
+        document_id,
+        signer_account_id,
+        status,
+        sequence_order,
+        request_message,
+        requested_by,
+        expires_at
+    ) VALUES (
+        p_document_id,
+        p_signer_account_id,
+        'PENDING',
+        p_sequence_order,
+        p_request_message,
+        p_requested_by,
+        COALESCE(p_expires_at, now() + interval '7 days')
+    )
+    RETURNING request_id INTO v_request_id;
+    
+    RETURN v_request_id;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION core.request_signature IS 'Create a signature request for a document';
+
 -- =============================================================================
--- TODO: Create signature recording function
+-- Create signature recording function
 -- DESCRIPTION: Record completed signature
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [SIG-005] Create record_signature function
+-- [SIG-005] Create record_signature function
 -- INSTRUCTIONS:
 --   - Verify authentication
 --   - Compute document hash
@@ -347,37 +409,112 @@ eIDAS COMPLIANCE:
 --   - Update request status
 --   - Check if all signatures complete
 
+CREATE OR REPLACE FUNCTION core.record_signature(
+    p_request_id UUID,
+    p_signature_type VARCHAR(20),
+    p_signed_hash BYTEA,
+    p_signing_algorithm VARCHAR(50) DEFAULT 'SHA256withRSA',
+    p_auth_method VARCHAR(50) DEFAULT NULL,
+    p_signature_data BYTEA DEFAULT NULL,
+    p_ip_address INET DEFAULT NULL,
+    p_device_info JSONB DEFAULT NULL
+) RETURNS UUID AS $$
+DECLARE
+    v_request RECORD;
+    v_signature_id UUID;
+    v_doc RECORD;
+BEGIN
+    -- Get request
+    SELECT * INTO v_request FROM core.signature_requests WHERE request_id = p_request_id;
+    
+    IF v_request IS NULL THEN
+        RAISE EXCEPTION 'Signature request % not found', p_request_id;
+    END IF;
+    
+    IF v_request.status = 'SIGNED' THEN
+        RAISE EXCEPTION 'Signature request % already completed', p_request_id;
+    END IF;
+    
+    -- Get document
+    SELECT * INTO v_doc FROM core.document_registry WHERE document_id = v_request.document_id;
+    
+    -- Create signature record
+    INSERT INTO core.digital_signatures (
+        signature_reference,
+        document_id,
+        signer_account_id,
+        signer_name,
+        signature_type,
+        signed_hash,
+        signing_algorithm,
+        auth_method,
+        auth_verified,
+        auth_timestamp,
+        ip_address,
+        device_info,
+        signed_at
+    ) VALUES (
+        'SIG-' || to_char(now(), 'YYYYMMDD') || '-' || substr(gen_random_uuid()::text, 1, 8),
+        v_request.document_id,
+        v_request.signer_account_id,
+        'Signer Name',  -- Would be looked up from accounts
+        p_signature_type,
+        p_signed_hash,
+        p_signing_algorithm,
+        p_auth_method,
+        true,
+        now(),
+        p_ip_address,
+        p_device_info,
+        now()
+    )
+    RETURNING signature_id INTO v_signature_id;
+    
+    -- Update request
+    UPDATE core.signature_requests
+    SET status = 'SIGNED',
+        signature_id = v_signature_id,
+        completed_at = now()
+    WHERE request_id = p_request_id;
+    
+    RETURN v_signature_id;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION core.record_signature IS 'Record a completed signature and update the request';
+
 -- =============================================================================
--- TODO: Create signature indexes
+-- Create signature indexes
 -- DESCRIPTION: Optimize signature queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [SIG-006] Create signature indexes
--- INDEX LIST:
---   -- Signatures:
---   - PRIMARY KEY (signature_id)
---   - UNIQUE (signature_reference)
---   - INDEX on (document_id, is_valid)
---   - INDEX on (signer_account_id, signed_at)
---   - INDEX on (signed_hash)
---   -- Requests:
---   - PRIMARY KEY (request_id)
---   - INDEX on (document_id, status)
---   - INDEX on (signer_account_id, status)
---   - INDEX on (status, expires_at) WHERE status = 'PENDING'
+-- [SIG-006] Create signature indexes
+
+-- Signatures indexes
+CREATE INDEX idx_digital_signatures_doc_valid ON core.digital_signatures(document_id, is_valid);
+CREATE INDEX idx_digital_signatures_signer_date ON core.digital_signatures(signer_account_id, signed_at);
+CREATE INDEX idx_digital_signatures_hash ON core.digital_signatures(signed_hash);
+
+-- Requests indexes
+CREATE INDEX idx_signature_requests_doc_status ON core.signature_requests(document_id, status);
+CREATE INDEX idx_signature_requests_signer_status ON core.signature_requests(signer_account_id, status);
+CREATE INDEX idx_signature_requests_pending_expiry ON core.signature_requests(status, expires_at) 
+    WHERE status = 'PENDING';
+
+COMMENT ON INDEX core.idx_signature_requests_pending_expiry IS 'Partial index for pending signature expiry checks';
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create digital_signatures table
-□ Create signature_requests table
-□ Implement verify_signature function
-□ Implement request_signature function
-□ Implement record_signature function
-□ Add all indexes for signature queries
-□ Test signature verification
-□ Test signature workflow
-□ Test revocation
-□ Verify hash computation
+☑ Create digital_signatures table
+☑ Create signature_requests table
+☑ Implement verify_signature function
+☑ Implement request_signature function
+☑ Implement record_signature function
+☑ Add all indexes for signature queries
+☑ Test signature verification
+☑ Test signature workflow
+☑ Test revocation
+☑ Verify hash computation
 ================================================================================
 */

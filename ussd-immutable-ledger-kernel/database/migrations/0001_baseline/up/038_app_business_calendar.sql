@@ -173,221 +173,268 @@ FUNCTIONS:
 
 
 -- =============================================================================
--- TODO: Create business_calendars table
+-- IMPLEMENTED: Create business_calendars table
 -- DESCRIPTION: Calendar definitions
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [CAL-001] Create app.business_calendars table
--- INSTRUCTIONS:
---   - Calendar configuration per application
---   - Weekend and working day settings
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.business_calendars (
---       calendar_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Identity
---       calendar_code       VARCHAR(50) NOT NULL,
---       calendar_name       VARCHAR(100) NOT NULL,
---       
---       -- Scope
---       application_id      UUID REFERENCES app.applications(application_id), -- NULL = global
---       country_code        VARCHAR(2),                  -- ISO country for default holidays
---       
---       -- Working Days
---       working_days        INTEGER[] DEFAULT ARRAY[1,2,3,4,5], -- Mon=1, Sun=7
---       
---       -- Time Zone
---       timezone            VARCHAR(50) DEFAULT 'UTC',
---       business_start_time TIME DEFAULT '09:00',
---       business_end_time   TIME DEFAULT '17:00',
---       
---       -- Status
---       is_default          BOOLEAN DEFAULT false,       -- Default for application
---       is_active           BOOLEAN DEFAULT true,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       created_by          UUID REFERENCES core.accounts(account_id)
---   );
---
+-- [CAL-001] Create app.business_calendars table
+CREATE TABLE app.business_calendars (
+    calendar_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Identity
+    calendar_code       VARCHAR(50) NOT NULL,
+    calendar_name       VARCHAR(100) NOT NULL,
+    
+    -- Scope
+    application_id      UUID REFERENCES app.applications(application_id), -- NULL = global
+    country_code        VARCHAR(2),                  -- ISO country for default holidays
+    
+    -- Working Days
+    working_days        INTEGER[] DEFAULT ARRAY[1,2,3,4,5], -- Mon=1, Sun=7
+    
+    -- Time Zone
+    timezone            VARCHAR(50) DEFAULT 'UTC',
+    business_start_time TIME DEFAULT '09:00',
+    business_end_time   TIME DEFAULT '17:00',
+    
+    -- Status
+    is_default          BOOLEAN DEFAULT false,       -- Default for application
+    is_active           BOOLEAN DEFAULT true,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by          UUID REFERENCES core.accounts(account_id)
+);
+
 -- CONSTRAINTS:
---   - UNIQUE (calendar_code)
---   - UNIQUE (application_id, is_default) WHERE is_default = true
+CREATE UNIQUE INDEX idx_calendars_code 
+    ON app.business_calendars (calendar_code);
+
+CREATE UNIQUE INDEX idx_calendars_app_default 
+    ON app.business_calendars (application_id, is_default) 
+    WHERE is_default = true;
+
+COMMENT ON TABLE app.business_calendars IS 'Business calendar definitions per application';
 
 -- =============================================================================
--- TODO: Create holidays table
+-- IMPLEMENTED: Create holidays table
 -- DESCRIPTION: Holiday definitions
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [CAL-002] Create app.holidays table
--- INSTRUCTIONS:
---   - Holiday dates per calendar
---   - Types for different handling
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.holidays (
---       holiday_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       calendar_id         UUID NOT NULL REFERENCES app.business_calendars(calendar_id),
---       
---       -- Holiday Details
---       holiday_date        DATE NOT NULL,
---       holiday_name        VARCHAR(100) NOT NULL,
---       
---       -- Type
---       holiday_type        VARCHAR(20) DEFAULT 'PUBLIC', -- PUBLIC, BANK, OBSERVANCE
---       
---       -- Handling
---       is_recurring        BOOLEAN DEFAULT false,       -- Same date each year
---       observed_date       DATE,                        -- If observed on different date
---       is_half_day         BOOLEAN DEFAULT false,
---       
---       -- Validity
---       valid_from          DATE NOT NULL DEFAULT CURRENT_DATE,
---       valid_to            DATE,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
---
+-- [CAL-002] Create app.holidays table
+CREATE TABLE app.holidays (
+    holiday_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    calendar_id         UUID NOT NULL REFERENCES app.business_calendars(calendar_id),
+    
+    -- Holiday Details
+    holiday_date        DATE NOT NULL,
+    holiday_name        VARCHAR(100) NOT NULL,
+    
+    -- Type
+    holiday_type        VARCHAR(20) DEFAULT 'PUBLIC', -- PUBLIC, BANK, OBSERVANCE
+    
+    -- Handling
+    is_recurring        BOOLEAN DEFAULT false,       -- Same date each year
+    observed_date       DATE,                        -- If observed on different date
+    is_half_day         BOOLEAN DEFAULT false,
+    
+    -- Validity
+    valid_from          DATE NOT NULL DEFAULT CURRENT_DATE,
+    valid_to            DATE,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- CONSTRAINTS:
---   - UNIQUE (calendar_id, holiday_date) WHERE valid_to IS NULL
+CREATE UNIQUE INDEX idx_holidays_calendar_date_current 
+    ON app.holidays (calendar_id, holiday_date) 
+    WHERE valid_to IS NULL;
+
+COMMENT ON TABLE app.holidays IS 'Holiday definitions per calendar';
 
 -- =============================================================================
--- TODO: Create is_business_day function
+-- IMPLEMENTED: Create is_business_day function
 -- DESCRIPTION: Check if date is business day
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [CAL-003] Create is_business_day function
--- INSTRUCTIONS:
---   - Check if day is in working_days
---   - Check if date is a holiday
---   - Return boolean
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.is_business_day(
---       p_date DATE,
---       p_calendar_id UUID DEFAULT NULL
---   ) RETURNS BOOLEAN AS $$
---   DECLARE
---       v_calendar RECORD;
---       v_day_of_week INTEGER;
---   BEGIN
---       -- Get calendar (use default if not specified)
---       SELECT * INTO v_calendar
---       FROM app.business_calendars
---       WHERE (calendar_id = p_calendar_id OR (p_calendar_id IS NULL AND is_default = true))
---           AND is_active = true
---       LIMIT 1;
---       
---       IF v_calendar IS NULL THEN
---           -- Default to Monday-Friday
---           v_day_of_week := EXTRACT(DOW FROM p_date);
---           RETURN v_day_of_week BETWEEN 1 AND 5;
---       END IF;
---       
---       -- Check working days
---       v_day_of_week := EXTRACT(ISODOW FROM p_date);
---       IF NOT (v_day_of_week = ANY(v_calendar.working_days)) THEN
---           RETURN false;
---       END IF;
---       
---       -- Check holidays
---       IF EXISTS (
---           SELECT 1 FROM app.holidays
---           WHERE calendar_id = v_calendar.calendar_id
---               AND holiday_date = p_date
---               AND valid_from <= p_date
---               AND (valid_to IS NULL OR valid_to >= p_date)
---       ) THEN
---           RETURN false;
---       END IF;
---       
---       RETURN true;
---   END;
---   $$ LANGUAGE plpgsql STABLE;
+-- [CAL-003] Create is_business_day function
+CREATE OR REPLACE FUNCTION app.is_business_day(
+    p_date DATE,
+    p_calendar_id UUID DEFAULT NULL
+) RETURNS BOOLEAN AS $$
+DECLARE
+    v_calendar RECORD;
+    v_day_of_week INTEGER;
+BEGIN
+    -- Get calendar (use default if not specified)
+    SELECT * INTO v_calendar
+    FROM app.business_calendars
+    WHERE (calendar_id = p_calendar_id OR (p_calendar_id IS NULL AND is_default = true))
+        AND is_active = true
+    LIMIT 1;
+    
+    IF v_calendar IS NULL THEN
+        -- Default to Monday-Friday
+        v_day_of_week := EXTRACT(DOW FROM p_date);
+        RETURN v_day_of_week BETWEEN 1 AND 5;
+    END IF;
+    
+    -- Check working days
+    v_day_of_week := EXTRACT(ISODOW FROM p_date);
+    IF NOT (v_day_of_week = ANY(v_calendar.working_days)) THEN
+        RETURN false;
+    END IF;
+    
+    -- Check holidays
+    IF EXISTS (
+        SELECT 1 FROM app.holidays
+        WHERE calendar_id = v_calendar.calendar_id
+            AND holiday_date = p_date
+            AND valid_from <= p_date
+            AND (valid_to IS NULL OR valid_to >= p_date)
+    ) THEN
+        RETURN false;
+    END IF;
+    
+    RETURN true;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION app.is_business_day IS 'Checks if a date is a business day';
 
 -- =============================================================================
--- TODO: Create next_business_day function
+-- IMPLEMENTED: Create next_business_day function
 -- DESCRIPTION: Find next business day
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [CAL-004] Create next_business_day function
--- INSTRUCTIONS:
---   - Start from given date
---   - Increment until business day found
---   - Support offset (next 2nd business day)
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.next_business_day(
---       p_from_date DATE DEFAULT CURRENT_DATE,
---       p_offset INTEGER DEFAULT 1,
---       p_calendar_id UUID DEFAULT NULL
---   ) RETURNS DATE AS $$
---   DECLARE
---       v_date DATE := p_from_date;
---       v_count INTEGER := 0;
---   BEGIN
---       LOOP
---           v_date := v_date + 1;
---           IF app.is_business_day(v_date, p_calendar_id) THEN
---               v_count := v_count + 1;
---               IF v_count >= p_offset THEN
---                   RETURN v_date;
---               END IF;
---           END IF;
---       END LOOP;
---   END;
---   $$ LANGUAGE plpgsql STABLE;
+-- [CAL-004] Create next_business_day function
+CREATE OR REPLACE FUNCTION app.next_business_day(
+    p_from_date DATE DEFAULT CURRENT_DATE,
+    p_offset INTEGER DEFAULT 1,
+    p_calendar_id UUID DEFAULT NULL
+) RETURNS DATE AS $$
+DECLARE
+    v_date DATE := p_from_date;
+    v_count INTEGER := 0;
+BEGIN
+    LOOP
+        v_date := v_date + 1;
+        IF app.is_business_day(v_date, p_calendar_id) THEN
+            v_count := v_count + 1;
+            IF v_count >= p_offset THEN
+                RETURN v_date;
+            END IF;
+        END IF;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION app.next_business_day IS 'Finds the next business day with optional offset';
 
 -- =============================================================================
--- TODO: Create previous_business_day function
+-- IMPLEMENTED: Create previous_business_day function
 -- DESCRIPTION: Find previous business day
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [CAL-005] Create previous_business_day function
--- INSTRUCTIONS:
---   - Similar to next_business_day but backwards
+-- [CAL-005] Create previous_business_day function
+CREATE OR REPLACE FUNCTION app.previous_business_day(
+    p_from_date DATE DEFAULT CURRENT_DATE,
+    p_offset INTEGER DEFAULT 1,
+    p_calendar_id UUID DEFAULT NULL
+) RETURNS DATE AS $$
+DECLARE
+    v_date DATE := p_from_date;
+    v_count INTEGER := 0;
+BEGIN
+    LOOP
+        v_date := v_date - 1;
+        IF app.is_business_day(v_date, p_calendar_id) THEN
+            v_count := v_count + 1;
+            IF v_count >= p_offset THEN
+                RETURN v_date;
+            END IF;
+        END IF;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION app.previous_business_day IS 'Finds the previous business day with optional offset';
 
 -- =============================================================================
--- TODO: Create business_days_between function
+-- IMPLEMENTED: Create business_days_between function
 -- DESCRIPTION: Count business days in range
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [CAL-006] Create business_days_between function
--- INSTRUCTIONS:
---   - Count business days between two dates
---   - Exclude start and/or end as needed
+-- [CAL-006] Create business_days_between function
+CREATE OR REPLACE FUNCTION app.business_days_between(
+    p_start_date DATE,
+    p_end_date DATE,
+    p_include_start BOOLEAN DEFAULT false,
+    p_include_end BOOLEAN DEFAULT false,
+    p_calendar_id UUID DEFAULT NULL
+) RETURNS INTEGER AS $$
+DECLARE
+    v_date DATE;
+    v_count INTEGER := 0;
+BEGIN
+    v_date := p_start_date;
+    
+    IF NOT p_include_start THEN
+        v_date := v_date + 1;
+    END IF;
+    
+    WHILE v_date <= p_end_date LOOP
+        IF app.is_business_day(v_date, p_calendar_id) THEN
+            v_count := v_count + 1;
+        END IF;
+        v_date := v_date + 1;
+    END LOOP;
+    
+    IF NOT p_include_end AND app.is_business_day(p_end_date, p_calendar_id) THEN
+        v_count := v_count - 1;
+    END IF;
+    
+    RETURN v_count;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION app.business_days_between IS 'Counts business days between two dates';
 
 -- =============================================================================
--- TODO: Create calendar indexes
+-- IMPLEMENTED: Create calendar indexes
 -- DESCRIPTION: Optimize calendar queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [CAL-007] Create calendar indexes
--- INDEX LIST:
---   -- Calendars:
---   - PRIMARY KEY (calendar_id)
---   - UNIQUE (calendar_code)
---   - INDEX on (application_id, is_default) WHERE is_default = true
---   -- Holidays:
---   - PRIMARY KEY (holiday_id)
---   - UNIQUE (calendar_id, holiday_date) WHERE valid_to IS NULL
---   - INDEX on (calendar_id, holiday_date, valid_from, valid_to)
+-- [CAL-007] Create calendar indexes
+-- Calendars:
+-- PRIMARY KEY (calendar_id) - created with table
+-- UNIQUE (calendar_code) - created above
+
+CREATE INDEX idx_calendars_app_default_lookup 
+    ON app.business_calendars (application_id, is_default) 
+    WHERE is_default = true;
+
+-- Holidays:
+-- PRIMARY KEY (holiday_id) - created with table
+-- UNIQUE (calendar_id, holiday_date) WHERE valid_to IS NULL - created above
+
+CREATE INDEX idx_holidays_calendar_date_validity 
+    ON app.holidays (calendar_id, holiday_date, valid_from, valid_to);
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create business_calendars table
-□ Create holidays table
-□ Implement is_business_day function
-□ Implement next_business_day function
-□ Implement previous_business_day function
-□ Implement business_days_between function
-□ Add all indexes for calendar queries
-□ Test business day calculations
-□ Test holiday handling
-□ Test next/previous functions
-□ Add seed holidays
+☑ Create business_calendars table
+☑ Create holidays table
+☑ Implement is_business_day function
+☑ Implement next_business_day function
+☑ Implement previous_business_day function
+☑ Implement business_days_between function
+☑ Add all indexes for calendar queries
+☐ Test business day calculations
+☐ Test holiday handling
+☐ Test next/previous functions
+☐ Add seed holidays
 ================================================================================
 */

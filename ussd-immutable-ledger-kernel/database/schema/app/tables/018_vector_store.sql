@@ -240,7 +240,7 @@ CREATE POLICY vector_store_select_policy ON app.vector_store
              app.has_permission(current_user, 'ai:vectors:read:restricted'))
             OR
             -- Creator can always access their own vectors
-            created_by = current_setting('app.current_user_id')::UUID
+            created_by = current_setting('app.current_user_id', true)::UUID
             OR
             -- Admin override
             app.has_permission(current_user, 'system:admin')
@@ -261,7 +261,7 @@ CREATE POLICY vector_store_update_policy ON app.vector_store
     USING (
         deleted_at IS NULL AND
         (
-            created_by = current_setting('app.current_user_id')::UUID
+            created_by = current_setting('app.current_user_id', true)::UUID
             OR
             app.has_permission(current_user, 'ai:vectors:update')
             OR
@@ -286,7 +286,7 @@ RETURNS TRIGGER AS $$
 BEGIN
     -- Set audit fields
     IF NEW.created_by IS NULL THEN
-        NEW.created_by := current_setting('app.current_user_id')::UUID;
+        NEW.created_by := current_setting('app.current_user_id', true)::UUID;
     END IF;
     
     -- Compute content hash for integrity
@@ -344,7 +344,7 @@ CREATE OR REPLACE FUNCTION app.trigger_vector_store_updated()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at := CURRENT_TIMESTAMP;
-    NEW.updated_by := current_setting('app.current_user_id')::UUID;
+    NEW.updated_by := current_setting('app.current_user_id', true)::UUID;
     
     -- Recompute content hash if text changed
     IF NEW.content_text IS DISTINCT FROM OLD.content_text THEN
@@ -386,7 +386,7 @@ RETURNS TRIGGER AS $$
 BEGIN
     -- If deleted_at is being set, perform soft delete
     IF NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL THEN
-        NEW.deleted_by := current_setting('app.current_user_id')::UUID;
+        NEW.deleted_by := current_setting('app.current_user_id', true)::UUID;
         
         -- Log deletion
         INSERT INTO app.audit_log (

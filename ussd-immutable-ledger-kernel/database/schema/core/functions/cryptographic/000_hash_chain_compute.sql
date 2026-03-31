@@ -126,265 +126,244 @@ RETENTION: 7 years
 ================================================================================
 */
 
+-- Ensure pgcrypto extension is available
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- =============================================================================
--- TODO: Create compute_transaction_hash function
+-- Create compute_transaction_hash function
 -- DESCRIPTION: Compute cryptographic hash for transaction integrity
 -- PRIORITY: CRITICAL
 -- SECURITY: IMMUTABLE - no side effects, deterministic output
 -- =============================================================================
--- TODO: [HASH-001] Implement core.compute_transaction_hash()
--- INSTRUCTIONS:
---   - Use digest() from pgcrypto extension with 'sha256' algorithm
---   - Concatenate all significant fields in deterministic order
---   - Include previous_hash to maintain chain integrity
---   - Include application_id for multi-tenancy isolation
---   - Return BYTEA (32 bytes for SHA-256)
---
--- FUNCTION STRUCTURE:
---   CREATE OR REPLACE FUNCTION core.compute_transaction_hash(
---       p_transaction_type_id UUID,      -- Transaction classification
---       p_application_id UUID,           -- Tenant isolation
---       p_payload JSONB,                 -- Transaction data
---       p_initiator_account_id UUID,     -- Actor identification
---       p_beneficiary_account_id UUID,   -- Counterparty (nullable)
---       p_amount NUMERIC,                -- Financial amount
---       p_currency VARCHAR(3),           -- Currency code
---       p_entry_date DATE,               -- Accounting date
---       p_previous_hash BYTEA            -- Chain link
---   ) RETURNS BYTEA
---   LANGUAGE plpgsql
---   IMMUTABLE                    -- CRITICAL: Must be deterministic
---   STRICT                       -- Returns NULL if any input is NULL
---   SECURITY INVOKER             -- Execute with caller's permissions
---   COST 100                     -- Relatively expensive operation
---   AS $$
---   DECLARE
---       v_hash_input TEXT;
---   BEGIN
---       -- Build deterministic input string
---       v_hash_input := COALESCE(p_transaction_type_id::text, '') ||
---                       COALESCE(p_application_id::text, '') ||
---                       COALESCE(p_payload::text, '{}') ||
---                       COALESCE(p_initiator_account_id::text, '') ||
---                       COALESCE(p_beneficiary_account_id::text, '') ||
---                       COALESCE(p_amount::text, '0') ||
---                       COALESCE(p_currency, 'XXX') ||
---                       COALESCE(p_entry_date::text, '1970-01-01') ||
---                       COALESCE(encode(p_previous_hash, 'hex'), '00');
---       
---       -- Return SHA-256 hash as BYTEA
---       RETURN digest(v_hash_input, 'sha256');
---   END;
---   $$;
---
+CREATE OR REPLACE FUNCTION core.compute_transaction_hash(
+    p_transaction_type_id UUID,      -- Transaction classification
+    p_application_id UUID,           -- Tenant isolation
+    p_payload JSONB,                 -- Transaction data
+    p_initiator_account_id UUID,     -- Actor identification
+    p_beneficiary_account_id UUID,   -- Counterparty (nullable)
+    p_amount NUMERIC,                -- Financial amount
+    p_currency VARCHAR(3),           -- Currency code
+    p_entry_date DATE,               -- Accounting date
+    p_previous_hash BYTEA            -- Chain link
+) RETURNS BYTEA
+LANGUAGE plpgsql
+IMMUTABLE                    -- CRITICAL: Must be deterministic
+STRICT                       -- Returns NULL if any input is NULL
+SECURITY INVOKER             -- Execute with caller's permissions
+COST 100                     -- Relatively expensive operation
+AS $$
+DECLARE
+    v_hash_input TEXT;
+BEGIN
+    -- Build deterministic input string
+    v_hash_input := COALESCE(p_transaction_type_id::text, '') ||
+                    '|' || COALESCE(p_application_id::text, '') ||
+                    '|' || COALESCE(p_payload::text, '{}') ||
+                    '|' || COALESCE(p_initiator_account_id::text, '') ||
+                    '|' || COALESCE(p_beneficiary_account_id::text, '') ||
+                    '|' || COALESCE(p_amount::text, '0') ||
+                    '|' || COALESCE(p_currency, 'XXX') ||
+                    '|' || COALESCE(p_entry_date::text, '1970-01-01') ||
+                    '|' || COALESCE(encode(p_previous_hash, 'hex'), '00');
+    
+    -- Return SHA-256 hash as BYTEA
+    RETURN digest(v_hash_input, 'sha256');
+END;
+$$;
+
+COMMENT ON FUNCTION core.compute_transaction_hash IS 'Compute SHA-256 hash for transaction integrity with chain linkage';
+
 -- PERFORMANCE NOTES:
 --   - Index on current_hash for verification lookups
 --   - Index on previous_hash for chain traversal
 --   - Consider caching for repeated computations
 
 -- =============================================================================
--- TODO: Create compute_account_hash function
+-- Create compute_account_hash function
 -- DESCRIPTION: Compute hash for account registry entries
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [HASH-002] Implement core.compute_account_hash()
--- INSTRUCTIONS:
---   - Hash account_number, account_type_id, application_id, status
---   - Include metadata JSONB for comprehensive coverage
---   - Include temporal fields (valid_from) for bitemporal integrity
---   - Include version and previous_hash for versioning chain
---
--- FUNCTION STRUCTURE:
---   CREATE OR REPLACE FUNCTION core.compute_account_hash(
---       p_account_number VARCHAR(50),
---       p_account_type_id UUID,
---       p_application_id UUID,
---       p_status VARCHAR(20),
---       p_metadata JSONB,
---       p_valid_from TIMESTAMPTZ,
---       p_version INTEGER,
---       p_previous_hash BYTEA
---   ) RETURNS BYTEA
---   LANGUAGE plpgsql
---   IMMUTABLE
---   AS $$
---   BEGIN
---       RETURN digest(
---           COALESCE(p_account_number, '') ||
---           COALESCE(p_account_type_id::text, '') ||
---           COALESCE(p_application_id::text, '') ||
---           COALESCE(p_status, '') ||
---           COALESCE(p_metadata::text, '{}') ||
---           COALESCE(p_valid_from::text, '') ||
---           COALESCE(p_version::text, '1') ||
---           COALESCE(encode(p_previous_hash, 'hex'), '00'),
---           'sha256'
---       );
---   END;
---   $$;
+CREATE OR REPLACE FUNCTION core.compute_account_hash(
+    p_account_number VARCHAR(50),
+    p_account_type_id UUID,
+    p_application_id UUID,
+    p_status VARCHAR(20),
+    p_metadata JSONB,
+    p_valid_from TIMESTAMPTZ,
+    p_version INTEGER,
+    p_previous_hash BYTEA
+) RETURNS BYTEA
+LANGUAGE plpgsql
+IMMUTABLE
+SECURITY INVOKER
+COST 100
+AS $$
+BEGIN
+    RETURN digest(
+        COALESCE(p_account_number, '') ||
+        '|' || COALESCE(p_account_type_id::text, '') ||
+        '|' || COALESCE(p_application_id::text, '') ||
+        '|' || COALESCE(p_status, '') ||
+        '|' || COALESCE(p_metadata::text, '{}') ||
+        '|' || COALESCE(p_valid_from::text, '') ||
+        '|' || COALESCE(p_version::text, '1') ||
+        '|' || COALESCE(encode(p_previous_hash, 'hex'), '00'),
+        'sha256'
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION core.compute_account_hash IS 'Compute SHA-256 hash for account registry entries with versioning';
 
 -- =============================================================================
--- TODO: Create compute_leg_hash function
+-- Create compute_leg_hash function
 -- DESCRIPTION: Compute hash for movement legs (double-entry)
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [HASH-003] Implement core.compute_leg_hash()
--- INSTRUCTIONS:
---   - Hash movement_id, account_id, direction, amount, currency
---   - Include COA code for accounting integrity
---   - Used for individual leg verification
---
--- FUNCTION STRUCTURE:
---   CREATE OR REPLACE FUNCTION core.compute_leg_hash(
---       p_movement_id UUID,
---       p_account_id UUID,
---       p_direction VARCHAR(6),      -- 'DEBIT' or 'CREDIT'
---       p_amount NUMERIC(20, 8),
---       p_currency VARCHAR(3),
---       p_coa_code VARCHAR(50)
---   ) RETURNS BYTEA
---   LANGUAGE plpgsql
---   IMMUTABLE
---   AS $$
---   BEGIN
---       RETURN digest(
---           COALESCE(p_movement_id::text, '') ||
---           COALESCE(p_account_id::text, '') ||
---           COALESCE(p_direction, '') ||
---           COALESCE(p_amount::text, '0') ||
---           COALESCE(p_currency, '') ||
---           COALESCE(p_coa_code, ''),
---           'sha256'
---       );
---   END;
---   $$;
+CREATE OR REPLACE FUNCTION core.compute_leg_hash(
+    p_movement_id UUID,
+    p_account_id UUID,
+    p_direction VARCHAR(6),      -- 'DEBIT' or 'CREDIT'
+    p_amount NUMERIC(20, 8),
+    p_currency VARCHAR(3),
+    p_coa_code VARCHAR(50)
+) RETURNS BYTEA
+LANGUAGE plpgsql
+IMMUTABLE
+SECURITY INVOKER
+COST 100
+AS $$
+BEGIN
+    RETURN digest(
+        COALESCE(p_movement_id::text, '') ||
+        '|' || COALESCE(p_account_id::text, '') ||
+        '|' || COALESCE(p_direction, '') ||
+        '|' || COALESCE(p_amount::text, '0') ||
+        '|' || COALESCE(p_currency, '') ||
+        '|' || COALESCE(p_coa_code, ''),
+        'sha256'
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION core.compute_leg_hash IS 'Compute SHA-256 hash for movement legs in double-entry accounting';
 
 -- =============================================================================
--- TODO: Create compute_movement_control_hash function
+-- Create compute_movement_control_hash function
 -- DESCRIPTION: Aggregate hash of all legs in a movement
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [HASH-004] Implement core.compute_movement_control_hash()
--- INSTRUCTIONS:
---   - Concatenate all leg hashes in sequence order
---   - Compute SHA-256 of concatenation
---   - Store in movement_headers.control_hash
---
--- FUNCTION STRUCTURE:
---   CREATE OR REPLACE FUNCTION core.compute_movement_control_hash(
---       p_movement_id UUID
---   ) RETURNS BYTEA
---   LANGUAGE plpgsql
---   STABLE                       -- Reads from table
---   SECURITY DEFINER             -- Access to leg hashes
---   AS $$
---   DECLARE
---       v_concatenated_hashes TEXT := '';
---       v_leg_hash BYTEA;
---   BEGIN
---       FOR v_leg_hash IN
---           SELECT leg_hash 
---           FROM core.movement_legs 
---           WHERE movement_id = p_movement_id 
---           ORDER BY leg_sequence
---       LOOP
---           v_concatenated_hashes := v_concatenated_hashes || encode(v_leg_hash, 'hex');
---       END LOOP;
---       
---       RETURN digest(v_concatenated_hashes, 'sha256');
---   END;
---   $$;
+CREATE OR REPLACE FUNCTION core.compute_movement_control_hash(
+    p_movement_id UUID
+) RETURNS BYTEA
+LANGUAGE plpgsql
+STABLE                       -- Reads from table
+SECURITY DEFINER             -- Access to leg hashes
+COST 200
+AS $$
+DECLARE
+    v_concatenated_hashes TEXT := '';
+    v_leg_hash BYTEA;
+BEGIN
+    FOR v_leg_hash IN
+        SELECT leg_hash 
+        FROM core.movement_legs 
+        WHERE movement_id = p_movement_id 
+        ORDER BY leg_sequence
+    LOOP
+        v_concatenated_hashes := v_concatenated_hashes || encode(v_leg_hash, 'hex');
+    END LOOP;
+    
+    IF v_concatenated_hashes = '' THEN
+        RETURN digest('empty_movement', 'sha256');
+    END IF;
+    
+    RETURN digest(v_concatenated_hashes, 'sha256');
+END;
+$$;
+
+COMMENT ON FUNCTION core.compute_movement_control_hash IS 'Compute aggregate SHA-256 hash of all legs in a movement for control purposes';
 
 -- =============================================================================
--- TODO: Create get_previous_hash function
+-- Create get_previous_hash function
 -- DESCRIPTION: Retrieve the previous hash in an account's chain
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [HASH-005] Implement core.get_previous_hash()
--- INSTRUCTIONS:
---   - Query transaction_log for last transaction by account
---   - Return current_hash of most recent transaction
---   - Handle genesis case (no previous transactions)
---   - Use FOR UPDATE to prevent race conditions
---
--- FUNCTION STRUCTURE:
---   CREATE OR REPLACE FUNCTION core.get_previous_hash(
---       p_account_id UUID,
---       p_application_id UUID DEFAULT NULL
---   ) RETURNS TABLE (
---       previous_hash BYTEA,
---       account_sequence BIGINT
---   )
---   LANGUAGE plpgsql
---   STABLE
---   AS $$
---   DECLARE
---       v_prev_hash BYTEA;
---       v_sequence BIGINT;
---   BEGIN
---       SELECT 
---           current_hash,
---           account_sequence
---       INTO 
---           v_prev_hash,
---           v_sequence
---       FROM core.transaction_log
---       WHERE initiator_account_id = p_account_id
---         AND (p_application_id IS NULL OR application_id = p_application_id)
---       ORDER BY account_sequence DESC
---       LIMIT 1
---       FOR UPDATE SKIP LOCKED;  -- Prevent deadlocks
---       
---       IF v_prev_hash IS NULL THEN
---           -- Genesis transaction - return zero hash
---           RETURN QUERY SELECT '\x00'::BYTEA, 0::BIGINT;
---       ELSE
---           RETURN QUERY SELECT v_prev_hash, v_sequence;
---       END IF;
---   END;
---   $$;
+CREATE OR REPLACE FUNCTION core.get_previous_hash(
+    p_account_id UUID,
+    p_application_id UUID DEFAULT NULL
+) RETURNS TABLE (
+    previous_hash BYTEA,
+    account_sequence BIGINT
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY INVOKER
+AS $$
+DECLARE
+    v_prev_hash BYTEA;
+    v_sequence BIGINT;
+BEGIN
+    SELECT 
+        current_hash,
+        account_sequence
+    INTO 
+        v_prev_hash,
+        v_sequence
+    FROM core.transaction_log
+    WHERE initiator_account_id = p_account_id
+      AND (p_application_id IS NULL OR application_id = p_application_id)
+    ORDER BY account_sequence DESC
+    LIMIT 1;
+    
+    IF v_prev_hash IS NULL THEN
+        -- Genesis transaction - return zero hash
+        RETURN QUERY SELECT '\x00'::BYTEA, 0::BIGINT;
+    ELSE
+        RETURN QUERY SELECT v_prev_hash, v_sequence;
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION core.get_previous_hash IS 'Retrieve the previous hash and sequence for an account chain (genesis returns zero hash)';
 
 -- =============================================================================
--- TODO: Create get_global_previous_hash function
+-- Create get_global_previous_hash function
 -- DESCRIPTION: Retrieve the previous hash in the global chain
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [HASH-006] Implement core.get_global_previous_hash()
--- INSTRUCTIONS:
---   - Query for the globally last transaction
---   - Return current_hash and chain_sequence
---   - Used for global ledger integrity
---
--- FUNCTION STRUCTURE:
---   CREATE OR REPLACE FUNCTION core.get_global_previous_hash()
---   RETURNS TABLE (
---       previous_hash BYTEA,
---       chain_sequence BIGINT
---   )
---   LANGUAGE plpgsql
---   STABLE
---   AS $$
---   DECLARE
---       v_prev_hash BYTEA;
---       v_sequence BIGINT;
---   BEGIN
---       SELECT 
---           current_hash,
---           chain_sequence
---       INTO 
---           v_prev_hash,
---           v_sequence
---       FROM core.transaction_log
---       ORDER BY chain_sequence DESC
---       LIMIT 1;
---       
---       IF v_prev_hash IS NULL THEN
---           RETURN QUERY SELECT '\x00'::BYTEA, 0::BIGINT;
---       ELSE
---           RETURN QUERY SELECT v_prev_hash, v_sequence;
---       IF;
---   END;
---   $$;
+CREATE OR REPLACE FUNCTION core.get_global_previous_hash()
+RETURNS TABLE (
+    previous_hash BYTEA,
+    chain_sequence BIGINT
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY INVOKER
+AS $$
+DECLARE
+    v_prev_hash BYTEA;
+    v_sequence BIGINT;
+BEGIN
+    SELECT 
+        current_hash,
+        chain_sequence
+    INTO 
+        v_prev_hash,
+        v_sequence
+    FROM core.transaction_log
+    ORDER BY chain_sequence DESC
+    LIMIT 1;
+    
+    IF v_prev_hash IS NULL THEN
+        RETURN QUERY SELECT '\x00'::BYTEA, 0::BIGINT;
+    ELSE
+        RETURN QUERY SELECT v_prev_hash, v_sequence;
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION core.get_global_previous_hash IS 'Retrieve the previous hash and sequence for the global ledger chain (genesis returns zero hash)';
 
 /*
 ================================================================================

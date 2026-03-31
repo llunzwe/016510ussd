@@ -175,213 +175,308 @@ SECURITY:
 
 
 -- =============================================================================
--- TODO: Create entitlement_limits table
+-- IMPLEMENTED: Create entitlement_limits table
 -- DESCRIPTION: Limit definitions
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [LIM-001] Create app.entitlement_limits table
--- INSTRUCTIONS:
---   - Limit definitions per role or account
---   - Temporal validity
---   - Configurable enforcement
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.entitlement_limits (
---       limit_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Scope
---       limit_scope         VARCHAR(20) NOT NULL,        -- ROLE, ACCOUNT, GLOBAL
---       role_id             UUID REFERENCES app.roles(role_id),
---       account_id          UUID REFERENCES core.accounts(account_id),
---       application_id      UUID REFERENCES app.applications(application_id),
---       
---       -- Limit Definition
---       limit_type          VARCHAR(50) NOT NULL,        -- TRANSACTION_MAX, DAILY, etc.
---       limit_name          VARCHAR(100),
---       
---       -- Limit Value
---       limit_amount        NUMERIC(20, 8),
---       limit_currency      VARCHAR(3),
---       limit_count         INTEGER,                     -- For count-based limits
---       
---       -- Time Period (for time-based limits)
---       period_type         VARCHAR(20),                 -- TRANSACTION, DAILY, WEEKLY, MONTHLY
---       period_start        TIME,                        -- e.g., 00:00 for daily
---       
---       -- Counterparty/Scheme restrictions
---       allowed_values      TEXT[],                      -- Allowed counterparties/schemes
---       blocked_values      TEXT[],                      -- Blocked counterparties/schemes
---       
---       -- Enforcement
---       enforcement_action  VARCHAR(20) DEFAULT 'BLOCK', -- BLOCK, WARN, NOTIFY
---       
---       -- Validity
---       valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       valid_to            TIMESTAMPTZ,
---       
---       -- Status
---       is_active           BOOLEAN DEFAULT true,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       created_by          UUID REFERENCES core.accounts(account_id)
---   );
---
+-- [LIM-001] Create app.entitlement_limits table
+CREATE TABLE app.entitlement_limits (
+    limit_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Scope
+    limit_scope         VARCHAR(20) NOT NULL,        -- ROLE, ACCOUNT, GLOBAL
+    role_id             UUID REFERENCES app.roles(role_id),
+    account_id          UUID REFERENCES core.accounts(account_id),
+    application_id      UUID REFERENCES app.applications(application_id),
+    
+    -- Limit Definition
+    limit_type          VARCHAR(50) NOT NULL,        -- TRANSACTION_MAX, DAILY, etc.
+    limit_name          VARCHAR(100),
+    
+    -- Limit Value
+    limit_amount        NUMERIC(20, 8),
+    limit_currency      VARCHAR(3),
+    limit_count         INTEGER,                     -- For count-based limits
+    
+    -- Time Period (for time-based limits)
+    period_type         VARCHAR(20),                 -- TRANSACTION, DAILY, WEEKLY, MONTHLY
+    period_start        TIME,                        -- e.g., 00:00 for daily
+    
+    -- Counterparty/Scheme restrictions
+    allowed_values      TEXT[],                      -- Allowed counterparties/schemes
+    blocked_values      TEXT[],                      -- Blocked counterparties/schemes
+    
+    -- Enforcement
+    enforcement_action  VARCHAR(20) DEFAULT 'BLOCK', -- BLOCK, WARN, NOTIFY
+    
+    -- Validity
+    valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_to            TIMESTAMPTZ,
+    
+    -- Status
+    is_active           BOOLEAN DEFAULT true,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by          UUID REFERENCES core.accounts(account_id)
+);
+
 -- CONSTRAINTS:
---   - CHECK (limit_scope IN ('ROLE', 'ACCOUNT', 'GLOBAL'))
---   - CHECK (limit_type IN ('TRANSACTION_MAX', 'DAILY', 'MONTHLY', 'COUNTERPARTY', 'SCHEME'))
+ALTER TABLE app.entitlement_limits
+    ADD CONSTRAINT chk_limit_scope 
+        CHECK (limit_scope IN ('ROLE', 'ACCOUNT', 'GLOBAL'));
+
+ALTER TABLE app.entitlement_limits
+    ADD CONSTRAINT chk_limit_type 
+        CHECK (limit_type IN ('TRANSACTION_MAX', 'DAILY', 'MONTHLY', 'COUNTERPARTY', 'SCHEME'));
+
+COMMENT ON TABLE app.entitlement_limits IS 'Entitlement limits per role/account for risk management';
 
 -- =============================================================================
--- TODO: Create limit_usage table
+-- IMPLEMENTED: Create limit_usage table
 -- DESCRIPTION: Track current period usage
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [LIM-002] Create app.limit_usage table
--- INSTRUCTIONS:
---   - Tracks usage against limits
---   - Resets on period boundaries
---   - Updated by transaction processing
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.limit_usage (
---       usage_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Links
---       limit_id            UUID NOT NULL REFERENCES app.entitlement_limits(limit_id),
---       account_id          UUID NOT NULL REFERENCES core.accounts(account_id),
---       
---       -- Period
---       period_start        TIMESTAMPTZ NOT NULL,
---       period_end          TIMESTAMPTZ NOT NULL,
---       
---       -- Usage
---       used_amount         NUMERIC(20, 8) DEFAULT 0,
---       used_count          INTEGER DEFAULT 0,
---       remaining_amount    NUMERIC(20, 8),
---       
---       -- Last Transaction
---       last_transaction_at TIMESTAMPTZ,
---       last_transaction_id UUID REFERENCES core.transaction_log(transaction_id),
---       
---       -- Audit
---       updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
---
+-- [LIM-002] Create app.limit_usage table
+CREATE TABLE app.limit_usage (
+    usage_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Links
+    limit_id            UUID NOT NULL REFERENCES app.entitlement_limits(limit_id),
+    account_id          UUID NOT NULL REFERENCES core.accounts(account_id),
+    
+    -- Period
+    period_start        TIMESTAMPTZ NOT NULL,
+    period_end          TIMESTAMPTZ NOT NULL,
+    
+    -- Usage
+    used_amount         NUMERIC(20, 8) DEFAULT 0,
+    used_count          INTEGER DEFAULT 0,
+    remaining_amount    NUMERIC(20, 8),
+    
+    -- Last Transaction
+    last_transaction_at TIMESTAMPTZ,
+    last_transaction_id UUID REFERENCES core.transaction_log(transaction_id),
+    
+    -- Audit
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- CONSTRAINTS:
---   - UNIQUE (limit_id, account_id, period_start)
+CREATE UNIQUE INDEX idx_limit_usage_unique_period 
+    ON app.limit_usage (limit_id, account_id, period_start);
+
+COMMENT ON TABLE app.limit_usage IS 'Tracks usage against entitlement limits';
 
 -- =============================================================================
--- TODO: Create check_limit function
+-- IMPLEMENTED: Create check_limit function
 -- DESCRIPTION: Validate transaction against limits
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [LIM-003] Create check_entitlement_limit function
--- INSTRUCTIONS:
---   - Calculate applicable limits for account
---   - Check current usage
---   - Return pass/fail with reason
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.check_entitlement_limit(
---       p_account_id UUID,
---       p_application_id UUID,
---       p_amount NUMERIC,
---       p_currency VARCHAR(3),
---       p_counterparty UUID DEFAULT NULL,
---       p_scheme VARCHAR(50) DEFAULT NULL
---   ) RETURNS TABLE (
---       limit_id UUID,
---       limit_name VARCHAR(100),
---       check_passed BOOLEAN,
---       reason TEXT,
---       remaining NUMERIC
---   ) AS $$
---   BEGIN
---       RETURN QUERY
---       WITH applicable_limits AS (
---           SELECT * FROM app.entitlement_limits
---           WHERE is_active = true
---               AND valid_from <= now()
---               AND (valid_to IS NULL OR valid_to > now())
---               AND (account_id = p_account_id OR 
---                    role_id IN (SELECT role_id FROM app.effective_roles 
---                               WHERE account_id = p_account_id AND application_id = p_application_id) OR
---                    limit_scope = 'GLOBAL')
---       )
---       SELECT 
---           al.limit_id,
---           al.limit_name,
---           CASE 
---               WHEN al.limit_type = 'TRANSACTION_MAX' AND p_amount > al.limit_amount THEN false
---               WHEN al.limit_type = 'DAILY' AND COALESCE(lu.used_amount, 0) + p_amount > al.limit_amount THEN false
---               ELSE true
---           END as check_passed,
---           CASE 
---               WHEN al.limit_type = 'TRANSACTION_MAX' AND p_amount > al.limit_amount 
---                   THEN 'Transaction amount exceeds maximum'
---               WHEN al.limit_type = 'DAILY' AND COALESCE(lu.used_amount, 0) + p_amount > al.limit_amount 
---                   THEN 'Daily limit would be exceeded'
---               ELSE 'Within limit'
---           END as reason,
---           COALESCE(al.limit_amount - lu.used_amount, al.limit_amount) as remaining
---       FROM applicable_limits al
---       LEFT JOIN app.limit_usage lu ON al.limit_id = lu.limit_id 
---           AND lu.account_id = p_account_id
---           AND lu.period_start <= now() AND lu.period_end > now();
---   END;
---   $$ LANGUAGE plpgsql STABLE;
+-- [LIM-003] Create check_entitlement_limit function
+CREATE OR REPLACE FUNCTION app.check_entitlement_limit(
+    p_account_id UUID,
+    p_application_id UUID,
+    p_amount NUMERIC,
+    p_currency VARCHAR(3),
+    p_counterparty UUID DEFAULT NULL,
+    p_scheme VARCHAR(50) DEFAULT NULL
+) RETURNS TABLE (
+    limit_id UUID,
+    limit_name VARCHAR(100),
+    check_passed BOOLEAN,
+    reason TEXT,
+    remaining NUMERIC
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH applicable_limits AS (
+        SELECT * FROM app.entitlement_limits
+        WHERE is_active = true
+            AND valid_from <= now()
+            AND (valid_to IS NULL OR valid_to > now())
+            AND (account_id = p_account_id OR 
+                 role_id IN (SELECT role_id FROM app.effective_roles 
+                            WHERE account_id = p_account_id AND application_id = p_application_id) OR
+                 limit_scope = 'GLOBAL')
+    )
+    SELECT 
+        al.limit_id,
+        al.limit_name,
+        CASE 
+            WHEN al.limit_type = 'TRANSACTION_MAX' AND p_amount > al.limit_amount THEN false
+            WHEN al.limit_type = 'DAILY' AND COALESCE(lu.used_amount, 0) + p_amount > al.limit_amount THEN false
+            ELSE true
+        END as check_passed,
+        CASE 
+            WHEN al.limit_type = 'TRANSACTION_MAX' AND p_amount > al.limit_amount 
+                THEN 'Transaction amount exceeds maximum'
+            WHEN al.limit_type = 'DAILY' AND COALESCE(lu.used_amount, 0) + p_amount > al.limit_amount 
+                THEN 'Daily limit would be exceeded'
+            ELSE 'Within limit'
+        END as reason,
+        COALESCE(al.limit_amount - lu.used_amount, al.limit_amount) as remaining
+    FROM applicable_limits al
+    LEFT JOIN app.limit_usage lu ON al.limit_id = lu.limit_id 
+        AND lu.account_id = p_account_id
+        AND lu.period_start <= now() AND lu.period_end > now();
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION app.check_entitlement_limit IS 'Validates a transaction against applicable entitlement limits';
 
 -- =============================================================================
--- TODO: Create update_usage function
+-- IMPLEMENTED: Create update_usage function
 -- DESCRIPTION: Record usage against limit
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [LIM-004] Create record_limit_usage function
--- INSTRUCTIONS:
---   - Increment usage counters
---   - Create new period record if needed
---   - Handle period rollovers
+-- [LIM-004] Create record_limit_usage function
+CREATE OR REPLACE FUNCTION app.record_limit_usage(
+    p_limit_id UUID,
+    p_account_id UUID,
+    p_amount NUMERIC,
+    p_transaction_id UUID DEFAULT NULL
+) RETURNS BOOLEAN AS $$
+DECLARE
+    v_limit RECORD;
+    v_period_start TIMESTAMPTZ;
+    v_period_end TIMESTAMPTZ;
+BEGIN
+    -- Get limit details
+    SELECT * INTO v_limit FROM app.entitlement_limits WHERE limit_id = p_limit_id;
+    
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    
+    -- Calculate period boundaries
+    IF v_limit.period_type = 'DAILY' THEN
+        v_period_start := date_trunc('day', now());
+        v_period_end := v_period_start + INTERVAL '1 day';
+    ELSIF v_limit.period_type = 'MONTHLY' THEN
+        v_period_start := date_trunc('month', now());
+        v_period_end := v_period_start + INTERVAL '1 month';
+    ELSIF v_limit.period_type = 'WEEKLY' THEN
+        v_period_start := date_trunc('week', now());
+        v_period_end := v_period_start + INTERVAL '1 week';
+    ELSE
+        -- Default to daily
+        v_period_start := date_trunc('day', now());
+        v_period_end := v_period_start + INTERVAL '1 day';
+    END IF;
+    
+    -- Upsert usage record
+    INSERT INTO app.limit_usage (
+        limit_id, account_id, period_start, period_end,
+        used_amount, used_count, last_transaction_at, last_transaction_id
+    ) VALUES (
+        p_limit_id, p_account_id, v_period_start, v_period_end,
+        p_amount, 1, now(), p_transaction_id
+    )
+    ON CONFLICT (limit_id, account_id, period_start) 
+    DO UPDATE SET
+        used_amount = app.limit_usage.used_amount + p_amount,
+        used_count = app.limit_usage.used_count + 1,
+        remaining_amount = app.entitlement_limits.limit_amount - (app.limit_usage.used_amount + p_amount),
+        last_transaction_at = now(),
+        last_transaction_id = p_transaction_id,
+        updated_at = now()
+    FROM app.entitlement_limits
+    WHERE app.entitlement_limits.limit_id = p_limit_id;
+    
+    RETURN true;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION app.record_limit_usage IS 'Records usage against an entitlement limit';
 
 -- =============================================================================
--- TODO: Create limit override function
+-- IMPLEMENTED: Create limit override function
 -- DESCRIPTION: Temporary limit increase
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [LIM-005] Create override_limit function
--- INSTRUCTIONS:
---   - Create temporary limit increase
---   - Require authorization
---   - Set expiration
+-- [LIM-005] Create override_limit function
+CREATE OR REPLACE FUNCTION app.override_limit(
+    p_limit_id UUID,
+    p_new_amount NUMERIC,
+    p_reason TEXT,
+    p_authorized_by UUID,
+    p_valid_until TIMESTAMPTZ
+) RETURNS UUID AS $$
+DECLARE
+    v_new_limit_id UUID;
+    v_old_limit RECORD;
+BEGIN
+    -- Get current limit
+    SELECT * INTO v_old_limit FROM app.entitlement_limits WHERE limit_id = p_limit_id;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Limit not found: %', p_limit_id;
+    END IF;
+    
+    -- Create new limit with override amount
+    INSERT INTO app.entitlement_limits (
+        limit_scope, role_id, account_id, application_id,
+        limit_type, limit_name, limit_amount, limit_currency,
+        period_type, allowed_values, blocked_values,
+        enforcement_action, valid_from, valid_to, is_active, created_by
+    ) VALUES (
+        v_old_limit.limit_scope, v_old_limit.role_id, v_old_limit.account_id, 
+        v_old_limit.application_id, v_old_limit.limit_type,
+        v_old_limit.limit_name || ' (OVERRIDE)', p_new_amount, v_old_limit.limit_currency,
+        v_old_limit.period_type, v_old_limit.allowed_values, v_old_limit.blocked_values,
+        v_old_limit.enforcement_action, now(), p_valid_until, true, p_authorized_by
+    )
+    RETURNING limit_id INTO v_new_limit_id;
+    
+    -- Deactivate old limit
+    UPDATE app.entitlement_limits
+    SET valid_to = now(), is_active = false
+    WHERE limit_id = p_limit_id;
+    
+    RETURN v_new_limit_id;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION app.override_limit IS 'Creates a temporary limit override with authorization';
 
 -- =============================================================================
--- TODO: Create limit indexes
+-- IMPLEMENTED: Create limit indexes
 -- DESCRIPTION: Optimize limit queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [LIM-006] Create limit indexes
--- INDEX LIST:
---   -- Limits:
---   - PRIMARY KEY (limit_id)
---   - INDEX on (role_id, limit_type, is_active)
---   - INDEX on (account_id, limit_type, is_active)
---   - INDEX on (application_id, limit_scope, is_active)
---   -- Usage:
---   - PRIMARY KEY (usage_id)
---   - UNIQUE (limit_id, account_id, period_start)
---   - INDEX on (account_id, period_end)
+-- [LIM-006] Create limit indexes
+-- Limits:
+-- PRIMARY KEY (limit_id) - created with table
+
+CREATE INDEX idx_entitlement_limits_role_type_active 
+    ON app.entitlement_limits (role_id, limit_type, is_active);
+
+CREATE INDEX idx_entitlement_limits_account_type_active 
+    ON app.entitlement_limits (account_id, limit_type, is_active);
+
+CREATE INDEX idx_entitlement_limits_app_scope_active 
+    ON app.entitlement_limits (application_id, limit_scope, is_active);
+
+-- Usage:
+-- PRIMARY KEY (usage_id) - created with table
+-- UNIQUE (limit_id, account_id, period_start) - created above
+
+CREATE INDEX idx_limit_usage_account_period 
+    ON app.limit_usage (account_id, period_end);
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create entitlement_limits table
-□ Create limit_usage table
-□ Implement check_entitlement_limit function
-□ Implement record_limit_usage function
-□ Implement override_limit function
-□ Add all indexes for limit queries
-□ Test limit checking
-□ Test usage tracking
-□ Test period rollovers
-□ Verify limit enforcement
+☑ Create entitlement_limits table
+☑ Create limit_usage table
+☑ Implement check_entitlement_limit function
+☑ Implement record_limit_usage function
+☑ Implement override_limit function
+☑ Add all indexes for limit queries
+☐ Test limit checking
+☐ Test usage tracking
+☐ Test period rollovers
+☐ Verify limit enforcement
 ================================================================================
 */

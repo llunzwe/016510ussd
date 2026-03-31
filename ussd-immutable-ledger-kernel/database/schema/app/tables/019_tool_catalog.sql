@@ -212,7 +212,7 @@ CREATE POLICY tool_catalog_select_policy ON app.tool_catalog
              app.has_permission(current_user, 'ai:tools:develop'))
             OR
             -- Maintainer can view their tools
-            maintained_by = current_setting('app.current_user_id')::UUID
+            maintained_by = current_setting('app.current_user_id', true)::UUID
             OR
             -- Admin override
             app.has_permission(current_user, 'system:admin')
@@ -232,9 +232,9 @@ CREATE POLICY tool_catalog_update_policy ON app.tool_catalog
     USING (
         deleted_at IS NULL AND
         (
-            maintained_by = current_setting('app.current_user_id')::UUID
+            maintained_by = current_setting('app.current_user_id', true)::UUID
             OR
-            created_by = current_setting('app.current_user_id')::UUID
+            created_by = current_setting('app.current_user_id', true)::UUID
             OR
             app.has_permission(current_user, 'ai:tools:update')
             OR
@@ -290,7 +290,7 @@ RETURNS TRIGGER AS $$
 BEGIN
     -- Set audit fields
     IF NEW.created_by IS NULL THEN
-        NEW.created_by := current_setting('app.current_user_id')::UUID;
+        NEW.created_by := current_setting('app.current_user_id', true)::UUID;
     END IF;
     
     -- Compute ledger hash
@@ -344,7 +344,7 @@ BEGIN
     
     -- Update timestamp
     NEW.updated_at := CURRENT_TIMESTAMP;
-    NEW.updated_by := current_setting('app.current_user_id')::UUID;
+    NEW.updated_by := current_setting('app.current_user_id', true)::UUID;
     
     -- Log to audit
     INSERT INTO app.audit_log (
@@ -371,7 +371,7 @@ CREATE OR REPLACE FUNCTION app.trigger_tool_catalog_soft_delete()
 RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL THEN
-        NEW.deleted_by := current_setting('app.current_user_id')::UUID;
+        NEW.deleted_by := current_setting('app.current_user_id', true)::UUID;
         
         INSERT INTO app.audit_log (
             table_name, record_id, action,

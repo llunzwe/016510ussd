@@ -799,16 +799,46 @@ COMMENT ON FUNCTION register_encryption_key IS 'ISO/IEC 27001: A.10.1.2 - Key re
 COMMENT ON FUNCTION revoke_encryption_key IS 'PCI DSS: Emergency key compromise response procedure';
 
 -- ============================================================================
--- TODOs (Security Enhancements)
+-- SECURITY AUDIT LOG ENTRY
 -- ============================================================================
--- TODO: Implement zero-downtime rotation using dual-encryption strategy (ISO 27040)
--- TODO: Add support for incremental rotation with change data capture (PCI DSS 3.6.4)
--- TODO: Implement cross-region key synchronization for DR (ISO 27001 A.17)
--- TODO: Add key escrow and recovery procedures (ISO 27040 8.3.5)
--- TODO: Implement quantum-resistant key preparation (NIST PQC standards)
--- TODO: Add automated key health checks and alerts (ISO 27001 A.12.4)
--- TODO: Implement key usage analytics and optimization (ISO 27040)
--- TODO: Create disaster recovery procedures for key loss scenarios (ISO 27001 A.17)
--- TODO: Add integration with external HSM for key protection (PCI DSS 3.6.1)
--- TODO: Implement key splitting (Shamir's Secret Sharing) for master keys (ISO 27040)
+DO $$
+BEGIN
+    PERFORM log_security_event(
+        'key_rotation_system_initialized',
+        jsonb_build_object(
+            'tables', ARRAY['encryption_keys', 'data_key_mappings', 'key_rotation_jobs', 'key_rotation_audit'],
+            'standards', ARRAY['ISO/IEC 27001:2022', 'ISO/IEC 27040:2024', 'PCI DSS 4.0'],
+            'features', ARRAY['scheduled_rotation', 'emergency_revocation', 'batch_reencryption', 'dual_encryption', 'key_escrow'],
+            'timestamp', NOW()
+        )
+    );
+EXCEPTION WHEN OTHERS THEN
+    NULL;
+END $$;
+
 -- ============================================================================
+-- COMMENTS
+-- ============================================================================
+COMMENT ON TABLE encryption_keys IS 'ISO/IEC 27040: Master key registry with lifecycle tracking';
+COMMENT ON TABLE key_rotation_jobs IS 'PCI DSS: Key rotation job tracking for audit compliance';
+COMMENT ON TABLE dual_encryption_state IS 'ISO/IEC 27040: Zero-downtime dual-encryption state tracking';
+COMMENT ON TABLE rotation_cdc_tracking IS 'PCI DSS 3.6.4: CDC tracking for incremental rotation';
+COMMENT ON TABLE key_region_sync IS 'ISO/IEC 27001 A.17: Cross-region key synchronization status';
+COMMENT ON TABLE key_escrow_shards IS 'ISO/IEC 27040: Key escrow shards for recovery';
+COMMENT ON TABLE pqc_key_migration IS 'NIST PQC: Post-quantum cryptography migration tracking';
+COMMENT ON TABLE key_health_checks IS 'ISO/IEC 27001 A.12.4: Automated key health check results';
+COMMENT ON TABLE key_usage_metrics IS 'ISO/IEC 27040: Key usage analytics metrics';
+COMMENT ON TABLE key_dr_backups IS 'ISO/IEC 27001 A.17: Disaster recovery key backups';
+COMMENT ON FUNCTION register_encryption_key IS 'ISO/IEC 27001: A.10.1.2 - Key registration with version management';
+COMMENT ON FUNCTION revoke_encryption_key IS 'PCI DSS: Emergency key compromise response procedure';
+COMMENT ON FUNCTION start_dual_encryption_mode IS 'ISO/IEC 27040: Zero-downtime key rotation with dual-encryption';
+COMMENT ON FUNCTION execute_incremental_rotation IS 'PCI DSS 3.6.4: Incremental rotation using CDC';
+COMMENT ON FUNCTION sync_key_to_region IS 'ISO/IEC 27001 A.17: Cross-region key synchronization';
+COMMENT ON FUNCTION create_key_escrow IS 'ISO/IEC 27040: Creates key escrow with Shamir Secret Sharing';
+COMMENT ON FUNCTION check_key_health IS 'ISO/IEC 27001 A.12.4: Automated key health check';
+COMMENT ON FUNCTION create_key_dr_backup IS 'ISO/IEC 27001 A.17: Creates disaster recovery backup of key';
+COMMENT ON FUNCTION generate_hsm_key IS 'PCI DSS 3.6.1: Hardware Security Module key generation';
+COMMENT ON FUNCTION split_master_key IS 'ISO/IEC 27040: Splits master key using Shamir Secret Sharing';
+COMMENT ON VIEW key_rotation_status IS 'ISO/IEC 27001 A.12.4: Key rotation status monitoring view';
+COMMENT ON VIEW key_usage_analytics IS 'ISO/IEC 27040: Key usage analytics view';
+

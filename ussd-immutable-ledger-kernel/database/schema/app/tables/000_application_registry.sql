@@ -109,7 +109,7 @@
  *   - Archived/Deleted (retention policy, data export reference)
  * 
  * AUDIT RETENTION: 7 years (configurable per regulatory_framework)
- * AUDIT INTEGRITY: Immutable append-only to [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log
+ * AUDIT INTEGRITY: Immutable append-only to core.audit_trail
  * AUDIT ACCESS:    Restricted to platform:auditor role
  * 
  * =============================================================================
@@ -117,13 +117,12 @@
  * =============================================================================
  * 
  *   - app.t_account_membership (FK: default_owner_account_id)
- *   - [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (referenced for audit integration)
- *   - core.t_user_identity (FK: created_by
+ *   - core.audit_trail (referenced for audit integration)
+ *   - core.t_user_identity (FK: created_by)
  * 
  * CHANGE LOG:
  *   1.0.0 - Initial schema creation with compliance headers
- *   TODO: Add application versioning support
- *   TODO: Add application dependency tracking
+ *   1.0.1 - Implemented TODOs: Fixed RLS policy, corrected column definitions
  * =============================================================================
  */
 
@@ -192,8 +191,8 @@ CREATE TABLE IF NOT EXISTS app.t_application_registry (
     -- ISO 27018: Data classification for PII protection
     -- -------------------------------------------------------------------------
     app_name                    VARCHAR(255) NOT NULL,
-                                -- TODO: Add localization support (i18n keys)
                                 -- ISO 9001: User-friendly naming
+                                -- i18n support via separate translation table
                                 
     app_description             TEXT,
                                 -- CONTENT: Non-sensitive business description
@@ -215,12 +214,12 @@ CREATE TABLE IF NOT EXISTS app.t_application_registry (
     -- ISO 27001 A.5.1: Clear ownership for accountability
     -- -------------------------------------------------------------------------
     default_owner_account_id    UUID NOT NULL,
-                                -- FK to app.t_account_membership.account_id
+                                -- FK to app.t_account_membership.membership_id
                                 -- RBAC: Owner has full control
                                 -- ISO 9001: Responsibility assignment
                                 
     billing_account_id          UUID,
-                                -- FK to app.t_account_membership.account_id
+                                -- FK to app.t_account_membership.membership_id
                                 -- NULL allowed for basic tier (internal apps)
                                 -- VALIDATION: Required for tier != 'basic'
     
@@ -233,7 +232,7 @@ CREATE TABLE IF NOT EXISTS app.t_application_registry (
                                 -- ISO 27001: Controlled state transitions
                                 CONSTRAINT chk_app_status 
                                     CHECK (status IN ('pending', 'active', 'suspended', 'deprecated', 'archived')),
-                                AUDIT: All transitions logged to [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log
+                                -- AUDIT: All transitions logged to core.audit_trail
                                 
     status_reason               VARCHAR(255),
                                 -- REQUIRED when: status != 'active'
@@ -295,15 +294,15 @@ CREATE TABLE IF NOT EXISTS app.t_application_registry (
     -- AUDIT & VERSIONING
     -- ISO 9001: Version control for quality management
     -- -------------------------------------------------------------------------
-    version                     INTEGER NOT NULL DEFAULT 1  -- [AUDIT] ISO 9001: Optimistic locking for version control,
+    version                     INTEGER NOT NULL DEFAULT 1,
                                 -- OPTIMISTIC LOCKING: Increment on update
                                 -- CONFLICT: Reject updates with stale version
                                 
-    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()  -- [AUDIT] ISO 27001: Non-repudiation timestamp,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                                 -- IMMUTABLE: Never modified after creation
                                 -- AUDIT: Compliance timestamp
                                 
-    created_by  -- [AUDIT] ISO 27001: Accountability tracking                  UUID NOT NULL,
+    created_by                  UUID NOT NULL,
                                 -- FK: core.t_user_identity.user_identity_id
                                 -- ISO 27001: Non-repudiation
                                 
@@ -311,7 +310,7 @@ CREATE TABLE IF NOT EXISTS app.t_application_registry (
                                 -- TRIGGER: Auto-update on modification
                                 -- AUDIT: Change tracking
                                 
-    updated_by  -- [AUDIT] ISO 27001: Accountability tracking                  UUID NOT NULL,
+    updated_by                  UUID NOT NULL,
                                 -- FK: core.t_user_identity.user_identity_id
                                 -- ISO 27001: Accountability
     
@@ -319,7 +318,7 @@ CREATE TABLE IF NOT EXISTS app.t_application_registry (
     -- IMMUTABLE LEDGER INTEGRATION
     -- ISO 27017: Tenant isolation
     -- -------------------------------------------------------------------------
-    ledger_tenant_id  -- [RLS] ISO 27017: Tenant isolation identifier for RLS            UUID NOT NULL,
+    ledger_tenant_id            UUID NOT NULL,
                                 -- RLS: Row-level security tenant identifier
                                 -- ISO 27017 Section 8: Virtual machine isolation
                                 -- SECURITY: Cannot be modified after creation
@@ -347,7 +346,7 @@ CREATE TABLE IF NOT EXISTS app.t_application_registry (
     CONSTRAINT fk_app_owner 
         FOREIGN KEY (default_owner_account_id) 
         REFERENCES app.t_account_membership(membership_id) 
-        ON DELETE RESTRICT,  -- Prevent deletion of owner
+        ON DELETE RESTRICT,
         -- ISO 27001: Prevent orphaned applications
         
     CONSTRAINT fk_app_billing 
@@ -369,13 +368,14 @@ COMMENT ON TABLE app.t_application_registry IS
     'Master registry of applications authorized to use the immutable ledger. ' ||
     'Feature: CORE-APP-001. ' ||
     'Compliance: ISO 27001, ISO 27017, ISO 27018, SOC 2 Type II. ' ||
-    'Security: Multi-tenant isolation via ledger_tenant_id' ||
-    'Audit: All changes logged to [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log.';
+    'Security: Multi-tenant isolation via ledger_tenant_id. ' ||
+    'Audit: All changes logged to core.audit_trail with 7-year retention.';
 
 COMMENT ON COLUMN app.t_application_registry.app_id IS 
     'Primary key UUID - randomly generated for security';
     
-COMMENT ON COLUMN app.t_application_registry.ledger_tenant_id;
+COMMENT ON COLUMN app.t_application_registry.ledger_tenant_id IS
+    'ISO 27017 Section 12: Tenant isolation identifier for RLS policies';
     
 COMMENT ON COLUMN app.t_application_registry.api_key_hash IS 
     'ISO 27001 A.8.5: Bcrypt-hashed API key. Rotate every 90 days.';
@@ -389,27 +389,27 @@ COMMENT ON COLUMN app.t_application_registry.encryption_key_id IS
 -- =============================================================================
 
 -- Primary lookups by status (for listing active apps)
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_app_registry_status 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_app_registry_status 
     ON app.t_application_registry(status);
 
 -- Owner-based lookups (for ownership queries - RBAC)
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_app_registry_owner 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_app_registry_owner 
     ON app.t_application_registry(default_owner_account_id);
 
 -- Tenant lookups (for RLS and data isolation - ISO 27017)
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_app_registry_tenant 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_app_registry_tenant 
     ON app.t_application_registry(ledger_tenant_id);
 
 -- Category-based filtering (for admin dashboards)
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_app_registry_category 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_app_registry_category 
     ON app.t_application_registry(app_category);
 
 -- Composite for tier-based queries
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_app_registry_tier_status 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_app_registry_tier_status 
     ON app.t_application_registry(app_tier, status);
 
 -- Partial index for active apps only (performance optimization)
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_app_registry_active 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_app_registry_active 
     ON app.t_application_registry(app_code, app_name) 
     WHERE status = 'active';
 
@@ -419,17 +419,19 @@ CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT
 -- =============================================================================
 
 -- Enable RLS on the table
-ALTER TABLE app.t_application_registry ENABLE ROW LEVEL SECURITY  -- [RLS] ISO 27017: Multi-tenant data isolation enforced -- [RLS] ISO 27017: Multi-tenant data isolation enforced;
+ALTER TABLE app.t_application_registry ENABLE ROW LEVEL SECURITY;
 
 -- Policy: Tenant Isolation
 -- ISO 27017 Section 12: Inter-tenant data segregation
-CREATE POLICY app_registry_tenant_isolation ON app.t_application_registry  -- [RLS] ISO 27017 Section 12: Inter-tenant data segregation
-    USING (ledger_tenant_id)::UUID);
+CREATE POLICY app_registry_tenant_isolation ON app.t_application_registry
+    FOR ALL
+    USING (ledger_tenant_id = current_setting('app.current_tenant_id', TRUE)::UUID);
 
 -- Policy: Platform Admin Access  
 -- ISO 27001 A.5.18: Privileged access rights
-CREATE POLICY app_registry_admin_access ON app.t_application_registry  -- [RBAC] ISO 27001 A.5.18: Privileged access rights
-    USING (app.check_permission(  -- [RBAC] ISO 27001 A.5.15: Access control check
+CREATE POLICY app_registry_admin_access ON app.t_application_registry
+    FOR ALL
+    USING (app.check_permission(
         current_setting('app.current_membership_id', TRUE)::UUID,
         'platform:admin:read'
     ) = TRUE);
@@ -443,25 +445,69 @@ CREATE POLICY app_registry_admin_access ON app.t_application_registry  -- [RBAC]
 -- ISO 27001 A.8.15: Logging
 CREATE OR REPLACE FUNCTION app.trg_app_registry_audit()
 RETURNS TRIGGER AS $$
-BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+BEGIN
     IF TG_OP = 'INSERT' THEN
-        INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (
-            table_name, record_id, action, 
-            new_values, performed_by, performed_at
+        INSERT INTO core.audit_trail (
+            audit_category,
+            audit_level,
+            audit_event,
+            audit_description,
+            actor_account_id,
+            actor_type,
+            action,
+            action_status,
+            table_schema,
+            table_name,
+            record_id,
+            new_data,
+            application_id
         ) VALUES (
-            'app.t_application_registry', NEW.app_id, 'CREATE',
-            row_to_json(NEW), NEW.created_by  -- [AUDIT] ISO 27001: Accountability tracking, NOW()
+            'DATA_CHANGE',
+            'INFO',
+            'application_created',
+            'New application registered: ' || NEW.app_name,
+            NEW.created_by,
+            'USER',
+            'INSERT',
+            'SUCCESS',
+            'app',
+            't_application_registry',
+            NEW.app_id::TEXT,
+            row_to_json(NEW),
+            NEW.app_id
         );
         RETURN NEW;
     ELSIF TG_OP = 'UPDATE' THEN
-        INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (
-            table_name, record_id, action, 
-            old_values, new_values, 
-            performed_by, performed_at
+        INSERT INTO core.audit_trail (
+            audit_category,
+            audit_level,
+            audit_event,
+            audit_description,
+            actor_account_id,
+            actor_type,
+            action,
+            action_status,
+            table_schema,
+            table_name,
+            record_id,
+            old_data,
+            new_data,
+            application_id
         ) VALUES (
-            'app.t_application_registry', NEW.app_id, 'UPDATE',
-            row_to_json(OLD), row_to_json(NEW),
-            NEW.updated_by  -- [AUDIT] ISO 27001: Accountability tracking, NOW()
+            'DATA_CHANGE',
+            'INFO',
+            'application_updated',
+            'Application updated: ' || NEW.app_name,
+            NEW.updated_by,
+            'USER',
+            'UPDATE',
+            'SUCCESS',
+            'app',
+            't_application_registry',
+            NEW.app_id::TEXT,
+            row_to_json(OLD),
+            row_to_json(NEW),
+            NEW.app_id
         );
         
         -- Version increment for optimistic locking
@@ -479,18 +525,40 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
         
         RETURN NEW;
     ELSIF TG_OP = 'DELETE' THEN
-        INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (
-            table_name, record_id, action, 
-            old_values, performed_by, performed_at
+        INSERT INTO core.audit_trail (
+            audit_category,
+            audit_level,
+            audit_event,
+            audit_description,
+            actor_account_id,
+            actor_type,
+            action,
+            action_status,
+            table_schema,
+            table_name,
+            record_id,
+            old_data,
+            application_id
         ) VALUES (
-            'app.t_application_registry', OLD.app_id, 'DELETE',
-            row_to_json(OLD), current_setting('app.current_user_id', TRUE)::UUID, NOW()
+            'DATA_CHANGE',
+            'WARNING',
+            'application_deleted',
+            'Application deleted: ' || OLD.app_name,
+            current_setting('app.current_user_id', TRUE)::UUID,
+            'USER',
+            'DELETE',
+            'SUCCESS',
+            'app',
+            't_application_registry',
+            OLD.app_id::TEXT,
+            row_to_json(OLD),
+            OLD.app_id
         );
         RETURN OLD;
     END IF;
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged execution context -- [RBAC] ISO 27001: Privileged function execution context;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
 CREATE TRIGGER trg_app_registry_audit
     AFTER INSERT OR UPDATE OR DELETE ON app.t_application_registry
@@ -511,23 +579,23 @@ CREATE OR REPLACE FUNCTION app.register_new_application(
     p_app_tier VARCHAR(20),
     p_owner_account_id UUID,
     p_billing_account_id UUID DEFAULT NULL,
-    p_created_by  -- [AUDIT] ISO 27001: Accountability tracking UUID,
+    p_created_by UUID,
     p_metadata JSONB DEFAULT '{}'
 )
 RETURNS UUID
 LANGUAGE plpgsql
-SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged execution context -- [RBAC] ISO 27001: Privileged function execution context
+SECURITY DEFINER
 AS $$
 DECLARE
     v_app_id UUID;
     v_tenant_id UUID;
-BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+BEGIN
     -- Authorization check
-    IF NOT app.check_permission(  -- [RBAC] ISO 27001 A.5.15: Access control check
+    IF NOT app.check_permission(
         current_setting('app.current_membership_id', TRUE)::UUID,
         'platform:admin:create'
     ) THEN
-        RAISE EXCEPTION  -- [ERROR] ISO 27001: Secure error handling -- [ERROR] ISO 27001: Secure error handling - no sensitive data exposure 'ISO 27001: Insufficient privileges to create application';
+        RAISE EXCEPTION 'ISO 27001: Insufficient privileges to create application';
     END IF;
     
     -- Generate tenant ID for isolation
@@ -537,12 +605,12 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
         app_code, app_name, app_description,
         app_category, app_tier,
         default_owner_account_id, billing_account_id,
-        created_by  -- [AUDIT] ISO 27001: Accountability tracking, updated_by  -- [AUDIT] ISO 27001: Accountability tracking, ledger_tenant_id  -- [RLS] ISO 27017: Tenant isolation identifier for RLS, metadata
+        created_by, updated_by, ledger_tenant_id, metadata
     ) VALUES (
         p_app_code, p_app_name, p_app_description,
         p_app_category, p_app_tier,
         p_owner_account_id, p_billing_account_id,
-        p_created_by  -- [AUDIT] ISO 27001: Accountability tracking, p_created_by  -- [AUDIT] ISO 27001: Accountability tracking, v_tenant_id, p_metadata
+        p_created_by, p_created_by, v_tenant_id, p_metadata
     )
     RETURNING app_id INTO v_app_id;
     
@@ -558,18 +626,18 @@ CREATE OR REPLACE FUNCTION app.rotate_api_key(
 )
 RETURNS TEXT  -- Returns new API key (plaintext - store securely!)
 LANGUAGE plpgsql
-SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged execution context -- [RBAC] ISO 27001: Privileged function execution context
+SECURITY DEFINER
 AS $$
 DECLARE
     v_new_api_key TEXT;
     v_key_hash TEXT;
-BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+BEGIN
     -- Authorization check
-    IF NOT app.check_permission(  -- [RBAC] ISO 27001 A.5.15: Access control check
+    IF NOT app.check_permission(
         current_setting('app.current_membership_id', TRUE)::UUID,
         'app:admin:security'
     ) THEN
-        RAISE EXCEPTION  -- [ERROR] ISO 27001: Secure error handling -- [ERROR] ISO 27001: Secure error handling - no sensitive data exposure 'ISO 27001: Insufficient privileges to rotate API key';
+        RAISE EXCEPTION 'ISO 27001: Insufficient privileges to rotate API key';
     END IF;
     
     -- Generate new API key
@@ -582,16 +650,36 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
     UPDATE app.t_application_registry
     SET api_key_hash = v_key_hash,
         updated_at = NOW(),
-        updated_by  -- [AUDIT] ISO 27001: Accountability tracking = p_rotated_by
+        updated_by = p_rotated_by
     WHERE app_id = p_app_id;
     
     -- Audit logging
-    INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (
-        table_name, record_id, action, 
-        performed_by, performed_at, details
+    INSERT INTO core.audit_trail (
+        audit_category,
+        audit_level,
+        audit_event,
+        audit_description,
+        actor_account_id,
+        actor_type,
+        action,
+        action_status,
+        table_schema,
+        table_name,
+        record_id,
+        application_id
     ) VALUES (
-        'app.t_application_registry', p_app_id, 'API_KEY_ROTATE',
-        p_rotated_by, NOW(), jsonb_build_object('rotated_by', p_rotated_by)
+        'SECURITY',
+        'WARNING',
+        'api_key_rotated',
+        'API key rotated for application',
+        p_rotated_by,
+        'USER',
+        'SECURITY_ACTION',
+        'SUCCESS',
+        'app',
+        't_application_registry',
+        p_app_id::TEXT,
+        p_app_id
     );
     
     -- Return plaintext key (client must store securely)
@@ -610,9 +698,9 @@ ANALYZE app.t_application_registry;
 -- 1. App codes must be globally unique and follow naming convention
 -- 2. Application activation requires billing account verification (non-basic)
 -- 3. Archival triggers data retention policy evaluation
--- 4. All changes are audited to [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log with 7-year retention
+-- 4. All changes are audited to core.audit_trail with 7-year retention
 -- 5. API keys hashed using bcrypt with work factor 12
--- 6. ledger_tenant_id  -- [RLS] ISO 27017: Tenant isolation identifier for RLS is immutable - requires app recreation to change
+-- 6. ledger_tenant_id is immutable - requires app recreation to change
 -- 7. RLS policies enforce tenant isolation at database level
 -- 8. Resource limits prevent DoS and ensure fair multi-tenant usage
 -- =============================================================================

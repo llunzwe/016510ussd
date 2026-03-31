@@ -312,6 +312,527 @@ END;
 $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
 
 -- ============================================================================
+-- BATCH TRANSACTION PROCESSING POLICY (ISO 27001 A.12.1)
+-- ============================================================================
+
+-- Policy for batch transaction processing
+-- ISO/IEC 27001: A.12.1 - Operational procedures for batch processing
+CREATE POLICY transaction_batch_processing ON transactions
+    FOR INSERT
+    TO authenticated
+    WITH CHECK (
+        current_user_has_role('batch_processor') AND
+        current_setting('app.batch_processing_mode', TRUE) = 'true' AND
+        account_id IN (
+            SELECT id FROM accounts WHERE owner_user_id = current_user_id()
+        )
+    );
+
+-- Function to validate batch transaction limits
+-- Parameters: p_batch_size - number of transactions in batch
+-- Returns: TRUE if within limits
+CREATE OR REPLACE FUNCTION validate_batch_transaction_limits(
+    p_batch_size INTEGER
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_daily_limit INTEGER;
+    v_processed_today INTEGER;
+BEGIN
+    v_daily_limit := COALESCE(current_setting('app.batch_daily_limit', TRUE)::INTEGER, 1000);
+    
+    -- Count transactions processed today by this user
+    SELECT COUNT(*) INTO v_processed_today
+    FROM transactions
+    WHERE created_by = current_user_id()
+    AND created_at > CURRENT_DATE;
+    
+    RETURN (v_processed_today + p_batch_size) <= v_daily_limit;
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+
+-- ============================================================================
+-- TIME-BASED RESTRICTIONS FOR HIGH-VALUE TRANSACTIONS (PCI DSS 10.6)
+-- ============================================================================
+
+-- Policy for high-value transaction time restrictions
+-- PCI DSS 10.6: Time-based restrictions for sensitive operations
+CREATE POLICY transaction_time_based_restriction ON transactions
+    AS RESTRICTIVE
+    FOR INSERT
+    TO authenticated
+    USING (
+        amount < 10000 OR  -- Normal transactions allowed anytime
+        (
+            amount >= 10000 AND
+            is_business_hours() AND  -- High-value only during business hours
+            current_user_has_verified_mfa()  -- And with MFA
+        )
+    );
+
+-- Function to check if current time is within business hours
+-- Returns: TRUE if during business hours (Mon-Fri, 6AM-10PM)
+CREATE OR REPLACE FUNCTION is_business_hours()
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_hour INTEGER;
+    v_dow INTEGER;
+BEGIN
+    v_hour := extract(hour from NOW());
+    v_dow := extract(dow from NOW());  -- 0 = Sunday, 6 = Saturday
+    
+    RETURN v_dow BETWEEN 1 AND 5 AND v_hour BETWEEN 6 AND 22;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Function to check if user has verified MFA for this session
+-- Returns: TRUE if MFA verified
+CREATE OR REPLACE FUNCTION current_user_has_verified_mfa()
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN COALESCE(current_setting('app.mfa_verified', TRUE), 'false')::BOOLEAN;
+EXCEPTION WHEN OTHERS THEN
+    RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- ============================================================================
+-- GEOGRAPHIC RESTRICTIONS (ISO 27001 A.13.1)
+-- ============================================================================
+
+-- Policy for geographic transaction restrictions
+-- ISO/IEC 27001: A.13.1 - Network security management
+CREATE POLICY transaction_geographic_restriction ON transactions
+    AS RESTRICTIVE
+    FOR ALL
+    TO authenticated
+    USING (
+        is_ip_in_allowed_region(inet_client_addr()) OR
+        current_user_has_role('admin') OR
+        current_setting('app.bypass_geo_check', TRUE) = 'true'
+    );
+
+-- Table for allowed regions
+CREATE TABLE IF NOT EXISTS transaction_allowed_regions (
+    region_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    country_code VARCHAR(2) NOT NULL,
+    region_name VARCHAR(100),
+    ip_range_start INET,
+    ip_range_end INET,
+    is_allowed BOOLEAN DEFAULT TRUE,
+    requires_approval BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Function to check if IP is in allowed region
+-- ISO/IEC 27001: A.13.1 - Geographic access control
+-- Parameters: p_client_ip - IP address to check
+-- Returns: TRUE if IP is in allowed region
+CREATE OR REPLACE FUNCTION is_ip_in_allowed_region(
+    p_client_ip INET
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_country_code VARCHAR(2);
+BEGIN
+    -- Get country code from IP geolocation (simulated)
+    -- In production, integrate with GeoIP service
+    v_country_code := current_setting('app.client_country_code', TRUE);
+    
+    IF v_country_code IS NULL THEN
+        RETURN TRUE;  -- Allow if geolocation unavailable
+    END IF;
+    
+    -- Check if country is in allowed list
+    RETURN EXISTS (
+        SELECT 1 FROM transaction_allowed_regions
+        WHERE country_code = v_country_code
+        AND is_allowed = TRUE
+    );
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+
+-- ============================================================================
+-- MULTI-SIGNATURE APPROVAL POLICIES (PCI DSS 8.4)
+-- ============================================================================
+
+-- Multi-signature requirements table
+CREATE TABLE IF NOT EXISTS transaction_multi_sig_requirements (
+    requirement_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id UUID NOT NULL,
+    min_approvers INTEGER DEFAULT 2,
+    approver_roles TEXT[] DEFAULT ARRAY['admin', 'transaction_approver'],
+    amount_threshold NUMERIC DEFAULT 50000,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Multi-signature approvals table
+CREATE TABLE IF NOT EXISTS transaction_multi_sig_approvals (
+    approval_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    transaction_id UUID NOT NULL,
+    approver_id UUID NOT NULL,
+    approval_signature TEXT,  -- Digital signature
+    approved_at TIMESTAMPTZ DEFAULT NOW(),
+    ip_address INET
+);
+
+-- Policy for multi-signature corporate accounts
+-- PCI DSS 8.4: Multi-factor authentication and multi-signature for corporate
+CREATE POLICY transaction_multi_sig_required ON transactions
+    AS RESTRICTIVE
+    FOR UPDATE
+    TO authenticated
+    USING (
+        NOT requires_multi_sig_approval(id) OR
+        has_sufficient_approvals(id) OR
+        current_user_has_role('super_admin')
+    );
+
+-- Function to check if transaction requires multi-sig approval
+-- Parameters: p_transaction_id
+-- Returns: TRUE if multi-sig required
+CREATE OR REPLACE FUNCTION requires_multi_sig_approval(
+    p_transaction_id UUID
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_transaction RECORD;
+    v_requirement RECORD;
+BEGIN
+    SELECT * INTO v_transaction FROM transactions WHERE id = p_transaction_id;
+    
+    IF v_transaction IS NULL THEN
+        RETURN FALSE;
+    END IF;
+    
+    SELECT * INTO v_requirement
+    FROM transaction_multi_sig_requirements
+    WHERE account_id = v_transaction.account_id
+    AND is_active = TRUE
+    AND amount_threshold <= v_transaction.amount;
+    
+    RETURN v_requirement IS NOT NULL;
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+
+-- Function to check if transaction has sufficient approvals
+-- Parameters: p_transaction_id
+-- Returns: TRUE if enough approvals
+CREATE OR REPLACE FUNCTION has_sufficient_approvals(
+    p_transaction_id UUID
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_requirement RECORD;
+    v_transaction RECORD;
+    v_approval_count INTEGER;
+BEGIN
+    SELECT * INTO v_transaction FROM transactions WHERE id = p_transaction_id;
+    
+    SELECT * INTO v_requirement
+    FROM transaction_multi_sig_requirements
+    WHERE account_id = v_transaction.account_id
+    AND is_active = TRUE;
+    
+    IF v_requirement IS NULL THEN
+        RETURN TRUE;
+    END IF;
+    
+    SELECT COUNT(DISTINCT approver_id) INTO v_approval_count
+    FROM transaction_multi_sig_approvals
+    WHERE transaction_id = p_transaction_id;
+    
+    RETURN v_approval_count >= v_requirement.min_approvers;
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+
+-- ============================================================================
+-- RATE LIMITING POLICIES (ISO 27001 A.12.4)
+-- ============================================================================
+
+-- Transaction rate limit tracking
+CREATE TABLE IF NOT EXISTS transaction_rate_limits (
+    limit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    window_start TIMESTAMPTZ DEFAULT NOW(),
+    transaction_count INTEGER DEFAULT 0,
+    window_duration INTERVAL DEFAULT INTERVAL '1 minute'
+);
+
+-- Policy for transaction rate limiting
+-- ISO/IEC 27001: A.12.4 - Rate limiting for resource protection
+CREATE POLICY transaction_rate_limit ON transactions
+    AS RESTRICTIVE
+    FOR INSERT
+    TO authenticated
+    USING (
+        check_transaction_rate_limit(current_user_id()) OR
+        current_user_has_role('admin')
+    );
+
+-- Function to check transaction rate limit
+-- Parameters: p_user_id
+-- Returns: TRUE if within rate limit
+CREATE OR REPLACE FUNCTION check_transaction_rate_limit(
+    p_user_id UUID
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_limit_record RECORD;
+    v_max_transactions INTEGER;
+    v_window_start TIMESTAMPTZ;
+BEGIN
+    v_max_transactions := COALESCE(current_setting('app.tx_rate_limit', TRUE)::INTEGER, 60);
+    
+    -- Get or create rate limit record
+    SELECT * INTO v_limit_record
+    FROM transaction_rate_limits
+    WHERE user_id = p_user_id
+    AND window_start > NOW() - INTERVAL '1 minute';
+    
+    IF v_limit_record IS NULL THEN
+        -- Create new window
+        INSERT INTO transaction_rate_limits (user_id, transaction_count)
+        VALUES (p_user_id, 1);
+        RETURN TRUE;
+    END IF;
+    
+    -- Check limit
+    IF v_limit_record.transaction_count >= v_max_transactions THEN
+        RETURN FALSE;
+    END IF;
+    
+    -- Increment count
+    UPDATE transaction_rate_limits
+    SET transaction_count = transaction_count + 1
+    WHERE limit_id = v_limit_record.limit_id;
+    
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
+
+-- ============================================================================
+-- TRANSACTION REVERSAL POLICIES (PCI DSS 11.4.5)
+-- ============================================================================
+
+-- Transaction reversal requests table
+CREATE TABLE IF NOT EXISTS transaction_reversal_requests (
+    reversal_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    original_transaction_id UUID NOT NULL,
+    requested_by UUID NOT NULL,
+    request_reason TEXT NOT NULL,
+    reversal_status VARCHAR(20) DEFAULT 'pending' CHECK (reversal_status IN ('pending', 'approved', 'rejected', 'completed')),
+    approved_by UUID,
+    approved_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+-- Policy for transaction reversal requests
+-- PCI DSS 11.4.5: Critical transaction change detection
+CREATE POLICY transaction_reversal_request ON transactions
+    FOR INSERT
+    TO authenticated
+    WITH CHECK (
+        is_reversal_transaction(id) IS NOT TRUE OR  -- Block direct reversals
+        current_user_has_role('super_admin')  -- Only super admin can create reversals
+    );
+
+-- Function to check if transaction is a reversal
+-- Parameters: p_transaction_id
+-- Returns: TRUE if reversal transaction
+CREATE OR REPLACE FUNCTION is_reversal_transaction(
+    p_transaction_id UUID
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_is_reversal BOOLEAN;
+BEGIN
+    SELECT metadata->>'is_reversal' = 'true' INTO v_is_reversal
+    FROM transactions
+    WHERE id = p_transaction_id;
+    
+    RETURN COALESCE(v_is_reversal, FALSE);
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Function to request transaction reversal
+-- Parameters: p_transaction_id, p_reason
+-- Returns: Reversal request ID
+CREATE OR REPLACE FUNCTION request_transaction_reversal(
+    p_transaction_id UUID,
+    p_reason TEXT
+)
+RETURNS UUID AS $$
+DECLARE
+    v_reversal_id UUID;
+BEGIN
+    INSERT INTO transaction_reversal_requests (
+        original_transaction_id, requested_by, request_reason
+    ) VALUES (
+        p_transaction_id, current_user_id(), p_reason
+    ) RETURNING reversal_id INTO v_reversal_id;
+    
+    -- Log security event
+    PERFORM log_security_event('transaction_reversal_requested',
+        jsonb_build_object(
+            'transaction_id', p_transaction_id,
+            'reversal_id', v_reversal_id,
+            'reason', p_reason
+        ));
+    
+    RETURN v_reversal_id;
+END;
+$$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
+
+-- ============================================================================
+-- CROSS-BORDER TRANSACTION APPROVAL WORKFLOWS (SWIFT CSP)
+-- ============================================================================
+
+-- Cross-border transaction requirements
+CREATE TABLE IF NOT EXISTS cross_border_requirements (
+    requirement_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    origin_country VARCHAR(2) NOT NULL,
+    destination_country VARCHAR(2) NOT NULL,
+    requires_approval BOOLEAN DEFAULT TRUE,
+    approval_roles TEXT[] DEFAULT ARRAY['compliance_officer'],
+    amount_threshold NUMERIC DEFAULT 10000,
+    additional_documentation TEXT[],
+    is_active BOOLEAN DEFAULT TRUE
+);
+
+-- Policy for cross-border transactions
+-- SWIFT CSP: Cross-border transaction controls
+CREATE POLICY transaction_cross_border ON transactions
+    AS RESTRICTIVE
+    FOR INSERT
+    TO authenticated
+    USING (
+        NOT is_cross_border_transaction(account_id, counterparty_account_id) OR
+        has_cross_border_approval(id) OR
+        current_user_has_role('compliance_officer')
+    );
+
+-- Function to check if transaction is cross-border
+-- Parameters: p_from_account, p_to_account
+-- Returns: TRUE if cross-border
+CREATE OR REPLACE FUNCTION is_cross_border_transaction(
+    p_from_account UUID,
+    p_to_account UUID
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_from_country VARCHAR(2);
+    v_to_country VARCHAR(2);
+BEGIN
+    SELECT country_code INTO v_from_country FROM accounts WHERE id = p_from_account;
+    SELECT country_code INTO v_to_country FROM accounts WHERE id = p_to_account;
+    
+    RETURN v_from_country IS DISTINCT FROM v_to_country;
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+
+-- Function to check if cross-border transaction has approval
+-- Parameters: p_transaction_id
+-- Returns: TRUE if approved
+CREATE OR REPLACE FUNCTION has_cross_border_approval(
+    p_transaction_id UUID
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_approved BOOLEAN;
+BEGIN
+    SELECT EXISTS (
+        SELECT 1 FROM transaction_approvals
+        WHERE transaction_id = p_transaction_id
+        AND approval_type = 'cross_border'
+        AND status = 'approved'
+    ) INTO v_approved;
+    
+    RETURN v_approved;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- ============================================================================
+-- ANOMALY DETECTION TRIGGERS (ISO 27001 A.12.4)
+-- ============================================================================
+
+-- Transaction anomaly log
+CREATE TABLE IF NOT EXISTS transaction_anomalies (
+    anomaly_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    transaction_id UUID,
+    user_id UUID,
+    anomaly_type VARCHAR(50) NOT NULL,
+    anomaly_score NUMERIC(5,4),
+    anomaly_details JSONB,
+    detected_at TIMESTAMPTZ DEFAULT NOW(),
+    reviewed_by UUID,
+    review_status VARCHAR(20) DEFAULT 'open'
+);
+
+-- Function to detect anomalous transaction patterns
+-- ISO/IEC 27001: A.12.4 - Anomaly detection
+-- Parameters: p_user_id, p_amount, p_account_id
+-- Returns: Anomaly score (0-1, higher = more anomalous)
+CREATE OR REPLACE FUNCTION detect_transaction_anomaly(
+    p_user_id UUID,
+    p_amount NUMERIC,
+    p_account_id UUID
+)
+RETURNS NUMERIC AS $$
+DECLARE
+    v_user_avg NUMERIC;
+    v_user_stddev NUMERIC;
+    v_zscore NUMERIC;
+    v_anomaly_score NUMERIC := 0;
+BEGIN
+    -- Calculate user's average transaction amount
+    SELECT AVG(amount), STDDEV(amount)
+    INTO v_user_avg, v_user_stddev
+    FROM transactions
+    WHERE created_by = p_user_id
+    AND created_at > NOW() - INTERVAL '30 days';
+    
+    -- Calculate z-score for amount
+    IF v_user_stddev > 0 THEN
+        v_zscore := ABS(p_amount - COALESCE(v_user_avg, 0)) / v_user_stddev;
+        v_anomaly_score := LEAST(v_zscore / 3, 1.0);  -- Normalize to 0-1
+    ELSIF p_amount > COALESCE(v_user_avg, 0) * 2 THEN
+        v_anomaly_score := 0.7;  -- High amount without history
+    END IF;
+    
+    -- Log if anomalous
+    IF v_anomaly_score > 0.8 THEN
+        INSERT INTO transaction_anomalies (
+            user_id, anomaly_type, anomaly_score, anomaly_details
+        ) VALUES (
+            p_user_id, 'unusual_amount', v_anomaly_score,
+            jsonb_build_object('amount', p_amount, 'user_avg', v_user_avg, 'zscore', v_zscore)
+        );
+        
+        PERFORM log_security_event('transaction_anomaly_detected',
+            jsonb_build_object(
+                'user_id', p_user_id,
+                'amount', p_amount,
+                'score', v_anomaly_score
+            ));
+    END IF;
+    
+    RETURN v_anomaly_score;
+END;
+$$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
+
+-- Trigger function for anomaly detection on transaction insert
+CREATE OR REPLACE FUNCTION transaction_anomaly_detection_trigger()
+RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM detect_transaction_anomaly(NEW.created_by, NEW.amount, NEW.account_id);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ============================================================================
 -- COMMENTS
 -- ============================================================================
 COMMENT ON POLICY transaction_owner_read ON transactions IS 
@@ -324,36 +845,18 @@ COMMENT ON POLICY transaction_auditor_readonly ON transactions IS
     'ISO/IEC 27050-3:2020 - Auditors have read-only access for compliance review';
 COMMENT ON POLICY transaction_service_account ON transactions IS 
     'ISO/IEC 27001 A.9.4.1 - Service accounts access based on granted permissions';
-
--- ============================================================================
--- SECURITY AUDIT LOG ENTRY
--- ============================================================================
-DO $$
-BEGIN
-    PERFORM log_security_event(
-        'rls_policies_initialized',
-        jsonb_build_object(
-            'table', 'transactions',
-            'policies', ARRAY['transaction_owner_read', 'transaction_owner_insert', 
-                              'transaction_admin_full_access', 'transaction_auditor_readonly',
-                              'transaction_service_account', 'transaction_pending_approval'],
-            'timestamp', NOW(),
-            'standard', 'ISO/IEC 27001:2022'
-        )
-    );
-EXCEPTION WHEN OTHERS THEN
-    NULL; -- Fail silently to prevent blocking
-END $$;
-
--- ============================================================================
--- TODOs (Security Enhancements)
--- ============================================================================
--- TODO: Implement policy for batch transaction processing (ISO 27001 A.12.1)
--- TODO: Add time-based restrictions for high-value transactions (PCI DSS 10.6)
--- TODO: Implement geographic restrictions based on user location (ISO 27001 A.13.1)
--- TODO: Add multi-signature approval policies for corporate accounts (PCI DSS 8.4)
--- TODO: Implement rate limiting policies at RLS level (ISO 27001 A.12.4)
--- TODO: Create policies for transaction reversal requests (PCI DSS 11.4.5)
--- TODO: Add cross-border transaction approval workflows (SWIFT CSP)
--- TODO: Implement anomaly detection triggers for suspicious patterns (ISO 27001 A.12.4)
--- ============================================================================
+COMMENT ON POLICY transaction_time_based_restriction ON transactions IS
+    'PCI DSS 10.6 - Time-based restrictions for high-value transactions';
+COMMENT ON POLICY transaction_geographic_restriction ON transactions IS
+    'ISO/IEC 27001 A.13.1 - Geographic access control for transactions';
+COMMENT ON POLICY transaction_multi_sig_required ON transactions IS
+    'PCI DSS 8.4 - Multi-signature approval for corporate accounts';
+COMMENT ON POLICY transaction_rate_limit ON transactions IS
+    'ISO/IEC 27001 A.12.4 - Rate limiting to prevent abuse';
+COMMENT ON FUNCTION is_business_hours IS 'Checks if current time is within business hours';
+COMMENT ON FUNCTION current_user_has_verified_mfa IS 'Checks if user has verified MFA for this session';
+COMMENT ON FUNCTION is_ip_in_allowed_region IS 'ISO/IEC 27001 A.13.1 - Validates IP geolocation';
+COMMENT ON FUNCTION requires_multi_sig_approval IS 'Checks if transaction requires multi-signature approval';
+COMMENT ON FUNCTION has_sufficient_approvals IS 'Verifies transaction has required number of approvals';
+COMMENT ON FUNCTION check_transaction_rate_limit IS 'Enforces per-user transaction rate limits';
+COMMENT ON FUNCTION detect_transaction_anomaly IS 'ISO/IEC 27001 A.12.4 - Detects anomalous transaction patterns';

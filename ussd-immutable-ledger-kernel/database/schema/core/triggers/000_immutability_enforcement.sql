@@ -134,40 +134,258 @@ RETENTION: 7 years (violations are security incidents)
 */
 
 -- =============================================================================
--- TODO: Create integrity_violations table
+-- Create integrity_violations table
 -- DESCRIPTION: Log of immutability violation attempts
 -- PRIORITY: HIGH
 -- SECURITY: Append-only audit trail
 -- =============================================================================
--- [Existing content preserved...]
+CREATE TABLE IF NOT EXISTS core.integrity_violations (
+    violation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    attempted_operation VARCHAR(20) NOT NULL CHECK (attempted_operation IN ('UPDATE', 'DELETE', 'TRUNCATE')),
+    table_schema VARCHAR(63) NOT NULL,
+    table_name VARCHAR(63) NOT NULL,
+    record_id TEXT,
+    old_data JSONB,
+    new_data JSONB,
+    user_name VARCHAR(100) NOT NULL DEFAULT CURRENT_USER,
+    application_name VARCHAR(100) DEFAULT current_setting('application_name', true),
+    client_addr INET DEFAULT inet_client_addr(),
+    client_port INTEGER DEFAULT inet_client_port(),
+    backend_pid INTEGER DEFAULT pg_backend_pid(),
+    query_text TEXT DEFAULT current_query(),
+    is_superuser BOOLEAN DEFAULT (CURRENT_USER = 'postgres' OR pg_has_role(CURRENT_USER, 'pg_execute_server_program', 'MEMBER')),
+    attempted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+COMMENT ON TABLE core.integrity_violations IS 'Immutable audit trail of all attempts to modify immutable ledger data';
+COMMENT ON COLUMN core.integrity_violations.attempted_operation IS 'Type of modification attempted: UPDATE, DELETE, or TRUNCATE';
+COMMENT ON COLUMN core.integrity_violations.is_superuser IS 'Whether the attempt was made by a superuser (for bypass tracking)';
+
+-- Create index for efficient querying
+CREATE INDEX IF NOT EXISTS idx_integrity_violations_attempted_at 
+    ON core.integrity_violations(attempted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_integrity_violations_table 
+    ON core.integrity_violations(table_schema, table_name);
 
 -- =============================================================================
--- TODO: Create prevent_update trigger function
+-- Create prevent_update trigger function
 -- DESCRIPTION: Block UPDATE operations on immutable tables
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- [Existing content preserved...]
+CREATE OR REPLACE FUNCTION core.prevent_update()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_allow_superuser_bypass BOOLEAN := false;  -- Configurable: set to true for emergency maintenance
+    v_is_superuser BOOLEAN;
+BEGIN
+    -- Check if current user is superuser
+    v_is_superuser := (CURRENT_USER = 'postgres' OR 
+                       pg_has_role(CURRENT_USER, 'pg_execute_server_program', 'MEMBER'));
+    
+    -- Log the violation attempt
+    INSERT INTO core.integrity_violations (
+        attempted_operation,
+        table_schema,
+        table_name,
+        record_id,
+        old_data,
+        new_data,
+        is_superuser
+    ) VALUES (
+        'UPDATE',
+        TG_TABLE_SCHEMA,
+        TG_TABLE_NAME,
+        COALESCE(OLD.id::text, OLD.transaction_id::text, OLD.account_id::text, 'unknown'),
+        to_jsonb(OLD),
+        to_jsonb(NEW),
+        v_is_superuser
+    );
+    
+    -- Allow superuser bypass if configured (with warning)
+    IF v_is_superuser AND v_allow_superuser_bypass THEN
+        RAISE WARNING 'SUPERUSER BYPASS: Update allowed on immutable table %.% by %', 
+            TG_TABLE_SCHEMA, TG_TABLE_NAME, CURRENT_USER;
+        RETURN NEW;
+    END IF;
+    
+    -- Block the update
+    RAISE EXCEPTION 'IMMUTABILITY_VIOLATION'
+        USING HINT = 'Updates are not permitted on immutable ledger tables. Use compensating transactions for corrections.',
+              ERRCODE = 'P0001',
+              DETAIL = format('Attempted to update record in %I.%I. If correction is needed, create a compensating entry.', 
+                              TG_TABLE_SCHEMA, TG_TABLE_NAME);
+END;
+$$;
+
+COMMENT ON FUNCTION core.prevent_update() IS 'Trigger function to prevent UPDATE operations on immutable ledger tables';
 
 -- =============================================================================
--- TODO: Create prevent_delete trigger function
+-- Create prevent_delete trigger function
 -- DESCRIPTION: Block DELETE operations on immutable tables
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- [Existing content preserved...]
+CREATE OR REPLACE FUNCTION core.prevent_delete()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    -- Log the violation attempt (no bypass allowed for DELETE)
+    INSERT INTO core.integrity_violations (
+        attempted_operation,
+        table_schema,
+        table_name,
+        record_id,
+        old_data,
+        is_superuser
+    ) VALUES (
+        'DELETE',
+        TG_TABLE_SCHEMA,
+        TG_TABLE_NAME,
+        COALESCE(OLD.id::text, OLD.transaction_id::text, OLD.account_id::text, 'unknown'),
+        to_jsonb(OLD),
+        (CURRENT_USER = 'postgres' OR pg_has_role(CURRENT_USER, 'pg_execute_server_program', 'MEMBER'))
+    );
+    
+    -- Block the delete (no bypass allowed - deletion is too destructive)
+    RAISE EXCEPTION 'IMMUTABILITY_VIOLATION'
+        USING HINT = 'Deletes are not permitted on immutable ledger tables. Records must be retained for audit and compliance.',
+              ERRCODE = 'P0001',
+              DETAIL = format('Attempted to delete record from %I.%I. Deletion is permanently prohibited.', 
+                              TG_TABLE_SCHEMA, TG_TABLE_NAME);
+END;
+$$;
+
+COMMENT ON FUNCTION core.prevent_delete() IS 'Trigger function to prevent DELETE operations on immutable ledger tables (no bypass allowed)';
 
 -- =============================================================================
--- TODO: Create prevent_truncate trigger function
+-- Create prevent_truncate trigger function
 -- DESCRIPTION: Block TRUNCATE operations on immutable tables
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- [Existing content preserved...]
+CREATE OR REPLACE FUNCTION core.prevent_truncate()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    -- Log the violation attempt (no bypass allowed for TRUNCATE)
+    INSERT INTO core.integrity_violations (
+        attempted_operation,
+        table_schema,
+        table_name,
+        is_superuser
+    ) VALUES (
+        'TRUNCATE',
+        TG_TABLE_SCHEMA,
+        TG_TABLE_NAME,
+        (CURRENT_USER = 'postgres' OR pg_has_role(CURRENT_USER, 'pg_execute_server_program', 'MEMBER'))
+    );
+    
+    -- Block the truncate (no bypass allowed - truncation is catastrophic)
+    RAISE EXCEPTION 'IMMUTABILITY_VIOLATION'
+        USING HINT = 'TRUNCATE is not permitted on immutable ledger tables. This is a critical security violation.',
+              ERRCODE = 'P0001',
+              DETAIL = format('Attempted to truncate %I.%I. This operation is permanently prohibited and has been logged as a critical security event.', 
+                              TG_TABLE_SCHEMA, TG_TABLE_NAME);
+END;
+$$;
+
+COMMENT ON FUNCTION core.prevent_truncate() IS 'Trigger function to prevent TRUNCATE operations on immutable ledger tables (critical security)';
 
 -- =============================================================================
--- TODO: Apply immutability triggers to core tables
+-- Apply immutability triggers to core tables
 -- DESCRIPTION: Attach triggers to all immutable tables
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- [Existing content preserved...]
+
+-- Function to apply immutability triggers to a table
+CREATE OR REPLACE FUNCTION core.apply_immutability_triggers(p_schema TEXT, p_table TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    -- Apply UPDATE prevention trigger
+    EXECUTE format('
+        CREATE OR REPLACE TRIGGER trg_%I_%I_prevent_update
+        BEFORE UPDATE ON %I.%I
+        FOR EACH ROW
+        EXECUTE FUNCTION core.prevent_update()',
+        p_table, p_schema, p_schema, p_table);
+    
+    -- Apply DELETE prevention trigger
+    EXECUTE format('
+        CREATE OR REPLACE TRIGGER trg_%I_%I_prevent_delete
+        BEFORE DELETE ON %I.%I
+        FOR EACH ROW
+        EXECUTE FUNCTION core.prevent_delete()',
+        p_table, p_schema, p_schema, p_table);
+    
+    -- Apply TRUNCATE prevention trigger
+    EXECUTE format('
+        CREATE OR REPLACE TRIGGER trg_%I_%I_prevent_truncate
+        BEFORE TRUNCATE ON %I.%I
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION core.prevent_truncate()',
+        p_table, p_schema, p_schema, p_table);
+    
+    RAISE NOTICE 'Applied immutability triggers to %.%', p_schema, p_table;
+END;
+$$;
+
+-- Apply triggers to core ledger tables (tables must exist)
+-- Note: These will fail silently if tables don't exist yet; run after table creation
+DO $$
+BEGIN
+    -- transaction_log
+    IF EXISTS (SELECT 1 FROM information_schema.tables 
+               WHERE table_schema = 'core' AND table_name = 'transaction_log') THEN
+        PERFORM core.apply_immutability_triggers('core', 'transaction_log');
+    END IF;
+    
+    -- account_registry
+    IF EXISTS (SELECT 1 FROM information_schema.tables 
+               WHERE table_schema = 'core' AND table_name = 'account_registry') THEN
+        PERFORM core.apply_immutability_triggers('core', 'account_registry');
+    END IF;
+    
+    -- movement_headers
+    IF EXISTS (SELECT 1 FROM information_schema.tables 
+               WHERE table_schema = 'core' AND table_name = 'movement_headers') THEN
+        PERFORM core.apply_immutability_triggers('core', 'movement_headers');
+    END IF;
+    
+    -- movement_legs
+    IF EXISTS (SELECT 1 FROM information_schema.tables 
+               WHERE table_schema = 'core' AND table_name = 'movement_legs') THEN
+        PERFORM core.apply_immutability_triggers('core', 'movement_legs');
+    END IF;
+    
+    -- merkle_nodes
+    IF EXISTS (SELECT 1 FROM information_schema.tables 
+               WHERE table_schema = 'core' AND table_name = 'merkle_nodes') THEN
+        PERFORM core.apply_immutability_triggers('core', 'merkle_nodes');
+    END IF;
+    
+    -- blocks (with exception for OPEN blocks - handled separately)
+    IF EXISTS (SELECT 1 FROM information_schema.tables 
+               WHERE table_schema = 'core' AND table_name = 'blocks') THEN
+        PERFORM core.apply_immutability_triggers('core', 'blocks');
+    END IF;
+    
+    -- integrity_violations itself is immutable (no updates allowed to audit trail)
+    PERFORM core.apply_immutability_triggers('core', 'integrity_violations');
+    
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Some tables may not exist yet. Run apply_immutability_triggers() after table creation.';
+END;
+$$;
 
 /*
 ================================================================================

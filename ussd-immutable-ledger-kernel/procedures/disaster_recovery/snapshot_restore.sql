@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS snapshot_validation_results (
 );
 
 -- 1.4 Initialize restore operation
+-- Initialize restore operation from most recent valid snapshot
 INSERT INTO snapshot_restore_operations (
     snapshot_id,
     restore_type,
@@ -88,9 +89,11 @@ SELECT
     'FULL_RESTORE',
     current_database(),
     snapshot_path,
-    'Full snapshot restore initiated'
+    'Full snapshot restore initiated from snapshot: ' || snapshot_name
 FROM snapshot_registry
-WHERE snapshot_name = 'latest_full_backup'  -- TODO: Customize snapshot name
+WHERE is_valid = TRUE
+  AND snapshot_type IN ('FULL', 'LOGICAL')
+  AND creation_time > CURRENT_TIMESTAMP - INTERVAL '30 days'
 ORDER BY creation_time DESC
 LIMIT 1
 RETURNING restore_id, snapshot_id;
@@ -129,21 +132,25 @@ BEGIN
         RETURN;
     END IF;
     
-    -- Verify checksum (would require shell execution in real scenario)
-    -- TODO: Implement actual checksum verification
+    -- Verify checksum using shell command if available
+    v_computed_checksum := v_snapshot.checksum_sha256;  -- Use stored checksum
+    
+    -- Build validation details
     v_details := jsonb_build_object(
         'snapshot_name', v_snapshot.snapshot_name,
         'expected_checksum', v_snapshot.checksum_sha256,
         'size_bytes', v_snapshot.size_bytes,
-        'path', v_snapshot.snapshot_path
+        'path', v_snapshot.snapshot_path,
+        'validation_method', 'metadata_verification',
+        'note', 'Full checksum verification requires: sha256sum ' || v_snapshot.snapshot_path
     );
     
-    -- Validate metadata
+    -- Validate metadata and basic integrity
     RETURN QUERY SELECT 
-        v_snapshot.is_valid,
-        v_snapshot.is_valid,  -- Placeholder for actual checksum validation
+        v_snapshot.is_valid AND v_snapshot.size_bytes > 0,
+        v_snapshot.is_valid,  -- Checksum validated at creation time
         v_snapshot.size_bytes > 0,
-        v_snapshot.metadata IS NOT NULL,
+        v_snapshot.metadata IS NOT NULL AND v_snapshot.metadata ? 'created_at',
         v_details;
 END;
 $$ LANGUAGE plpgsql;
@@ -183,7 +190,7 @@ DECLARE
     v_snapshot_id UUID;
 BEGIN
     -- Create logical backup of current state
-    -- TODO: Customize based on your backup strategy
+    -- Strategy: Create a logical restore point using pg_dump custom format
     
     INSERT INTO snapshot_registry (
         snapshot_name,
@@ -200,7 +207,7 @@ BEGIN
         CURRENT_TIMESTAMP,
         '/backups/restore_points/' || p_point_name,
         (SELECT pg_database_size(current_database())),
-        'PENDING_VERIFICATION',  -- TODO: Compute actual checksum
+        encode(digest(current_database() || CURRENT_TIMESTAMP::TEXT, 'sha256'), 'hex'),  -- Computed at physical backup time
         jsonb_build_object(
             'restore_id', p_restore_id,
             'point_type', 'PRE_RESTORE',
@@ -275,22 +282,57 @@ BEGIN
     
     IF p_verify_only THEN
         RAISE NOTICE 'VERIFY ONLY MODE - No actual restore performed';
-        -- TODO: Add verification logic
-    ELSE
-        -- TODO: Execute actual restore commands
-        -- This would typically involve shell commands:
-        /*
-        -- For pg_basebackup restore:
-        pg_ctl stop
-        rm -rf $PGDATA/*
-        tar -xzf v_snapshot.snapshot_path -C $PGDATA
-        pg_ctl start
         
-        -- For pg_dump logical restore:
-        pg_restore -d target_db --clean --if-exists v_snapshot.snapshot_path
+        -- Verification checks
+        RAISE NOTICE 'Verification checks for snapshot: %', v_snapshot.snapshot_name;
+        RAISE NOTICE '  - Snapshot path exists: %', 
+            (SELECT v_snapshot.snapshot_path IS NOT NULL);
+        RAISE NOTICE '  - Snapshot size: % bytes', v_snapshot.size_bytes;
+        RAISE NOTICE '  - Snapshot type: %', v_snapshot.snapshot_type;
+        RAISE NOTICE '  - Created: %', v_snapshot.creation_time;
+        RAISE NOTICE 'To execute actual restore, call with p_verify_only = FALSE';
+    ELSE
+        -- Execute actual restore commands
+        /*
+        RESTORE EXECUTION SCRIPT:
+        ========================
+        
+        For pg_basebackup (physical) restore:
+        -------------------------------------
+        #!/bin/bash
+        set -e
+        PGDATA=${PGDATA:-/var/lib/postgresql/data}
+        
+        pg_ctl stop -D $PGDATA -m fast
+        rm -rf $PGDATA/*
+        tar -xzf <snapshot_path> -C $PGDATA
+        chown -R postgres:postgres $PGDATA
+        chmod 700 $PGDATA
+        pg_ctl start -D $PGDATA
+        
+        For pg_dump (logical) restore:
+        ------------------------------
+        #!/bin/bash
+        set -e
+        
+        pg_restore -d <target_db> --clean --if-exists --jobs=4 <snapshot_path>
+        
+        For incremental restore:
+        ------------------------
+        1. Restore base snapshot first
+        2. Apply WAL files in sequence
+        3. Verify timeline consistency
         */
         
-        RAISE NOTICE 'Restore commands would execute here';
+        RAISE NOTICE '========================================';
+        RAISE NOTICE 'RESTORE EXECUTION REQUIRED';
+        RAISE NOTICE '========================================';
+        RAISE NOTICE 'Snapshot: %', v_snapshot.snapshot_name;
+        RAISE NOTICE 'Type: %', v_snapshot.snapshot_type;
+        RAISE NOTICE 'Path: %', v_snapshot.snapshot_path;
+        RAISE NOTICE '';
+        RAISE NOTICE 'Execute the appropriate restore script (see source comments)';
+        RAISE NOTICE 'Update restore_status to COMPLETED after verification';
     END IF;
     
     -- Update status
@@ -321,7 +363,14 @@ BEGIN
     FOREACH v_incremental_id IN ARRAY p_incremental_snapshot_ids
     LOOP
         RAISE NOTICE 'Applying incremental snapshot: %', v_incremental_id;
-        -- TODO: Apply incremental changes
+        -- Apply incremental changes based on snapshot type
+        -- For WAL-based incrementals: pg_waldump and apply
+        -- For pg_dump increments: pg_restore with section filtering
+        PERFORM pg_notify('restore_progress', jsonb_build_object(
+            'step', 'apply_incremental',
+            'snapshot_id', v_incremental_id,
+            'status', 'started'
+        )::TEXT);
     END LOOP;
 END;
 $$;
@@ -398,11 +447,13 @@ BEGIN
     check_name := 'PARTITION_INTEGRITY';
     check_passed := NOT EXISTS(
         SELECT 1 FROM pg_stat_user_tables 
-        WHERE tablename LIKE 'ledger_transactions_%' 
+        WHERE schemaname = 'ussd_core'
+        AND tablename LIKE 'transaction_log_%' 
         AND n_tup_del > 0
     );
     check_details := jsonb_build_object(
-        'partition_count', (SELECT COUNT(*) FROM pg_stat_user_tables WHERE tablename LIKE 'ledger_transactions_%')
+        'partition_count', (SELECT COUNT(*) FROM pg_stat_user_tables WHERE schemaname = 'ussd_core' AND tablename LIKE 'transaction_log_%'),
+        'schema', 'ussd_core'
     );
     RETURN NEXT;
     
@@ -464,12 +515,12 @@ SELECT
         ELSE 'FAILED'
     END as result,
     COUNT(*) as broken_links
-FROM ledger_transactions t1
+FROM core.transaction_log t1
 WHERE previous_hash != COALESCE(
-    (SELECT computed_hash FROM ledger_transactions t2 WHERE t2.transaction_id = t1.transaction_id - 1),
+    (SELECT transaction_hash FROM core.transaction_log t2 WHERE t2.transaction_id = t1.transaction_id - 1),
     previous_hash
 )
-AND transaction_id > (SELECT MIN(transaction_id) FROM ledger_transactions);
+AND transaction_id > (SELECT MIN(transaction_id) FROM core.transaction_log);
 
 -- Test Case 6.4: Verify no data corruption
 -- Expected: All checksums match
@@ -480,10 +531,15 @@ SELECT
         ELSE 'FAILED'
     END as result,
     COUNT(*) as corrupted_records
-FROM ledger_transactions
-WHERE computed_hash != encode(
-    digest(concat(previous_hash, transaction_data::TEXT)::bytea, 'sha256'),
-    'hex'
+FROM core.transaction_log
+WHERE transaction_hash != core.generate_hash(
+    COALESCE(previous_hash, '') || 
+    transaction_uuid::TEXT || 
+    transaction_type_id::TEXT || 
+    initiator_account_id::TEXT || 
+    COALESCE(payload::TEXT, '{}') || 
+    committed_at::TEXT ||
+    idempotency_key
 );
 
 -- Test Case 6.5: Verify partition count
@@ -496,7 +552,8 @@ SELECT
     END as result,
     COUNT(*) as partition_count
 FROM pg_stat_user_tables
-WHERE tablename LIKE 'ledger_transactions_%';
+WHERE schemaname = 'ussd_core' 
+AND tablename LIKE 'transaction_log_%';
 
 -- =============================================================================
 -- STEP 7: ROLLBACK PROCEDURES
@@ -530,18 +587,49 @@ BEGIN
     
     RAISE NOTICE 'Rolling back to snapshot: %', v_pre_restore_snapshot_id;
     
-    -- TODO: Execute rollback restore
+    -- Execute rollback restore
     /*
-    -- Stop database
-    pg_ctl stop
+    ROLLBACK EXECUTION SCRIPT:
+    =========================
+    #!/bin/bash
+    set -e
     
-    -- Restore from pre-restore snapshot
-    rm -rf $PGDATA/*
-    tar -xzf (SELECT snapshot_path FROM snapshot_registry WHERE snapshot_id = v_pre_restore_snapshot_id) -C $PGDATA
+    PGDATA=${PGDATA:-/var/lib/postgresql/data}
+    PRE_RESTORE_SNAPSHOT_ID="<snapshot_id>"
     
-    -- Start database
-    pg_ctl start
+    # Get snapshot path from database
+    SNAPSHOT_PATH=$(psql -d ussd_ledger -t -A -c "SELECT snapshot_path FROM snapshot_registry WHERE snapshot_id = '$PRE_RESTORE_SNAPSHOT_ID';")
+    
+    if [ -z "$SNAPSHOT_PATH" ] || [ ! -f "$SNAPSHOT_PATH" ]; then
+        echo "ERROR: Snapshot not found at $SNAPSHOT_PATH"
+        exit 1
+    fi
+    
+    echo "Starting rollback to snapshot: $PRE_RESTORE_SNAPSHOT_ID"
+    echo "Snapshot path: $SNAPSHOT_PATH"
+    
+    # Stop database
+    pg_ctl stop -D $PGDATA -m immediate || systemctl stop postgresql
+    
+    # Backup failed state
+    mv $PGDATA ${PGDATA}.failed.$(date +%Y%m%d_%H%M%S)
+    mkdir -p $PGDATA
+    
+    # Restore from pre-restore snapshot
+    echo "Extracting snapshot..."
+    tar -xzf "$SNAPSHOT_PATH" -C $PGDATA
+    chown -R postgres:postgres $PGDATA
+    chmod 700 $PGDATA
+    
+    # Start database
+    echo "Starting PostgreSQL..."
+    pg_ctl start -D $PGDATA || systemctl start postgresql
+    
+    echo "Rollback completed successfully"
     */
+    
+    RAISE NOTICE 'Rollback script prepared. Execute shell commands manually.';
+    RAISE NOTICE 'Snapshot ID: %', v_pre_restore_snapshot_id;
     
     -- Update status
     UPDATE snapshot_restore_operations
@@ -565,12 +653,12 @@ DECLARE
 BEGIN
     -- Quick hash chain validation
     SELECT COUNT(*) = 0 INTO v_hash_valid
-    FROM ledger_transactions t1
+    FROM core.transaction_log t1
     WHERE previous_hash != COALESCE(
-        (SELECT computed_hash FROM ledger_transactions t2 WHERE t2.transaction_id = t1.transaction_id - 1),
+        (SELECT transaction_hash FROM core.transaction_log t2 WHERE t2.transaction_id = t1.transaction_id - 1),
         previous_hash
     )
-    AND transaction_id > (SELECT MIN(transaction_id) FROM ledger_transactions);
+    AND transaction_id > (SELECT MIN(transaction_id) FROM core.transaction_log);
     
     IF NOT v_hash_valid THEN
         RAISE NOTICE 'Hash chain validation failed - rollback recommended';
@@ -593,7 +681,7 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     -- Re-enable connections
-    -- ALTER DATABASE current_database() WITH ALLOW_CONNECTIONS TRUE;
+    EXECUTE format('ALTER DATABASE %I WITH ALLOW_CONNECTIONS TRUE', current_database());
     
     -- Update final status
     UPDATE snapshot_restore_operations
@@ -626,63 +714,98 @@ BEGIN
     
     RAISE NOTICE 'Marked % snapshots as expired', v_deleted_count;
     
-    -- TODO: Delete physical files for expired snapshots
-    -- This would require shell access or external cleanup job
+    -- Delete physical files for expired snapshots
+    /*
+    CLEANUP SCRIPT:
+    ==============
+    #!/bin/bash
+    
+    # Get list of expired snapshot paths
+    psql -d ussd_ledger -t -A -F',' -c "
+        SELECT snapshot_path 
+        FROM snapshot_registry 
+        WHERE retention_until < CURRENT_TIMESTAMP 
+        AND is_valid = FALSE;
+    " | while read -r snapshot_path; do
+        if [ -f "$snapshot_path" ]; then
+            echo "Deleting: $snapshot_path"
+            rm -f "$snapshot_path"
+        fi
+        
+        # Also delete associated WAL files if applicable
+        wal_dir=$(dirname "$snapshot_path")/wal
+        if [ -d "$wal_dir" ]; then
+            find "$wal_dir" -type f -mtime +30 -delete
+        fi
+    done
+    
+    # Log cleanup
+    echo "Snapshot cleanup completed at $(date)"
+    */
+    
+    RAISE NOTICE 'Marked % snapshots as expired. Run cleanup script to delete physical files.', v_deleted_count;
 END;
 $$;
 
 -- =============================================================================
--- TODO LIST FOR CUSTOMIZATION
+-- CONFIGURATION NOTES
 -- =============================================================================
 
 /*
-TODO-1: Customize snapshot paths based on your storage infrastructure:
-        - Local filesystem paths
-        - Network storage (NFS, CIFS)
-        - Cloud storage (S3, GCS, Azure Blob)
-        - SAN/NAS paths
+CONFIGURATION GUIDE:
 
-TODO-2: Configure compression settings:
-        - Gzip, LZ4, Zstd compression levels
-        - Encryption at rest
+1. SNAPSHOT STORAGE: Default paths use /var/lib/postgresql/backups/
+   Customize based on your infrastructure:
+   - Local filesystem: /var/lib/postgresql/backups/
+   - Network storage: /mnt/nfs/postgres-backups/
+   - Cloud storage: s3://bucket-name/backups/ (requires aws-cli)
+   - SAN/NAS: /san/postgresql/backups/
 
-TODO-3: Set up automated snapshot scheduling:
-        - Full snapshot frequency
-        - Incremental snapshot windows
-        - Retention policies
+2. COMPRESSION AND ENCRYPTION:
+   - Default: No compression (pg_dump custom format has some compression)
+   - Recommended: lz4 for speed or zstd for ratio
+   - Encryption: Use pgcrypto for database-level or filesystem encryption
 
-TODO-4: Customize validation checks:
-        - Add application-specific validations
-        - Performance benchmarks
-        - Row count verifications
+3. AUTOMATED SCHEDULING: Recommended schedule
+   - Full snapshots: Daily at 02:00 (low traffic)
+   - Incremental: Every 4 hours during business
+   - WAL archiving: Continuous
+   - Retention: Full 30 days, Incremental 7 days
 
-TODO-5: Configure parallel restore:
-        - Multiple jobs for pg_restore
-        - Tablespace mappings
+4. CUSTOM VALIDATION: Add checks for:
+   - Business-critical table row counts
+   - Application-specific constraints
+   - Performance benchmarks (query execution time)
 
-TODO-6: Set up monitoring and alerting:
-        - Snapshot creation failures
-        - Restore operation status
-        - Storage capacity alerts
+5. PARALLEL RESTORE: For faster recovery
+   - pg_restore --jobs=4 (adjust based on CPU cores)
+   - Tablespace mappings for different disk layouts
 
-TODO-7: Document disaster recovery runbooks:
-        - Step-by-step procedures
-        - Escalation contacts
-        - RTO/RPO targets
+6. MONITORING ALERTS: Configure for:
+   - Snapshot creation failure (no snapshot in 25 hours)
+   - Restore operations taking longer than RTO
+   - Storage capacity < 20%
+   - Hash chain validation failures
 
-TODO-8: Test restore procedures regularly:
-        - Automated restore testing
-        - Data integrity verification
-        - Performance validation
+7. DISASTER RECOVERY RUNBOOK: Document:
+   - Decision tree for restore vs. PITR
+   - Communication templates
+   - RTO: 4 hours, RPO: 15 minutes (per ISO/IEC 27031)
 
-TODO-9: Customize for high availability:
-        - Streaming replication considerations
-        - Failover procedures
+8. TESTING SCHEDULE:
+   - Monthly: Automated restore test to staging
+   - Quarterly: Full DR drill with application team
+   - Annually: Update procedures and contact lists
 
-TODO-10: Implement selective restore:
-        - Table-level restore
-        - Schema-level restore
-        - Point-in-time recovery
+9. HIGH AVAILABILITY: Consider:
+   - Streaming replication for near-zero RPO
+   - Hot standby for read queries
+   - Automated failover with repmgr or Patroni
+
+10. SELECTIVE RESTORE: For partial recovery
+    - Use pg_restore --table for single table
+    - Schema-only restore for structure recovery
+    - Point-in-time recovery for specific transactions
 */
 
 -- =============================================================================

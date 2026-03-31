@@ -29,8 +29,8 @@
 --   Backup Validation     - EOD includes backup verification step
 -- =============================================================================
 
--- TODO: Ensure pg_cron extension is installed
--- CREATE EXTENSION IF NOT EXISTS pg_cron;
+-- Ensure pg_cron extension is installed
+CREATE EXTENSION IF NOT EXISTS pg_cron;
 
 -- EOD processing configuration
 CREATE TABLE IF NOT EXISTS ledger.eod_processing_config (
@@ -303,12 +303,11 @@ RETURNS JSONB AS $$
 BEGIN RETURN jsonb_build_object('records_processed', 0, 'status', 'NOT_IMPLEMENTED'); END;
 $$ LANGUAGE plpgsql;
 
--- TODO: Create supporting tables
-/*
+-- Supporting tables for EOD processing
 CREATE TABLE IF NOT EXISTS ledger.daily_balance_snapshots (
     snapshot_id BIGSERIAL PRIMARY KEY,
     snapshot_date DATE NOT NULL,
-    account_id BIGINT NOT NULL REFERENCES ledger.accounts(account_id),
+    account_id BIGINT NOT NULL,
     opening_balance NUMERIC(20,8) NOT NULL DEFAULT 0,
     closing_balance NUMERIC(20,8) NOT NULL DEFAULT 0,
     total_credits NUMERIC(20,8) NOT NULL DEFAULT 0,
@@ -320,7 +319,6 @@ CREATE TABLE IF NOT EXISTS ledger.daily_balance_snapshots (
 );
 
 CREATE TABLE IF NOT EXISTS ledger.daily_transaction_summary (
-    summary_id BIGSERIAL PRIMARY KEY,
     summary_date DATE PRIMARY KEY,
     total_transactions BIGINT NOT NULL DEFAULT 0,
     total_volume NUMERIC(30,8) NOT NULL DEFAULT 0,
@@ -331,11 +329,234 @@ CREATE TABLE IF NOT EXISTS ledger.daily_transaction_summary (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
-*/
 
--- TODO: Schedule EOD processing via pg_cron
--- SELECT cron.schedule('eod-processing', '5 0 * * *', 'SELECT ledger.execute_eod_processing()');
+-- Audit trail archive for long-term storage
+CREATE TABLE IF NOT EXISTS ledger.audit_trail_archive (
+    archive_id BIGSERIAL PRIMARY KEY,
+    archive_date DATE NOT NULL,
+    audit_id BIGINT NOT NULL,
+    table_name TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    old_data JSONB,
+    new_data JSONB,
+    changed_at TIMESTAMPTZ NOT NULL,
+    changed_by TEXT,
+    archived_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT uk_audit_archive UNIQUE (archive_date, audit_id)
+);
 
--- TODO: Add retry mechanism for failed steps
--- TODO: Implement notification system for EOD completion/failures
--- TODO: Create dependency validation (ensure all prior days are processed)
+-- Daily audit summary
+CREATE TABLE IF NOT EXISTS ledger.daily_audit_summary (
+    summary_date DATE PRIMARY KEY,
+    total_operations BIGINT NOT NULL DEFAULT 0,
+    insert_count BIGINT NOT NULL DEFAULT 0,
+    update_count BIGINT NOT NULL DEFAULT 0,
+    delete_count BIGINT NOT NULL DEFAULT 0,
+    unique_tables INT NOT NULL DEFAULT 0,
+    unique_users INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Compliance reports
+CREATE TABLE IF NOT EXISTS ledger.compliance_reports (
+    report_id BIGSERIAL PRIMARY KEY,
+    report_date DATE NOT NULL,
+    report_type TEXT NOT NULL,
+    report_name TEXT NOT NULL,
+    total_accounts BIGINT,
+    balanced_accounts BIGINT,
+    discrepancies_found BIGINT,
+    report_status TEXT DEFAULT 'DRAFT',
+    generated_at TIMESTAMPTZ DEFAULT NOW(),
+    reviewed_by TEXT,
+    reviewed_at TIMESTAMPTZ,
+    CONSTRAINT uk_compliance_report UNIQUE (report_date, report_type)
+);
+
+-- Backup log
+CREATE TABLE IF NOT EXISTS ledger.backup_log (
+    backup_id BIGSERIAL PRIMARY KEY,
+    backup_date DATE NOT NULL,
+    backup_type TEXT NOT NULL,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    table_count INT,
+    row_counts JSONB,
+    checksum TEXT,
+    status TEXT DEFAULT 'PENDING'
+);
+
+-- Security events for compliance reporting
+CREATE TABLE IF NOT EXISTS ledger.security_events (
+    event_id BIGSERIAL PRIMARY KEY,
+    event_time TIMESTAMPTZ DEFAULT NOW(),
+    event_type TEXT NOT NULL,
+    severity TEXT NOT NULL, -- LOW, MEDIUM, HIGH, CRITICAL
+    description TEXT,
+    source_ip INET,
+    user_name TEXT,
+    details JSONB
+);
+
+-- Schedule EOD processing via pg_cron
+-- Runs daily at 00:05 UTC (5 minutes after midnight)
+DO $$
+BEGIN
+    PERFORM cron.schedule('eod-processing', '5 0 * * *', 'SELECT ledger.execute_eod_processing()');
+    RAISE NOTICE 'EOD processing scheduled via pg_cron';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Could not schedule EOD processing: %', SQLERRM;
+END;
+$$;
+
+-- Retry mechanism for failed steps
+CREATE OR REPLACE FUNCTION ledger.retry_failed_eod_steps(
+    p_processing_date DATE,
+    p_max_retries INT DEFAULT 3
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_failed_step RECORD;
+    v_result JSONB;
+    v_retried INT := 0;
+BEGIN
+    -- Find failed steps
+    FOR v_failed_step IN
+        SELECT sl.process_name, sl.step_id
+        FROM ledger.eod_step_log sl
+        JOIN ledger.eod_execution_log el ON sl.log_id = el.log_id
+        WHERE el.processing_date = p_processing_date
+          AND sl.status = 'FAILED'
+          AND sl.retry_count IS NULL
+    LOOP
+        -- Increment retry count
+        UPDATE ledger.eod_step_log
+        SET retry_count = COALESCE(retry_count, 0) + 1,
+            started_at = NOW(),
+            status = 'RETRYING'
+        WHERE step_id = v_failed_step.step_id;
+        
+        -- Retry the step
+        BEGIN
+            v_result := CASE v_failed_step.process_name
+                WHEN 'DAILY_BALANCE_SNAPSHOT' THEN ledger.eod_balance_snapshot(p_processing_date)
+                WHEN 'TRANSACTION_AGGREGATION' THEN ledger.eod_transaction_aggregation(p_processing_date)
+                WHEN 'AUDIT_TRAIL_CONSOLIDATION' THEN ledger.eod_audit_consolidation(p_processing_date)
+                WHEN 'COMPLIANCE_REPORT_GENERATION' THEN ledger.eod_compliance_reports(p_processing_date)
+                WHEN 'MATERIALIZED_VIEW_REFRESH' THEN ledger.eod_mv_refresh(p_processing_date)
+                WHEN 'STATISTICS_UPDATE' THEN ledger.eod_statistics_update(p_processing_date)
+                WHEN 'BACKUP_VALIDATION' THEN ledger.eod_backup_validation(p_processing_date)
+                ELSE jsonb_build_object('error', 'Unknown process')
+            END;
+            
+            UPDATE ledger.eod_step_log
+            SET status = 'COMPLETED',
+                completed_at = NOW(),
+                retry_success = TRUE
+            WHERE step_id = v_failed_step.step_id;
+            
+            v_retried := v_retried + 1;
+            
+        EXCEPTION WHEN OTHERS THEN
+            UPDATE ledger.eod_step_log
+            SET status = 'FAILED',
+                completed_at = NOW(),
+                error_message = SQLERRM,
+                retry_success = FALSE
+            WHERE step_id = v_failed_step.step_id;
+        END;
+    END LOOP;
+    
+    RETURN jsonb_build_object(
+        'processing_date', p_processing_date,
+        'steps_retried', v_retried,
+        'status', CASE WHEN v_retried > 0 THEN 'PARTIAL_RETRY' ELSE 'NO_ACTION' END
+    );
+END;
+$$;
+
+-- Notification function for EOD events
+CREATE OR REPLACE FUNCTION ledger.notify_eod_status()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Send notification based on status
+    IF NEW.status = 'COMPLETED' THEN
+        PERFORM pg_notify('eod_status', jsonb_build_object(
+            'status', 'SUCCESS',
+            'processing_date', NEW.processing_date,
+            'steps_completed', NEW.steps_completed,
+            'duration_seconds', EXTRACT(EPOCH FROM (NEW.completed_at - NEW.started_at))
+        )::TEXT);
+    ELSIF NEW.status = 'FAILED' THEN
+        PERFORM pg_notify('eod_status', jsonb_build_object(
+            'status', 'FAILED',
+            'processing_date', NEW.processing_date,
+            'error', NEW.error_details,
+            'requires_attention', TRUE
+        )::TEXT);
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create trigger for EOD notifications
+DROP TRIGGER IF EXISTS eod_status_notification ON ledger.eod_execution_log;
+CREATE TRIGGER eod_status_notification
+    AFTER UPDATE OF status ON ledger.eod_execution_log
+    FOR EACH ROW
+    WHEN (NEW.status IN ('COMPLETED', 'FAILED'))
+    EXECUTE FUNCTION ledger.notify_eod_status();
+
+-- Dependency validation: ensure all prior days are processed
+CREATE OR REPLACE FUNCTION ledger.validate_eod_dependencies(p_date DATE)
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_missing_dates DATE[];
+    v_last_processed DATE;
+BEGIN
+    -- Find the last successfully processed date
+    SELECT MAX(processing_date) INTO v_last_processed
+    FROM ledger.eod_execution_log
+    WHERE status = 'COMPLETED';
+    
+    -- Find any gaps
+    SELECT ARRAY_AGG(missing_date) INTO v_missing_dates
+    FROM (
+        SELECT generate_series(
+            COALESCE(v_last_processed, p_date - INTERVAL '30 days')::DATE + 1,
+            p_date - 1,
+            INTERVAL '1 day'
+        )::DATE as missing_date
+        EXCEPT
+        SELECT processing_date 
+        FROM ledger.eod_execution_log 
+        WHERE status = 'COMPLETED'
+    ) gaps;
+    
+    IF v_missing_dates IS NULL OR array_length(v_missing_dates, 1) IS NULL THEN
+        RETURN jsonb_build_object(
+            'status', 'VALID',
+            'can_proceed', TRUE,
+            'missing_dates', '[]'::JSONB
+        );
+    ELSE
+        RETURN jsonb_build_object(
+            'status', 'INVALID',
+            'can_proceed', FALSE,
+            'missing_dates', to_jsonb(v_missing_dates),
+            'last_processed', v_last_processed
+        );
+    END IF;
+END;
+$$;
+
+-- Add retry-related columns to step log
+ALTER TABLE ledger.eod_step_log
+ADD COLUMN IF NOT EXISTS retry_count INT DEFAULT 0,
+ADD COLUMN IF NOT EXISTS retry_success BOOLEAN;

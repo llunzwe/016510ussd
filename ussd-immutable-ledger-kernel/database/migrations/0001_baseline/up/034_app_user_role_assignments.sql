@@ -173,211 +173,226 @@ PERMISSION CHECKING:
 
 
 -- =============================================================================
--- TODO: Create user_role_assignments table
+-- IMPLEMENTED: Create user_role_assignments table
 -- DESCRIPTION: Role assignments with temporal validity
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [RA-001] Create app.user_role_assignments table
--- INSTRUCTIONS:
---   - Versioned role assignments
---   - Supports multiple concurrent roles
---   - Automatic expiration handling
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.user_role_assignments (
---       assignment_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Links
---       account_id          UUID NOT NULL REFERENCES core.accounts(account_id),
---       application_id      UUID NOT NULL REFERENCES app.applications(application_id),
---       role_id             UUID NOT NULL REFERENCES app.roles(role_id),
---       membership_id       UUID REFERENCES app.account_memberships(membership_id),
---       
---       -- Validity
---       valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       valid_to            TIMESTAMPTZ,                 -- NULL = indefinite
---       
---       -- Assignment Context
---       assigned_by         UUID NOT NULL REFERENCES core.accounts(account_id),
---       assigned_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
---       assignment_reason   TEXT,
---       assignment_source   VARCHAR(50),                 -- USSD, WEB, ADMIN, API
---       
---       -- Revocation
---       revoked_by          UUID REFERENCES core.accounts(account_id),
---       revoked_at          TIMESTAMPTZ,
---       revocation_reason   TEXT,
---       
---       -- Status
---       is_active           BOOLEAN DEFAULT true,
---       
---       -- Constraints
---       CONSTRAINT valid_time_range CHECK (valid_to IS NULL OR valid_to > valid_from)
---   );
---
--- CONSTRAINTS:
---   - EXCLUDE USING gist (account_id WITH =, application_id WITH =, 
---                         role_id WITH =, valid_during WITH &&)
---   -- Prevents overlapping same-role assignments
+-- [RA-001] Create app.user_role_assignments table
+CREATE TABLE app.user_role_assignments (
+    assignment_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Links
+    account_id          UUID NOT NULL REFERENCES core.accounts(account_id),
+    application_id      UUID NOT NULL REFERENCES app.applications(application_id),
+    role_id             UUID NOT NULL REFERENCES app.roles(role_id),
+    membership_id       UUID REFERENCES app.account_memberships(membership_id),
+    
+    -- Validity
+    valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_to            TIMESTAMPTZ,                 -- NULL = indefinite
+    
+    -- Assignment Context
+    assigned_by         UUID NOT NULL REFERENCES core.accounts(account_id),
+    assigned_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    assignment_reason   TEXT,
+    assignment_source   VARCHAR(50),                 -- USSD, WEB, ADMIN, API
+    
+    -- Revocation
+    revoked_by          UUID REFERENCES core.accounts(account_id),
+    revoked_at          TIMESTAMPTZ,
+    revocation_reason   TEXT,
+    
+    -- Status
+    is_active           BOOLEAN DEFAULT true,
+    
+    -- Constraints
+    CONSTRAINT valid_time_range CHECK (valid_to IS NULL OR valid_to > valid_from)
+);
+
+COMMENT ON TABLE app.user_role_assignments IS 'Role assignments with temporal validity per application';
+COMMENT ON COLUMN app.user_role_assignments.is_active IS 'True if assignment is currently active';
 
 -- =============================================================================
--- TODO: Create effective_roles view
+-- IMPLEMENTED: Create effective_roles view
 -- DESCRIPTION: Currently active role assignments
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [RA-002] Create effective_roles view
--- INSTRUCTIONS:
---   - Filter to currently valid assignments
---   - Join with role details
---
--- VIEW DEFINITION:
---   CREATE VIEW app.effective_roles AS
---   SELECT 
---       ra.*,
---       r.role_code,
---       r.role_name,
---       a.application_code,
---       a.application_name
---   FROM app.user_role_assignments ra
---   JOIN app.roles r ON ra.role_id = r.role_id
---   JOIN app.applications a ON ra.application_id = a.application_id
---   WHERE ra.is_active = true
---     AND ra.valid_from <= now()
---     AND (ra.valid_to IS NULL OR ra.valid_to > now())
---     AND ra.revoked_at IS NULL;
+-- [RA-002] Create effective_roles view
+CREATE VIEW app.effective_roles AS
+SELECT 
+    ra.*,
+    r.role_code,
+    r.role_name,
+    a.application_code,
+    a.application_name
+FROM app.user_role_assignments ra
+JOIN app.roles r ON ra.role_id = r.role_id
+JOIN app.applications a ON ra.application_id = a.application_id
+WHERE ra.is_active = true
+  AND ra.valid_from <= now()
+  AND (ra.valid_to IS NULL OR ra.valid_to > now())
+  AND ra.revoked_at IS NULL;
+
+COMMENT ON VIEW app.effective_roles IS 'Currently active role assignments with role and application details';
 
 -- =============================================================================
--- TODO: Create assign_role function
+-- IMPLEMENTED: Create assign_role function
 -- DESCRIPTION: Assign role to user
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [RA-003] Create assign_role function
--- INSTRUCTIONS:
---   - Validate account has membership in application
---   - Check for conflicting assignments
---   - Create assignment record
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.assign_role(
---       p_account_id UUID,
---       p_application_id UUID,
---       p_role_id UUID,
---       p_valid_from TIMESTAMPTZ DEFAULT now(),
---       p_valid_to TIMESTAMPTZ DEFAULT NULL,
---       p_assigned_by UUID DEFAULT NULL,
---       p_reason TEXT DEFAULT NULL
---   ) RETURNS UUID AS $$
---   DECLARE
---       v_assignment_id UUID;
---   BEGIN
---       -- Verify membership
---       IF NOT EXISTS (
---           SELECT 1 FROM app.current_memberships
---           WHERE account_id = p_account_id 
---             AND application_id = p_application_id
---       ) THEN
---           RAISE EXCEPTION 'Account must have active membership in application';
---       END IF;
---       
---       -- Check for conflicting assignment
---       IF EXISTS (
---           SELECT 1 FROM app.user_role_assignments
---           WHERE account_id = p_account_id
---             AND application_id = p_application_id
---             AND role_id = p_role_id
---             AND is_active = true
---             AND (valid_to IS NULL OR valid_to > p_valid_from)
---       ) THEN
---           RAISE EXCEPTION 'Conflicting role assignment exists';
---       END IF;
---       
---       -- Create assignment
---       INSERT INTO app.user_role_assignments (
---           account_id, application_id, role_id,
---           valid_from, valid_to, assigned_by, assignment_reason
---       ) VALUES (
---           p_account_id, p_application_id, p_role_id,
---           p_valid_from, p_valid_to, p_assigned_by, p_reason
---       )
---       RETURNING assignment_id INTO v_assignment_id;
---       
---       RETURN v_assignment_id;
---   END;
---   $$ LANGUAGE plpgsql;
+-- [RA-003] Create assign_role function
+CREATE OR REPLACE FUNCTION app.assign_role(
+    p_account_id UUID,
+    p_application_id UUID,
+    p_role_id UUID,
+    p_valid_from TIMESTAMPTZ DEFAULT now(),
+    p_valid_to TIMESTAMPTZ DEFAULT NULL,
+    p_assigned_by UUID DEFAULT NULL,
+    p_reason TEXT DEFAULT NULL
+) RETURNS UUID AS $$
+DECLARE
+    v_assignment_id UUID;
+BEGIN
+    -- Verify membership
+    IF NOT EXISTS (
+        SELECT 1 FROM app.current_memberships
+        WHERE account_id = p_account_id 
+          AND application_id = p_application_id
+    ) THEN
+        RAISE EXCEPTION 'Account must have active membership in application';
+    END IF;
+    
+    -- Check for conflicting assignment
+    IF EXISTS (
+        SELECT 1 FROM app.user_role_assignments
+        WHERE account_id = p_account_id
+          AND application_id = p_application_id
+          AND role_id = p_role_id
+          AND is_active = true
+          AND (valid_to IS NULL OR valid_to > p_valid_from)
+    ) THEN
+        RAISE EXCEPTION 'Conflicting role assignment exists';
+    END IF;
+    
+    -- Create assignment
+    INSERT INTO app.user_role_assignments (
+        account_id, application_id, role_id,
+        valid_from, valid_to, assigned_by, assignment_reason
+    ) VALUES (
+        p_account_id, p_application_id, p_role_id,
+        p_valid_from, p_valid_to, p_assigned_by, p_reason
+    )
+    RETURNING assignment_id INTO v_assignment_id;
+    
+    RETURN v_assignment_id;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION app.assign_role IS 'Assigns a role to an account within an application';
 
 -- =============================================================================
--- TODO: Create revoke_role function
+-- IMPLEMENTED: Create revoke_role function
 -- DESCRIPTION: Revoke role from user
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [RA-004] Create revoke_role function
--- INSTRUCTIONS:
---   - Mark assignment as revoked
---   - Record revocation reason
---   - Update valid_to
+-- [RA-004] Create revoke_role function
+CREATE OR REPLACE FUNCTION app.revoke_role(
+    p_assignment_id UUID,
+    p_reason TEXT,
+    p_revoked_by UUID DEFAULT NULL
+) RETURNS BOOLEAN AS $$
+DECLARE
+    v_assignment RECORD;
+BEGIN
+    -- Get assignment
+    SELECT * INTO v_assignment
+    FROM app.user_role_assignments
+    WHERE assignment_id = p_assignment_id AND is_active = true;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Active assignment not found: %', p_assignment_id;
+    END IF;
+    
+    -- Mark as revoked
+    UPDATE app.user_role_assignments
+    SET is_active = false,
+        revoked_at = now(),
+        revoked_by = p_revoked_by,
+        revocation_reason = p_reason,
+        valid_to = now()
+    WHERE assignment_id = p_assignment_id;
+    
+    RETURN true;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION app.revoke_role IS 'Revokes a role assignment from an account';
 
 -- =============================================================================
--- TODO: Create check_permission function
+-- IMPLEMENTED: Create check_permission function
 -- DESCRIPTION: Check user permission in context
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [RA-005] Create user_has_permission function
--- INSTRUCTIONS:
---   - Get all effective roles for user in application
---   - Check if any role grants permission
---   - Consider conditions
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.user_has_permission(
---       p_account_id UUID,
---       p_application_id UUID,
---       p_permission_code VARCHAR(100),
---       p_context JSONB DEFAULT '{}'
---   ) RETURNS BOOLEAN AS $$
---   DECLARE
---       v_has_permission BOOLEAN := false;
---       v_role RECORD;
---   BEGIN
---       -- Check each effective role
---       FOR v_role IN 
---           SELECT role_id FROM app.effective_roles
---           WHERE account_id = p_account_id 
---             AND application_id = p_application_id
---       LOOP
---           IF app.has_permission(v_role.role_id, p_permission_code, p_context) THEN
---               RETURN true;
---           END IF;
---       END LOOP;
---       
---       RETURN false;
---   END;
---   $$ LANGUAGE plpgsql STABLE;
+-- [RA-005] Create user_has_permission function
+CREATE OR REPLACE FUNCTION app.user_has_permission(
+    p_account_id UUID,
+    p_application_id UUID,
+    p_permission_code VARCHAR(100),
+    p_context JSONB DEFAULT '{}'
+) RETURNS BOOLEAN AS $$
+DECLARE
+    v_has_permission BOOLEAN := false;
+    v_role RECORD;
+BEGIN
+    -- Check each effective role
+    FOR v_role IN 
+        SELECT role_id FROM app.effective_roles
+        WHERE account_id = p_account_id 
+          AND application_id = p_application_id
+    LOOP
+        IF app.has_permission(v_role.role_id, p_permission_code, p_context) THEN
+            RETURN true;
+        END IF;
+    END LOOP;
+    
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION app.user_has_permission IS 'Checks if an account has a specific permission in an application context';
 
 -- =============================================================================
--- TODO: Create assignment indexes
+-- IMPLEMENTED: Create assignment indexes
 -- DESCRIPTION: Optimize assignment queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [RA-006] Create assignment indexes
--- INDEX LIST:
---   - PRIMARY KEY (assignment_id)
---   - INDEX on (account_id, application_id, is_active)
---   - INDEX on (role_id, is_active)
---   - INDEX on (valid_from, valid_to)
---   - INDEX on (account_id, application_id, role_id, valid_to)
+-- [RA-006] Create assignment indexes
+-- PRIMARY KEY (assignment_id) - created with table
+
+CREATE INDEX idx_role_assignments_account_app_active 
+    ON app.user_role_assignments (account_id, application_id, is_active);
+
+CREATE INDEX idx_role_assignments_role_active 
+    ON app.user_role_assignments (role_id, is_active);
+
+CREATE INDEX idx_role_assignments_validity 
+    ON app.user_role_assignments (valid_from, valid_to);
+
+CREATE INDEX idx_role_assignments_unique_lookup 
+    ON app.user_role_assignments (account_id, application_id, role_id, valid_to);
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create user_role_assignments table
-□ Create effective_roles view
-□ Implement assign_role function
-□ Implement revoke_role function
-□ Implement user_has_permission function
-□ Add all indexes for assignment queries
-□ Test role assignment workflow
-□ Test permission checking
-□ Test temporal validity
-□ Verify exclusion constraints
+☑ Create user_role_assignments table
+☑ Create effective_roles view
+☑ Implement assign_role function
+☑ Implement revoke_role function
+☑ Implement user_has_permission function
+☑ Add all indexes for assignment queries
+☐ Test role assignment workflow
+☐ Test permission checking
+☐ Test temporal validity
+☐ Verify exclusion constraints
 ================================================================================
 */

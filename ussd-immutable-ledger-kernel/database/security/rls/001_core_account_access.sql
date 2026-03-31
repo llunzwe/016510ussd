@@ -420,6 +420,535 @@ END;
 $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
 
 -- ============================================================================
+-- HIERARCHICAL ACCOUNT ACCESS (ISO 27001 A.9.1)
+-- ============================================================================
+
+-- Parent-child account relationships
+CREATE TABLE IF NOT EXISTS account_hierarchy (
+    hierarchy_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_account_id UUID NOT NULL REFERENCES accounts(id),
+    child_account_id UUID NOT NULL REFERENCES accounts(id),
+    relationship_type VARCHAR(30) DEFAULT 'sub_account' CHECK (relationship_type IN ('sub_account', 'linked', 'dependent')),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT no_self_parent CHECK (parent_account_id != child_account_id)
+);
+
+-- POLICY: account_parent_child_access
+-- ISO/IEC 27001: A.9.1 - Hierarchical account access
+-- Parent account holders can view child accounts
+CREATE POLICY account_parent_child_access ON accounts
+    FOR SELECT
+    TO authenticated
+    USING (
+        id IN (
+            SELECT child_account_id FROM account_hierarchy ah
+            JOIN accounts pa ON ah.parent_account_id = pa.id
+            WHERE pa.owner_user_id = current_user_id()
+        )
+    );
+
+-- Function to get all child accounts recursively
+-- Parameters: p_parent_account_id
+-- Returns: Set of account IDs
+CREATE OR REPLACE FUNCTION get_child_accounts(
+    p_parent_account_id UUID
+)
+RETURNS TABLE(account_id UUID, level INTEGER) AS $$
+BEGIN
+    RETURN QUERY
+    WITH RECURSIVE account_tree AS (
+        -- Base case: direct children
+        SELECT child_account_id, 1 as lvl
+        FROM account_hierarchy
+        WHERE parent_account_id = p_parent_account_id
+        
+        UNION ALL
+        
+        -- Recursive case: grandchildren, etc.
+        SELECT ah.child_account_id, at.lvl + 1
+        FROM account_hierarchy ah
+        JOIN account_tree at ON ah.parent_account_id = at.child_account_id
+        WHERE at.lvl < 10  -- Prevent infinite recursion
+    )
+    SELECT child_account_id, lvl FROM account_tree;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- ============================================================================
+-- EMERGENCY ELEVATED ACCESS (Break-Glass) (PCI DSS 10.4)
+-- ============================================================================
+
+-- Break-glass access log
+CREATE TABLE IF NOT EXISTS break_glass_access_log (
+    access_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    accessed_account_id UUID,
+    justification TEXT NOT NULL,
+    approval_token TEXT,
+    access_granted_at TIMESTAMPTZ DEFAULT NOW(),
+    access_expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    revoked_by UUID,
+    session_actions JSONB DEFAULT '[]'
+);
+
+-- POLICY: account_break_glass_access
+-- PCI DSS 10.4: Emergency break-glass access for support
+-- Temporary elevated access for emergency situations
+CREATE POLICY account_break_glass_access ON accounts
+    FOR ALL
+    TO authenticated
+    USING (
+        has_active_break_glass_access(current_user_id(), id)
+    )
+    WITH CHECK (
+        has_active_break_glass_access(current_user_id(), id)
+    );
+
+-- Function to check active break-glass access
+-- Parameters: p_user_id, p_account_id
+-- Returns: TRUE if user has active break-glass access
+CREATE OR REPLACE FUNCTION has_active_break_glass_access(
+    p_user_id UUID,
+    p_account_id UUID DEFAULT NULL
+)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 FROM break_glass_access_log
+        WHERE user_id = p_user_id
+        AND (accessed_account_id IS NULL OR accessed_account_id = p_account_id)
+        AND access_expires_at > NOW()
+        AND revoked_at IS NULL
+    );
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+
+-- Function to request break-glass access
+-- Parameters: p_account_id, p_justification
+-- Returns: Access ID
+CREATE OR REPLACE FUNCTION request_break_glass_access(
+    p_account_id UUID,
+    p_justification TEXT
+)
+RETURNS UUID AS $$
+DECLARE
+    v_access_id UUID;
+BEGIN
+    INSERT INTO break_glass_access_log (
+        user_id, accessed_account_id, justification,
+        access_expires_at
+    ) VALUES (
+        current_user_id(), p_account_id, p_justification,
+        NOW() + INTERVAL '30 minutes'
+    ) RETURNING access_id INTO v_access_id;
+    
+    -- Log security event
+    PERFORM log_security_event('break_glass_access_granted',
+        jsonb_build_object(
+            'access_id', v_access_id,
+            'account_id', p_account_id,
+            'justification', p_justification
+        ));
+    
+    RETURN v_access_id;
+END;
+$$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
+
+-- ============================================================================
+-- TIME-BASED ACCESS RESTRICTIONS (ISO 27001 A.9.4)
+-- ============================================================================
+
+-- Time-based access policies table
+CREATE TABLE IF NOT EXISTS account_time_restrictions (
+    restriction_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id UUID REFERENCES accounts(id),
+    user_role VARCHAR(50),
+    allowed_days INTEGER[] DEFAULT ARRAY[1,2,3,4,5],  -- 0=Sun, 6=Sat
+    allowed_start_time TIME DEFAULT '06:00',
+    allowed_end_time TIME DEFAULT '22:00',
+    timezone VARCHAR(50) DEFAULT 'UTC',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- POLICY: account_time_restriction
+-- ISO/IEC 27001: A.9.4 - Time-based access control
+CREATE POLICY account_time_restriction ON accounts
+    AS RESTRICTIVE
+    FOR ALL
+    TO authenticated
+    USING (
+        is_access_time_allowed(id, current_user_id()) OR
+        current_user_has_role('admin') OR
+        current_user_has_role('emergency_access')
+    );
+
+-- Function to check if current time is allowed for account access
+-- Parameters: p_account_id, p_user_id
+-- Returns: TRUE if access time is allowed
+CREATE OR REPLACE FUNCTION is_access_time_allowed(
+    p_account_id UUID,
+    p_user_id UUID
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_restriction RECORD;
+    v_current_dow INTEGER;
+    v_current_time TIME;
+BEGIN
+    -- Get restriction for account/user
+    SELECT * INTO v_restriction
+    FROM account_time_restrictions
+    WHERE (account_id = p_account_id OR account_id IS NULL)
+    AND is_active = TRUE
+    ORDER BY account_id NULLS LAST
+    LIMIT 1;
+    
+    -- No restriction found
+    IF v_restriction IS NULL THEN
+        RETURN TRUE;
+    END IF;
+    
+    v_current_dow := extract(dow from NOW());
+    v_current_time := NOW()::TIME;
+    
+    -- Check day of week
+    IF NOT (v_current_dow = ANY(v_restriction.allowed_days)) THEN
+        RETURN FALSE;
+    END IF;
+    
+    -- Check time window
+    RETURN v_current_time BETWEEN v_restriction.allowed_start_time 
+                              AND v_restriction.allowed_end_time;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- ============================================================================
+-- IP-BASED GEOGRAPHIC RESTRICTIONS (PCI DSS 11.4)
+-- ============================================================================
+
+-- IP allowlist table
+CREATE TABLE IF NOT EXISTS account_ip_allowlist (
+    allowlist_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id UUID REFERENCES accounts(id),
+    ip_address INET,
+    ip_range CIDR,
+    description TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT ip_or_range CHECK (ip_address IS NOT NULL OR ip_range IS NOT NULL)
+);
+
+-- POLICY: account_ip_restriction
+-- PCI DSS 11.4: IP-based access restrictions
+CREATE POLICY account_ip_restriction ON accounts
+    AS RESTRICTIVE
+    FOR ALL
+    TO authenticated
+    USING (
+        is_ip_allowed_for_account(id, inet_client_addr()) OR
+        current_user_has_role('admin') OR
+        NOT EXISTS (
+            SELECT 1 FROM account_ip_allowlist 
+            WHERE account_id = id AND is_active = TRUE
+        )
+    );
+
+-- Function to check if IP is allowed for account
+-- Parameters: p_account_id, p_client_ip
+-- Returns: TRUE if IP is allowed
+CREATE OR REPLACE FUNCTION is_ip_allowed_for_account(
+    p_account_id UUID,
+    p_client_ip INET
+)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 FROM account_ip_allowlist
+        WHERE account_id = p_account_id
+        AND is_active = TRUE
+        AND (
+            ip_address = p_client_ip OR
+            (ip_range IS NOT NULL AND p_client_ip <<= ip_range)
+        )
+    );
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+
+-- ============================================================================
+-- JOINT ACCOUNT HOLDER POLICIES (PCI DSS 8.3)
+-- ============================================================================
+
+-- Joint account holders table
+CREATE TABLE IF NOT EXISTS account_joint_holders (
+    joint_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id UUID NOT NULL REFERENCES accounts(id),
+    user_id UUID NOT NULL,
+    holder_type VARCHAR(20) DEFAULT 'secondary' CHECK (holder_type IN ('primary', 'secondary', 'authorized')),
+    permissions JSONB DEFAULT '{"can_view": true, "can_transfer": true, "can_close": false}',
+    added_at TIMESTAMPTZ DEFAULT NOW(),
+    added_by UUID,
+    UNIQUE(account_id, user_id)
+);
+
+-- POLICY: account_joint_holder_access
+-- PCI DSS 8.3: Joint account holder access control
+CREATE POLICY account_joint_holder_access ON accounts
+    FOR SELECT
+    TO authenticated
+    USING (
+        id IN (
+            SELECT account_id FROM account_joint_holders
+            WHERE user_id = current_user_id()
+            AND (permissions->>'can_view')::BOOLEAN = TRUE
+        )
+    );
+
+-- POLICY: account_joint_holder_transfer
+CREATE POLICY account_joint_holder_transfer ON accounts
+    FOR UPDATE
+    TO authenticated
+    USING (
+        id IN (
+            SELECT account_id FROM account_joint_holders
+            WHERE user_id = current_user_id()
+            AND (permissions->>'can_transfer')::BOOLEAN = TRUE
+        )
+    );
+
+-- ============================================================================
+-- ACCOUNT FREEZE/UNFREEZE WORKFLOWS (ISO 27001 A.12.3)
+-- ============================================================================
+
+-- Account freeze log
+CREATE TABLE IF NOT EXISTS account_freeze_log (
+    freeze_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id UUID NOT NULL REFERENCES accounts(id),
+    freeze_type VARCHAR(20) NOT NULL CHECK (freeze_type IN ('admin_freeze', 'user_freeze', 'fraud_freeze', 'compliance_freeze')),
+    freeze_reason TEXT NOT NULL,
+    frozen_by UUID,
+    frozen_at TIMESTAMPTZ DEFAULT NOW(),
+    unfrozen_by UUID,
+    unfrozen_at TIMESTAMPTZ,
+    freeze_metadata JSONB DEFAULT '{}'
+);
+
+-- Function to freeze account
+-- ISO/IEC 27001: A.12.3 - Account freeze capability
+-- Parameters: p_account_id, p_freeze_type, p_reason
+-- Returns: Freeze ID
+CREATE OR REPLACE FUNCTION freeze_account(
+    p_account_id UUID,
+    p_freeze_type VARCHAR(20),
+    p_reason TEXT
+)
+RETURNS UUID AS $$
+DECLARE
+    v_freeze_id UUID;
+BEGIN
+    -- Check permissions
+    IF NOT (
+        current_user_has_role('admin') OR 
+        EXISTS (SELECT 1 FROM accounts WHERE id = p_account_id AND owner_user_id = current_user_id())
+    ) THEN
+        RAISE EXCEPTION 'Insufficient permissions to freeze account';
+    END IF;
+    
+    -- Create freeze record
+    INSERT INTO account_freeze_log (
+        account_id, freeze_type, freeze_reason, frozen_by
+    ) VALUES (
+        p_account_id, p_freeze_type, p_reason, current_user_id()
+    ) RETURNING freeze_id INTO v_freeze_id;
+    
+    -- Update account status
+    UPDATE accounts
+    SET status = 'frozen',
+        freeze_reason = p_reason,
+        frozen_at = NOW()
+    WHERE id = p_account_id;
+    
+    -- Log event
+    PERFORM log_security_event('account_frozen',
+        jsonb_build_object(
+            'account_id', p_account_id,
+            'freeze_id', v_freeze_id,
+            'type', p_freeze_type
+        ));
+    
+    RETURN v_freeze_id;
+END;
+$$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
+
+-- Function to unfreeze account
+-- Parameters: p_account_id, p_reason
+-- Returns: BOOLEAN
+CREATE OR REPLACE FUNCTION unfreeze_account(
+    p_account_id UUID,
+    p_reason TEXT
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_freeze_record RECORD;
+BEGIN
+    -- Get active freeze
+    SELECT * INTO v_freeze_record
+    FROM account_freeze_log
+    WHERE account_id = p_account_id
+    AND unfrozen_at IS NULL
+    ORDER BY frozen_at DESC
+    LIMIT 1;
+    
+    IF v_freeze_record IS NULL THEN
+        RETURN FALSE;
+    END IF;
+    
+    -- Check permissions (fraud/compliance freezes require admin)
+    IF v_freeze_record.freeze_type IN ('fraud_freeze', 'compliance_freeze') 
+       AND NOT current_user_has_role('admin') THEN
+        RAISE EXCEPTION 'Only admins can unfreeze fraud/compliance freezes';
+    END IF;
+    
+    -- Update freeze record
+    UPDATE account_freeze_log
+    SET unfrozen_by = current_user_id(),
+        unfrozen_at = NOW()
+    WHERE freeze_id = v_freeze_record.freeze_id;
+    
+    -- Update account status
+    UPDATE accounts
+    SET status = 'active',
+        freeze_reason = NULL,
+        frozen_at = NULL
+    WHERE id = p_account_id;
+    
+    -- Log event
+    PERFORM log_security_event('account_unfrozen',
+        jsonb_build_object(
+            'account_id', p_account_id,
+            'freeze_id', v_freeze_record.freeze_id
+        ));
+    
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
+
+-- ============================================================================
+-- DELEGATION POLICIES (ISO 27001 A.9.2)
+-- ============================================================================
+
+-- Account delegation table
+CREATE TABLE IF NOT EXISTS account_delegations (
+    delegation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id UUID NOT NULL REFERENCES accounts(id),
+    delegator_id UUID NOT NULL,
+    delegate_id UUID NOT NULL,
+    delegated_permissions TEXT[] DEFAULT ARRAY['view'],
+    valid_from TIMESTAMPTZ DEFAULT NOW(),
+    valid_until TIMESTAMPTZ,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT valid_date_range CHECK (valid_until > valid_from)
+);
+
+-- POLICY: account_delegated_access
+-- ISO/IEC 27001: A.9.2 - Delegation of account access
+CREATE POLICY account_delegated_access ON accounts
+    FOR SELECT
+    TO authenticated
+    USING (
+        id IN (
+            SELECT account_id FROM account_delegations
+            WHERE delegate_id = current_user_id()
+            AND is_active = TRUE
+            AND valid_from <= NOW()
+            AND (valid_until IS NULL OR valid_until > NOW())
+            AND 'view' = ANY(delegated_permissions)
+        )
+    );
+
+-- Function to delegate account access
+-- Parameters: p_account_id, p_delegate_id, p_permissions, p_valid_until
+-- Returns: Delegation ID
+CREATE OR REPLACE FUNCTION delegate_account_access(
+    p_account_id UUID,
+    p_delegate_id UUID,
+    p_permissions TEXT[],
+    p_valid_until TIMESTAMPTZ DEFAULT NULL
+)
+RETURNS UUID AS $$
+DECLARE
+    v_delegation_id UUID;
+BEGIN
+    -- Verify ownership
+    IF NOT EXISTS (
+        SELECT 1 FROM accounts 
+        WHERE id = p_account_id 
+        AND owner_user_id = current_user_id()
+    ) THEN
+        RAISE EXCEPTION 'Only account owner can delegate access';
+    END IF;
+    
+    INSERT INTO account_delegations (
+        account_id, delegator_id, delegate_id,
+        delegated_permissions, valid_until
+    ) VALUES (
+        p_account_id, current_user_id(), p_delegate_id,
+        p_permissions, p_valid_until
+    ) RETURNING delegation_id INTO v_delegation_id;
+    
+    -- Log event
+    PERFORM log_security_event('account_access_delegated',
+        jsonb_build_object(
+            'account_id', p_account_id,
+            'delegation_id', v_delegation_id,
+            'delegate_id', p_delegate_id,
+            'permissions', p_permissions
+        ));
+    
+    RETURN v_delegation_id;
+END;
+$$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
+
+-- ============================================================================
+-- SCHEDULED ACCESS (Maintenance Windows) (ISO 27001 A.12.1)
+-- ============================================================================
+
+-- Maintenance window configuration
+CREATE TABLE IF NOT EXISTS account_maintenance_windows (
+    window_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id UUID REFERENCES accounts(id),
+    window_name VARCHAR(100) NOT NULL,
+    recurring_schedule TEXT,  -- Cron expression
+    start_time TIMESTAMPTZ NOT NULL,
+    end_time TIMESTAMPTZ NOT NULL,
+    allowed_operations TEXT[] DEFAULT ARRAY['read'],
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Function to check if in maintenance window
+-- Parameters: p_account_id, p_operation
+-- Returns: TRUE if in maintenance window
+CREATE OR REPLACE FUNCTION is_maintenance_window_active(
+    p_account_id UUID DEFAULT NULL,
+    p_operation TEXT DEFAULT 'read'
+)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 FROM account_maintenance_windows
+        WHERE (account_id = p_account_id OR account_id IS NULL)
+        AND is_active = TRUE
+        AND start_time <= NOW()
+        AND end_time > NOW()
+        AND p_operation = ANY(allowed_operations)
+    );
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- ============================================================================
 -- COMMENTS
 -- ============================================================================
 COMMENT ON POLICY account_owner_full_access ON accounts IS 
@@ -428,36 +957,21 @@ COMMENT ON POLICY account_masked_for_relationship_managers ON accounts IS
     'ISO/IEC 27040 - RMs see masked data for assigned accounts only (data masking)';
 COMMENT ON POLICY account_org_member_access ON accounts IS 
     'ISO/IEC 27001 A.9.1.2 - Business account access for organization members';
-COMMENT ON POLICY balance_owner_read ON account_balances IS 
-    'PCI DSS Req 3.4 - Balance access restricted to account owners and authorized roles';
-
--- ============================================================================
--- SECURITY AUDIT LOG ENTRY
--- ============================================================================
-DO $$
-BEGIN
-    PERFORM log_security_event(
-        'account_rls_policies_initialized',
-        jsonb_build_object(
-            'tables', ARRAY['accounts', 'account_balances', 'account_limits'],
-            'policies_applied', 12,
-            'standards', ARRAY['ISO/IEC 27001:2022', 'ISO/IEC 27040:2024', 'PCI DSS 4.0'],
-            'timestamp', NOW()
-        )
-    );
-EXCEPTION WHEN OTHERS THEN
-    NULL;
-END $$;
-
--- ============================================================================
--- TODOs (Security Enhancements)
--- ============================================================================
--- TODO: Implement hierarchical account access (parent/child accounts) (ISO 27001 A.9.1)
--- TODO: Add temporary elevated access for emergency support (break-glass) (PCI DSS 10.4)
--- TODO: Implement time-based access restrictions (business hours) (ISO 27001 A.9.4)
--- TODO: Add IP-based geographic restrictions for account access (PCI DSS 11.4)
--- TODO: Create policies for joint account holders (PCI DSS 8.3)
--- TODO: Implement account freeze/unfreeze workflows (ISO 27001 A.12.3)
--- TODO: Add delegation policies for account management (ISO 27001 A.9.2)
--- TODO: Implement scheduled access (maintenance windows) (ISO 27001 A.12.1)
--- ============================================================================
+COMMENT ON POLICY account_parent_child_access ON accounts IS
+    'ISO/IEC 27001 A.9.1 - Parent account access to child accounts';
+COMMENT ON POLICY account_break_glass_access ON accounts IS
+    'PCI DSS 10.4 - Emergency break-glass access for support';
+COMMENT ON POLICY account_time_restriction ON accounts IS
+    'ISO/IEC 27001 A.9.4 - Time-based access restrictions';
+COMMENT ON POLICY account_ip_restriction ON accounts IS
+    'PCI DSS 11.4 - IP-based geographic restrictions';
+COMMENT ON POLICY account_joint_holder_access ON accounts IS
+    'PCI DSS 8.3 - Joint account holder access control';
+COMMENT ON POLICY account_delegated_access ON accounts IS
+    'ISO/IEC 27001 A.9.2 - Delegation of account access';
+COMMENT ON FUNCTION freeze_account IS 'ISO/IEC 27001 A.12.3 - Freezes account with audit trail';
+COMMENT ON FUNCTION unfreeze_account IS 'Unfreezes account with permission checks';
+COMMENT ON FUNCTION delegate_account_access IS 'ISO/IEC 27001 A.9.2 - Delegates account access to another user';
+COMMENT ON FUNCTION has_active_break_glass_access IS 'Checks if user has active break-glass access';
+COMMENT ON FUNCTION is_access_time_allowed IS 'Checks if current time is within allowed access window';
+COMMENT ON FUNCTION is_ip_allowed_for_account IS 'PCI DSS 11.4 - Validates IP against account allowlist';

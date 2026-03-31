@@ -19,8 +19,6 @@
  * 
  * CHANGE LOG:
  *   1.0.0 - Initial view creation
- *   TODO: Add role inheritance expansion
- *   TODO: Add computed permission set
  * =============================================================================
  */
 
@@ -52,41 +50,38 @@
 -- VIEW: app.v_current_active_roles
 -- =============================================================================
 
--- TODO: Drop existing view if recreating
--- DROP VIEW IF EXISTS app.v_current_active_roles CASCADE;
+DROP VIEW IF EXISTS app.v_current_active_roles CASCADE;
 
 CREATE OR REPLACE VIEW app.v_current_active_roles AS
 
--- TODO: IMPLEMENTATION - Base query for active role assignments
-/*
 WITH RECURSIVE role_hierarchy AS (
     -- Base: Direct role assignments
     SELECT 
         ra.assignment_id,
         ra.membership_id,
-        ra.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference,
+        ra.role_id,  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
         rp.role_code,
         rp.role_name,
         rp.role_type,
         rp.role_category,
         rp.permissions as direct_permissions,
         rp.entitlement_limits,
-        ra.assignment_type  -- [RBAC] ISO 27001: Assignment classification (direct/inherited/delegated),
-        ra.valid_from  -- [RBAC] ISO 27001: Temporal access control boundaries,
-        ra.valid_until  -- [RBAC] ISO 27001: Temporal access control boundaries,
+        ra.assignment_type,  -- [RBAC] ISO 27001: Assignment classification (direct/inherited/delegated)
+        ra.valid_from,  -- [RBAC] ISO 27001: Temporal access control boundaries
+        ra.valid_until,  -- [RBAC] ISO 27001: Temporal access control boundaries
         ra.condition_expression,
         ra.resource_scope,
-        ra.is_break_glass  -- [RBAC] ISO 27001: Emergency access indicator,
+        ra.is_break_glass,  -- [RBAC] ISO 27001: Emergency access indicator
         ra.break_glass_expires_at,
         0 as inheritance_level,
-        ARRAY[ra.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference] as role_path
+        ARRAY[ra.role_id] as role_path  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
     FROM app.t_user_role_assignments ra
-    INNER JOIN app.t_roles_permissions rp ON ra.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference = rp.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
+    INNER JOIN app.t_roles_permissions rp ON ra.role_id = rp.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
     WHERE ra.is_revoked = FALSE
       AND ra.approval_status = 'approved'
-      AND ra.valid_from  -- [RBAC] ISO 27001: Temporal access control boundaries <= NOW()
-      AND (ra.valid_until  -- [RBAC] ISO 27001: Temporal access control boundaries IS NULL OR ra.valid_until  -- [RBAC] ISO 27001: Temporal access control boundaries > NOW())
-      AND (ra.is_break_glass  -- [RBAC] ISO 27001: Emergency access indicator = FALSE OR ra.break_glass_expires_at > NOW())
+      AND ra.valid_from <= NOW()  -- [RBAC] ISO 27001: Temporal access control boundaries
+      AND (ra.valid_until IS NULL OR ra.valid_until > NOW())  -- [RBAC] ISO 27001: Temporal access control boundaries
+      AND (ra.is_break_glass = FALSE OR ra.break_glass_expires_at > NOW())  -- [RBAC] ISO 27001: Emergency access indicator
     
     UNION ALL
     
@@ -94,26 +89,26 @@ WITH RECURSIVE role_hierarchy AS (
     SELECT 
         rh.assignment_id,
         rh.membership_id,
-        rp.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference,
+        rp.role_id,  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
         rp.role_code,
         rp.role_name,
         rp.role_type,
         rp.role_category,
         rp.permissions as direct_permissions,
         rp.entitlement_limits,
-        'inherited'::VARCHAR(20) as assignment_type' ||
-        rh.valid_from  -- [RBAC] ISO 27001: Temporal access control boundaries,
-        rh.valid_until  -- [RBAC] ISO 27001: Temporal access control boundaries,
+        'inherited'::VARCHAR(20) as assignment_type,
+        rh.valid_from,  -- [RBAC] ISO 27001: Temporal access control boundaries
+        rh.valid_until,  -- [RBAC] ISO 27001: Temporal access control boundaries
         rh.condition_expression,
         rh.resource_scope,
-        rh.is_break_glass  -- [RBAC] ISO 27001: Emergency access indicator,
+        rh.is_break_glass,  -- [RBAC] ISO 27001: Emergency access indicator
         rh.break_glass_expires_at,
         rh.inheritance_level + 1,
         rh.role_path || rp.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
     FROM role_hierarchy rh
-    INNER JOIN app.t_roles_permissions rp ON rp.parent_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment references @> ARRAY[rh.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference]
+    INNER JOIN app.t_roles_permissions rp ON rp.parent_role_ids @> ARRAY[rh.role_id]  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
     WHERE rh.inheritance_level < 5  -- Prevent infinite recursion
-      AND NOT rp.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference = ANY(rh.role_path)  -- Prevent cycles
+      AND NOT rp.role_id = ANY(rh.role_path)  -- Prevent cycles
 )
 
 SELECT 
@@ -125,7 +120,7 @@ SELECT
     ar.app_code,
     
     -- Role information
-    rh.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference,
+    rh.role_id,  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
     rh.role_code,
     rh.role_name,
     rh.role_type,
@@ -133,9 +128,9 @@ SELECT
     rh.inheritance_level,
     
     -- Assignment details
-    rh.assignment_type  -- [RBAC] ISO 27001: Assignment classification (direct/inherited/delegated),
-    rh.valid_from  -- [RBAC] ISO 27001: Temporal access control boundaries,
-    rh.valid_until  -- [RBAC] ISO 27001: Temporal access control boundaries,
+    rh.assignment_type,  -- [RBAC] ISO 27001: Assignment classification (direct/inherited/delegated)
+    rh.valid_from,  -- [RBAC] ISO 27001: Temporal access control boundaries
+    rh.valid_until,  -- [RBAC] ISO 27001: Temporal access control boundaries
     
     -- Permissions (direct + inherited aggregation)
     rh.direct_permissions,
@@ -147,12 +142,12 @@ SELECT
     rh.resource_scope,
     
     -- Special access
-    rh.is_break_glass  -- [RBAC] ISO 27001: Emergency access indicator,
+    rh.is_break_glass,  -- [RBAC] ISO 27001: Emergency access indicator
     rh.break_glass_expires_at,
     
     -- Temporal validity check
     CASE 
-        WHEN rh.valid_from  -- [RBAC] ISO 27001: Temporal access control boundaries <= NOW() AND (rh.valid_until  -- [RBAC] ISO 27001: Temporal access control boundaries IS NULL OR rh.valid_until  -- [RBAC] ISO 27001: Temporal access control boundaries > NOW())
+        WHEN rh.valid_from <= NOW() AND (rh.valid_until IS NULL OR rh.valid_until > NOW())  -- [RBAC] ISO 27001: Temporal access control boundaries
         THEN TRUE 
         ELSE FALSE 
     END as is_temporally_valid,
@@ -163,34 +158,7 @@ SELECT
 FROM role_hierarchy rh
 INNER JOIN app.t_account_membership am ON rh.membership_id = am.membership_id
 INNER JOIN app.t_application_registry ar ON am.app_id = ar.app_id
-WHERE am.status = 'active'
-  AND rh.inheritance_level = 0  -- Base roles only; inheritance handled in recursive CTE
-*/
-
--- TODO: PLACEHOLDER - Return empty structure until implemented
-SELECT 
-    NULL::UUID as assignment_id,
-    NULL::UUID as membership_id,
-    NULL::UUID as user_identity_id,
-    NULL::UUID as app_id,
-    NULL::VARCHAR(50) as app_code,
-    NULL::UUID as role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference,
-    NULL::VARCHAR(50) as role_code,
-    NULL::VARCHAR(255) as role_name,
-    NULL::VARCHAR(20) as role_type,
-    NULL::VARCHAR(30) as role_category,
-    NULL::INTEGER as inheritance_level,
-    NULL::VARCHAR(20) as assignment_type  -- [RBAC] ISO 27001: Assignment classification (direct/inherited/delegated),
-    NULL::TIMESTAMPTZ as valid_from  -- [RBAC] ISO 27001: Temporal access control boundaries,
-    NULL::TIMESTAMPTZ as valid_until  -- [RBAC] ISO 27001: Temporal access control boundaries,
-    NULL::JSONB as direct_permissions,
-    NULL::JSONB as entitlement_limits,
-    NULL::JSONB as resource_scope,
-    NULL::BOOLEAN as is_break_glass  -- [RBAC] ISO 27001: Emergency access indicator,
-    NULL::TIMESTAMPTZ as break_glass_expires_at,
-    NULL::BOOLEAN as is_temporally_valid,
-    NULL::TIMESTAMPTZ as calculated_at
-WHERE FALSE;  -- Returns no rows until fully implemented
+WHERE am.status = 'active';
 
 -- =============================================================================
 -- COMMENTS
@@ -201,31 +169,44 @@ COMMENT ON VIEW app.v_current_active_roles IS
 -- =============================================================================
 -- INDEXES (for materialized view)
 -- =============================================================================
--- TODO: CREATE MATERIALIZED VIEW app.mv_current_active_roles AS ...
--- TODO: CREATE UNIQUE INDEX idx_mv_active_roles_assignment ON app.mv_current_active_roles(assignment_id);
--- TODO: CREATE INDEX idx_mv_active_roles_membership ON app.mv_current_active_roles(membership_id);
--- TODO: CREATE INDEX idx_mv_active_roles_app ON app.mv_current_active_roles(app_id);
--- TODO: CREATE INDEX idx_mv_active_roles_role ON app.mv_current_active_roles(role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference);
+
+-- Create materialized view for performance
+CREATE MATERIALIZED VIEW IF NOT EXISTS app.mv_current_active_roles AS
+SELECT * FROM app.v_current_active_roles;
+
+-- Create indexes on materialized view
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_active_roles_assignment 
+    ON app.mv_current_active_roles(assignment_id);
+
+CREATE INDEX IF NOT EXISTS idx_mv_active_roles_membership 
+    ON app.mv_current_active_roles(membership_id);
+
+CREATE INDEX IF NOT EXISTS idx_mv_active_roles_app 
+    ON app.mv_current_active_roles(app_id);
+
+CREATE INDEX IF NOT EXISTS idx_mv_active_roles_role 
+    ON app.mv_current_active_roles(role_id);  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
 
 -- =============================================================================
 -- REFRESH FUNCTION
 -- =============================================================================
 
--- TODO: Function to refresh materialized view
-
--- CREATE OR REPLACE FUNCTION app.refresh_active_roles()
--- RETURNS VOID
--- LANGUAGE plpgsql
--- SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged function execution context
--- AS $$
--- BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
---     -- Refresh the materialized view
---     -- REFRESH MATERIALIZED VIEW CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation app.mv_current_active_roles;
---     
---     -- Log refresh
---     -- INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (...);
--- END;
--- $$;
+CREATE OR REPLACE FUNCTION app.refresh_active_roles()
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged function execution context
+AS $$
+BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+    -- Refresh the materialized view
+    REFRESH MATERIALIZED VIEW CONCURRENTLY app.mv_current_active_roles;  -- [TXN] ISO 9001: Non-blocking index creation
+    
+    -- Log refresh
+    INSERT INTO core.t_audit_log (action, entity_type, entity_id, details, created_at)  -- [AUDIT] ISO 27001 A.8.15: Security event logging
+    VALUES ('mv_refresh', 'materialized_view', NULL, 
+        jsonb_build_object('view_name', 'app.mv_current_active_roles', 'refreshed_at', NOW()),
+        NOW());
+END;
+$$;
 
 -- =============================================================================
 -- IMPLEMENTATION NOTES

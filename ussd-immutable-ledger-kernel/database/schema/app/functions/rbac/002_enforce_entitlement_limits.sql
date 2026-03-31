@@ -67,6 +67,7 @@
  * 
  * CHANGE LOG:
  *   1.0.0 - Initial function creation
+ *   1.0.1 - Implemented TODOs: Usage window reset logic
  * =============================================================================
  */
 
@@ -113,24 +114,26 @@ RETURNS TABLE (
     limit_source TEXT
 )
 LANGUAGE plpgsql
-SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged execution context -- [RBAC] ISO 27001: Privileged function execution context
+SECURITY DEFINER
 STABLE
 SET search_path = app, core, public
 AS $$
 DECLARE
     v_app_id UUID;
-    v_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference UUID;
+    v_role_id UUID;
     v_effective_limit RECORD;
     v_projected_usage NUMERIC;
     v_usage_pct NUMERIC;
     v_warning_threshold NUMERIC;
     v_critical_threshold NUMERIC;
-BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+    v_window_start TIMESTAMPTZ;
+    v_window_end TIMESTAMPTZ;
+BEGIN
     -- ========================================================================
     -- GET MEMBERSHIP CONTEXT
     -- ========================================================================
-    SELECT app_id, primary_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference 
-    INTO v_app_id, v_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
+    SELECT app_id, primary_role_id 
+    INTO v_app_id, v_role_id
     FROM app.t_account_membership
     WHERE membership_id = p_membership_id
       AND status = 'active';
@@ -153,7 +156,7 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
       AND (resource_subtype = p_resource_subtype OR resource_subtype IS NULL)
       AND (
           (target_type = 'membership' AND target_id = p_membership_id)
-          OR (target_type = 'role' AND target_id = v_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference)
+          OR (target_type = 'role' AND target_id = v_role_id)
           OR (target_type = 'application' AND target_id = v_app_id)
           OR target_type = 'global'
       )
@@ -168,15 +171,97 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
     END IF;
     
     -- ========================================================================
-    -- CALCULATE CURRENT USAGE
+    -- CALCULATE CURRENT USAGE WITH WINDOW MANAGEMENT
     -- ========================================================================
-    -- Check if window needs reset
-    IF v_effective_limit.window_type = 'rolling' AND 
-       v_effective_limit.usage_reset_at IS NOT NULL AND
-       v_effective_limit.usage_reset_at < NOW() - v_effective_limit.window_duration THEN
-        -- TODO: Reset usage via background job
-        NULL;
-    END IF;
+    -- Calculate window boundaries based on window_type
+    CASE v_effective_limit.window_type
+        WHEN 'rolling' THEN
+            -- Rolling window: reset if window has passed
+            IF v_effective_limit.window_duration IS NOT NULL THEN
+                v_window_start := NOW() - v_effective_limit.window_duration;
+                v_window_end := NOW();
+                
+                -- Check if we need to reset usage
+                IF v_effective_limit.usage_reset_at IS NOT NULL AND
+                   v_effective_limit.usage_reset_at < v_window_start THEN
+                    -- Reset the usage counter via background job trigger
+                    PERFORM pg_notify('entitlement_reset', jsonb_build_object(
+                        'entitlement_id', v_effective_limit.entitlement_id,
+                        'reason', 'rolling_window_expired',
+                        'window_start', v_window_start,
+                        'window_end', v_window_end
+                    )::TEXT);
+                    
+                    -- Log the reset event
+                    INSERT INTO core.audit_trail (
+                        audit_category,
+                        audit_level,
+                        audit_event,
+                        audit_description,
+                        action,
+                        action_status,
+                        table_schema,
+                        table_name,
+                        record_id,
+                        new_data
+                    ) VALUES (
+                        'SYSTEM',
+                        'INFO',
+                        'entitlement_window_reset',
+                        'Rolling window usage reset triggered',
+                        'MAINTENANCE',
+                        'SUCCESS',
+                        'app',
+                        't_entitlement_limits',
+                        v_effective_limit.entitlement_id::TEXT,
+                        jsonb_build_object(
+                            'membership_id', p_membership_id,
+                            'resource_type', p_resource_type,
+                            'previous_usage', v_effective_limit.current_usage,
+                            'window_start', v_window_start
+                        )
+                    );
+                    
+                    -- For this check, treat as reset
+                    v_effective_limit.current_usage := 0;
+                END IF;
+            END IF;
+            
+        WHEN 'fixed' THEN
+            -- Fixed window: check if we're in a new window period
+            IF v_effective_limit.window_start IS NOT NULL AND
+               v_effective_limit.window_end IS NOT NULL THEN
+                
+                IF NOW() > v_effective_limit.window_end THEN
+                    -- Window has passed, trigger reset for new window
+                    PERFORM pg_notify('entitlement_reset', jsonb_build_object(
+                        'entitlement_id', v_effective_limit.entitlement_id,
+                        'reason', 'fixed_window_expired',
+                        'new_window_start', v_effective_limit.window_end,
+                        'new_window_end', v_effective_limit.window_end + (v_effective_limit.window_end - v_effective_limit.window_start)
+                    )::TEXT);
+                    
+                    v_effective_limit.current_usage := 0;
+                END IF;
+            END IF;
+            
+        WHEN 'calendar' THEN
+            -- Calendar-based window (daily, weekly, monthly)
+            IF v_effective_limit.usage_reset_at IS NOT NULL THEN
+                -- Check if we crossed a calendar boundary
+                CASE 
+                    WHEN v_effective_limit.window_type_detail = 'daily' AND
+                         DATE(v_effective_limit.usage_reset_at) < CURRENT_DATE THEN
+                        v_effective_limit.current_usage := 0;
+                    WHEN v_effective_limit.window_type_detail = 'weekly' AND
+                         DATE_TRUNC('week', v_effective_limit.usage_reset_at) < DATE_TRUNC('week', CURRENT_DATE) THEN
+                        v_effective_limit.current_usage := 0;
+                    WHEN v_effective_limit.window_type_detail = 'monthly' AND
+                         DATE_TRUNC('month', v_effective_limit.usage_reset_at) < DATE_TRUNC('month', CURRENT_DATE) THEN
+                        v_effective_limit.current_usage := 0;
+                END CASE;
+            END IF;
+    END CASE;
     
     -- ========================================================================
     -- CHECK AGAINST LIMITS
@@ -190,8 +275,8 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
     END IF;
     
     v_usage_pct := (v_projected_usage / v_effective_limit.limit_value) * 100;
-    v_warning_threshold := v_effective_limit.warning_threshold_pct;
-    v_critical_threshold := v_effective_limit.critical_threshold_pct;
+    v_warning_threshold := COALESCE(v_effective_limit.warning_threshold_pct, 80);
+    v_critical_threshold := COALESCE(v_effective_limit.critical_threshold_pct, 95);
     
     -- ========================================================================
     -- DETERMINE ENFORCEMENT ACTION
@@ -209,9 +294,35 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
                     v_effective_limit.target_type;
                     
                 -- Log enforcement
-                INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (action, entity_type, entity_id, details)
-                VALUES ('entitlement_exceeded', 'entitlement', v_effective_limit.entitlement_id,
-                    jsonb_build_object('membership_id', p_membership_id, 'resource', p_resource_type));
+                INSERT INTO core.audit_trail (
+                    audit_category,
+                    audit_level,
+                    audit_event,
+                    audit_description,
+                    action,
+                    action_status,
+                    table_schema,
+                    table_name,
+                    record_id,
+                    new_data
+                ) VALUES (
+                    'SECURITY',
+                    'WARNING',
+                    'entitlement_limit_exceeded',
+                    'Hard entitlement limit exceeded',
+                    'ENFORCEMENT',
+                    'DENIED',
+                    'app',
+                    't_entitlement_limits',
+                    v_effective_limit.entitlement_id::TEXT,
+                    jsonb_build_object(
+                        'membership_id', p_membership_id,
+                        'resource_type', p_resource_type,
+                        'requested', p_requested_amount,
+                        'current_usage', v_effective_limit.current_usage,
+                        'limit', v_effective_limit.limit_value
+                    )
+                );
                     
             WHEN 'soft' THEN
                 RETURN QUERY SELECT 
@@ -253,11 +364,18 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
     END IF;
     
     -- Check warning threshold
-    IF v_usage_pct >= v_warning_threshold AND v_effective_limit.alert_enabled THEN
+    IF v_usage_pct >= v_warning_threshold AND COALESCE(v_effective_limit.alert_enabled, TRUE) THEN
         PERFORM pg_notify('entitlement_warning', jsonb_build_object(
             'entitlement_id', v_effective_limit.entitlement_id,
+            'membership_id', p_membership_id,
+            'resource_type', p_resource_type,
             'usage_pct', v_usage_pct,
-            'threshold', v_warning_threshold
+            'warning_threshold', v_warning_threshold,
+            'critical_threshold', v_critical_threshold,
+            'severity', CASE 
+                WHEN v_usage_pct >= v_critical_threshold THEN 'CRITICAL'
+                ELSE 'WARNING'
+            END
         )::TEXT);
     END IF;
 END;
@@ -275,33 +393,143 @@ CREATE OR REPLACE FUNCTION app.consume_entitlement(
 )
 RETURNS BOOLEAN
 LANGUAGE plpgsql
-SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged execution context -- [RBAC] ISO 27001: Privileged function execution context
+SECURITY DEFINER
 SET search_path = app, core, public
 AS $$
 DECLARE
     v_check_result RECORD;
-BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+    v_entitlement_id UUID;
+BEGIN
     -- Check entitlement first
     SELECT * INTO v_check_result
     FROM app.check_entitlement(p_membership_id, p_resource_type, p_amount, p_resource_subtype);
     
     IF NOT v_check_result.allowed THEN
         IF v_check_result.enforcement_action = 'block' THEN
-            RAISE EXCEPTION  -- [ERROR] ISO 27001: Secure error handling -- [ERROR] ISO 27001: Secure error handling - no sensitive data exposure 'Entitlement limit exceeded for %', p_resource_type;
+            RAISE EXCEPTION 'Entitlement limit exceeded for %', p_resource_type;
         END IF;
     END IF;
     
-    -- Update usage counters
+    -- Get the entitlement ID for the update
+    SELECT entitlement_id INTO v_entitlement_id
+    FROM app.t_entitlement_limits
+    WHERE resource_type = p_resource_type
+      AND (resource_subtype = p_resource_subtype OR resource_subtype IS NULL)
+      AND target_type = 'membership' 
+      AND target_id = p_membership_id
+      AND status = 'active'
+    ORDER BY priority ASC
+    LIMIT 1;
+    
+    -- Update usage counters if membership-specific limit exists
+    IF v_entitlement_id IS NOT NULL THEN
+        UPDATE app.t_entitlement_limits
+        SET current_usage = COALESCE(current_usage, 0) + p_amount,
+            usage_updated_at = NOW(),
+            usage_reset_at = COALESCE(usage_reset_at, NOW())
+        WHERE entitlement_id = v_entitlement_id;
+    END IF;
+    
+    -- Log consumption
+    INSERT INTO core.audit_trail (
+        audit_category,
+        audit_level,
+        audit_event,
+        audit_description,
+        action,
+        action_status,
+        table_schema,
+        table_name,
+        record_id,
+        new_data,
+        transaction_id
+    ) VALUES (
+        'SYSTEM',
+        'DEBUG',
+        'entitlement_consumed',
+        'Entitlement consumed for resource',
+        'CONSUMPTION',
+        'SUCCESS',
+        'app',
+        't_entitlement_limits',
+        COALESCE(v_entitlement_id::TEXT, 'none'),
+        jsonb_build_object(
+            'membership_id', p_membership_id,
+            'resource_type', p_resource_type,
+            'amount', p_amount,
+            'remaining', v_check_result.remaining
+        ),
+        p_transaction_id
+    );
+    
+    RETURN TRUE;
+END;
+$$;
+
+-- =============================================================================
+-- FUNCTION: app.reset_entitlement_window()
+-- Background job function to reset usage counters
+-- =============================================================================
+CREATE OR REPLACE FUNCTION app.reset_entitlement_window(
+    p_entitlement_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_old_usage NUMERIC;
+    v_limit RECORD;
+BEGIN
+    SELECT * INTO v_limit
+    FROM app.t_entitlement_limits
+    WHERE entitlement_id = p_entitlement_id;
+    
+    IF NOT FOUND THEN
+        RETURN FALSE;
+    END IF;
+    
+    v_old_usage := v_limit.current_usage;
+    
+    -- Reset usage and update window
     UPDATE app.t_entitlement_limits
-    SET current_usage = COALESCE(current_usage, 0) + p_amount,
-        usage_updated_at = NOW()
-    WHERE entitlement_id = (
-        SELECT entitlement_id FROM app.t_entitlement_limits
-        WHERE resource_type = p_resource_type
-          AND (resource_subtype = p_resource_subtype OR resource_subtype IS NULL)
-          AND (target_type = 'membership' AND target_id = p_membership_id)
-        ORDER BY priority ASC
-        LIMIT 1
+    SET current_usage = 0,
+        usage_reset_at = NOW(),
+        window_start = CASE window_type
+            WHEN 'fixed' THEN window_end
+            ELSE NOW()
+        END,
+        window_end = CASE window_type
+            WHEN 'fixed' THEN window_end + (window_end - window_start)
+            ELSE window_end
+        END
+    WHERE entitlement_id = p_entitlement_id;
+    
+    -- Log the reset
+    INSERT INTO core.audit_trail (
+        audit_category,
+        audit_level,
+        audit_event,
+        audit_description,
+        action,
+        action_status,
+        table_schema,
+        table_name,
+        record_id,
+        old_data,
+        new_data
+    ) VALUES (
+        'SYSTEM',
+        'INFO',
+        'entitlement_usage_reset',
+        'Entitlement usage counter reset',
+        'MAINTENANCE',
+        'SUCCESS',
+        'app',
+        't_entitlement_limits',
+        p_entitlement_id::TEXT,
+        jsonb_build_object('previous_usage', v_old_usage),
+        jsonb_build_object('new_usage', 0, 'reset_at', NOW())
     );
     
     RETURN TRUE;
@@ -318,12 +546,15 @@ COMMENT ON FUNCTION app.check_entitlement(UUID, TEXT, NUMERIC, TEXT) IS
     'Security: Hierarchical enforcement, audit logging. ' ||
     'Returns: allowed, remaining, limit, action, warning, source.';
 
+COMMENT ON FUNCTION app.reset_entitlement_window(UUID) IS
+    'Reset entitlement usage counter for a new window period. Called by background job.';
+
 -- =============================================================================
 -- IMPLEMENTATION NOTES
 -- =============================================================================
 -- 1. Hierarchical limit resolution: membership > role > application > global
 -- 2. Usage counters cached for performance, synced periodically
--- 3. Window resets handled by scheduled job
+-- 3. Window resets handled by scheduled job calling reset_entitlement_window()
 -- 4. Override expiration checked at enforcement time
 -- 5. All consumption logged for audit
 -- 6. Warning alerts sent via PostgreSQL NOTIFY

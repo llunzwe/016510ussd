@@ -206,7 +206,7 @@ CREATE POLICY agent_sessions_select_policy ON app.agent_sessions
         deleted_at IS NULL AND
         (
             -- User owns the session
-            user_id = current_setting('app.current_user_id')::UUID
+            user_id = current_setting('app.current_user_id', true)::UUID
             OR
             -- Organization admin can view org sessions
             (
@@ -226,7 +226,7 @@ CREATE POLICY agent_sessions_select_policy ON app.agent_sessions
 CREATE POLICY agent_sessions_insert_policy ON app.agent_sessions
     FOR INSERT
     WITH CHECK (
-        user_id = current_setting('app.current_user_id')::UUID
+        user_id = current_setting('app.current_user_id', true)::UUID
         OR
         app.has_permission(current_user, 'ai:sessions:create:delegated')
         OR
@@ -239,7 +239,7 @@ CREATE POLICY agent_sessions_update_policy ON app.agent_sessions
     USING (
         deleted_at IS NULL AND
         (
-            user_id = current_setting('app.current_user_id')::UUID
+            user_id = current_setting('app.current_user_id', true)::UUID
             OR
             app.has_permission(current_user, 'ai:sessions:update:any')
             OR
@@ -262,7 +262,7 @@ RETURNS TRIGGER AS $$
 BEGIN
     -- Set audit fields
     IF NEW.created_by IS NULL THEN
-        NEW.created_by := current_setting('app.current_user_id')::UUID;
+        NEW.created_by := current_setting('app.current_user_id', true)::UUID;
     END IF;
     
     -- Compute session data hash for integrity
@@ -332,7 +332,7 @@ BEGIN
     
     -- Update timestamp
     NEW.updated_at := CURRENT_TIMESTAMP;
-    NEW.updated_by := current_setting('app.current_user_id')::UUID;
+    NEW.updated_by := current_setting('app.current_user_id', true)::UUID;
     
     -- Recompute session data hash if data changed
     IF NEW.session_data IS DISTINCT FROM OLD.session_data THEN
@@ -377,7 +377,7 @@ CREATE OR REPLACE FUNCTION app.trigger_agent_sessions_soft_delete()
 RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL THEN
-        NEW.deleted_by := current_setting('app.current_user_id')::UUID;
+        NEW.deleted_by := current_setting('app.current_user_id', true)::UUID;
         NEW.status := 'terminated';
         
         INSERT INTO app.audit_log (
@@ -432,7 +432,7 @@ BEGIN
     UPDATE app.agent_sessions
     SET 
         deleted_at = CURRENT_TIMESTAMP,
-        deleted_by = current_setting('app.current_user_id')::UUID,
+        deleted_by = current_setting('app.current_user_id', true)::UUID,
         status = 'expired'
     WHERE 
         deleted_at IS NULL

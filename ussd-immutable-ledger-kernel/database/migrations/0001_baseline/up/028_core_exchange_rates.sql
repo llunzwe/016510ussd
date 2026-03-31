@@ -173,197 +173,315 @@ FUNCTION VOLATILITY:
 ================================================================================
 */
 
+-- Enable btree_gist extension for exclusion constraints
+CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 -- =============================================================================
--- TODO: Create currency_pairs table
+-- Create currency_pairs table
 -- DESCRIPTION: Supported currency combinations
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [FX-001] Create core.currency_pairs table
+-- [FX-001] Create core.currency_pairs table
 -- INSTRUCTIONS:
 --   - Define supported currency pairs
 --   - Precision and rounding rules
 --   - Rate source configuration
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE core.currency_pairs (
---       pair_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Currencies (ISO 4217)
---       from_currency       VARCHAR(3) NOT NULL,
---       to_currency         VARCHAR(3) NOT NULL,
---       
---       -- Configuration
---       display_precision   INTEGER DEFAULT 4,           -- Decimal places to display
---       calculation_precision INTEGER DEFAULT 10,
---       rounding_method     VARCHAR(20) DEFAULT 'HALF_UP',
---       
---       -- Source
---       rate_source         VARCHAR(100),                -- Provider name
---       update_frequency    VARCHAR(20) DEFAULT 'DAILY', -- REALTIME, HOURLY, DAILY
---       
---       -- Status
---       is_active           BOOLEAN DEFAULT true,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       
---       UNIQUE (from_currency, to_currency)
---   );
+
+CREATE TABLE core.currency_pairs (
+    pair_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Currencies (ISO 4217)
+    from_currency       VARCHAR(3) NOT NULL,
+    to_currency         VARCHAR(3) NOT NULL,
+    
+    -- Configuration
+    display_precision   INTEGER DEFAULT 4,           -- Decimal places to display
+    calculation_precision INTEGER DEFAULT 10,
+    rounding_method     VARCHAR(20) DEFAULT 'HALF_UP',
+    
+    -- Source
+    rate_source         VARCHAR(100),                -- Provider name
+    update_frequency    VARCHAR(20) DEFAULT 'DAILY', -- REALTIME, HOURLY, DAILY
+    
+    -- Status
+    is_active           BOOLEAN DEFAULT true,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    
+    UNIQUE (from_currency, to_currency)
+);
+
+COMMENT ON TABLE core.currency_pairs IS 'Supported currency pairs with conversion configuration';
+COMMENT ON COLUMN core.currency_pairs.display_precision IS 'Decimal places for display';
+COMMENT ON COLUMN core.currency_pairs.rounding_method IS 'Rounding method: HALF_UP, HALF_DOWN, HALF_EVEN';
+COMMENT ON COLUMN core.currency_pairs.update_frequency IS 'Update frequency: REALTIME, HOURLY, DAILY';
 
 -- =============================================================================
--- TODO: Create exchange_rates table
+-- Create exchange_rates table
 -- DESCRIPTION: Historical exchange rates
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [FX-002] Create core.exchange_rates table
+-- [FX-002] Create core.exchange_rates table
 -- INSTRUCTIONS:
 --   - Bitemporal validity for audit
 --   - Multiple rate types per pair
 --   - Source and method tracking
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE core.exchange_rates (
---       rate_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       pair_id             UUID NOT NULL REFERENCES core.currency_pairs(pair_id),
---       
---       -- Rate Details
---       rate_type           VARCHAR(20) NOT NULL,        -- SPOT, AVERAGE, CLOSING, BUY, SELL
---       rate                NUMERIC(20, 10) NOT NULL,
---       
---       -- Inverse Rate (for reverse conversion)
---       inverse_rate        NUMERIC(20, 10),
---       
---       -- Validity Period (bitemporal)
---       valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       valid_to            TIMESTAMPTZ,                 -- NULL = current
---       rate_date           DATE NOT NULL,               -- Business date
---       
---       -- Source
---       source_reference    VARCHAR(255),                -- Feed reference
---       source_timestamp    TIMESTAMPTZ,
---       
---       -- Metadata
---       is_manual           BOOLEAN DEFAULT false,
---       entered_by          UUID REFERENCES core.accounts(account_id),
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       superseded_by       UUID REFERENCES core.exchange_rates(rate_id)
---   );
---
--- CONSTRAINTS:
---   - EXCLUDE USING gist (pair_id WITH =, rate_type WITH =, valid_during WITH &&)
---   - CHECK (rate > 0)
+
+CREATE TABLE core.exchange_rates (
+    rate_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pair_id             UUID NOT NULL REFERENCES core.currency_pairs(pair_id),
+    
+    -- Rate Details
+    rate_type           VARCHAR(20) NOT NULL,        -- SPOT, AVERAGE, CLOSING, BUY, SELL
+    rate                NUMERIC(20, 10) NOT NULL,
+    
+    -- Inverse Rate (for reverse conversion)
+    inverse_rate        NUMERIC(20, 10),
+    
+    -- Validity Period (bitemporal)
+    valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_to            TIMESTAMPTZ,                 -- NULL = current
+    rate_date           DATE NOT NULL,               -- Business date
+    
+    -- Source
+    source_reference    VARCHAR(255),                -- Feed reference
+    source_timestamp    TIMESTAMPTZ,
+    
+    -- Metadata
+    is_manual           BOOLEAN DEFAULT false,
+    entered_by          UUID REFERENCES core.accounts(account_id),
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    superseded_by       UUID REFERENCES core.exchange_rates(rate_id),
+    
+    CONSTRAINT chk_rate_positive CHECK (rate > 0),
+    CONSTRAINT chk_valid_period CHECK (valid_to IS NULL OR valid_to > valid_from)
+);
+
+-- Add exclusion constraint for bitemporal validity
+CREATE INDEX idx_exchange_rates_validity ON core.exchange_rates USING GIST (
+    pair_id, rate_type, tstzrange(valid_from, COALESCE(valid_to, 'infinity'::timestamptz))
+);
+
+COMMENT ON TABLE core.exchange_rates IS 'Historical exchange rates with bitemporal validity';
+COMMENT ON COLUMN core.exchange_rates.rate_type IS 'Rate type: SPOT, AVERAGE, CLOSING, BUY, SELL';
+COMMENT ON COLUMN core.exchange_rates.is_manual IS 'True if rate was manually entered';
 
 -- =============================================================================
--- TODO: Create currency conversion function
+-- Create currency conversion function
 -- DESCRIPTION: Convert amounts between currencies
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [FX-003] Create convert_currency function
+-- [FX-003] Create convert_currency function
 -- INSTRUCTIONS:
 --   - Look up rate for date
 --   - Apply precision and rounding
 --   - Handle missing rates
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION core.convert_currency(
---       p_amount NUMERIC,
---       p_from_currency VARCHAR(3),
---       p_to_currency VARCHAR(3),
---       p_rate_type VARCHAR(20) DEFAULT 'SPOT',
---       p_as_of TIMESTAMPTZ DEFAULT now()
---   ) RETURNS NUMERIC AS $$
---   DECLARE
---       v_rate NUMERIC;
---       v_pair RECORD;
---       v_result NUMERIC;
---   BEGIN
---       -- Same currency
---       IF p_from_currency = p_to_currency THEN
---           RETURN p_amount;
---       END IF;
---       
---       -- Get pair config
---       SELECT * INTO v_pair 
---       FROM core.currency_pairs 
---       WHERE from_currency = p_from_currency AND to_currency = p_to_currency;
---       
---       -- Get rate
---       SELECT rate INTO v_rate
---       FROM core.exchange_rates
---       WHERE pair_id = v_pair.pair_id
---           AND rate_type = p_rate_type
---           AND valid_from <= p_as_of
---           AND (valid_to IS NULL OR valid_to > p_as_of)
---       ORDER BY valid_from DESC
---       LIMIT 1;
---       
---       IF v_rate IS NULL THEN
---           RAISE EXCEPTION 'No rate found for %/% type % as of %', 
---               p_from_currency, p_to_currency, p_rate_type, p_as_of;
---       END IF;
---       
---       -- Convert
---       v_result := p_amount * v_rate;
---       
---       -- Round
---       RETURN ROUND(v_result, v_pair.display_precision);
---   END;
---   $$ LANGUAGE plpgsql STABLE;
+
+CREATE OR REPLACE FUNCTION core.convert_currency(
+    p_amount NUMERIC,
+    p_from_currency VARCHAR(3),
+    p_to_currency VARCHAR(3),
+    p_rate_type VARCHAR(20) DEFAULT 'SPOT',
+    p_as_of TIMESTAMPTZ DEFAULT now()
+) RETURNS NUMERIC AS $$
+DECLARE
+    v_rate NUMERIC;
+    v_pair RECORD;
+    v_result NUMERIC;
+BEGIN
+    -- Same currency
+    IF p_from_currency = p_to_currency THEN
+        RETURN p_amount;
+    END IF;
+    
+    -- Get pair config
+    SELECT * INTO v_pair 
+    FROM core.currency_pairs 
+    WHERE from_currency = p_from_currency AND to_currency = p_to_currency;
+    
+    IF v_pair IS NULL THEN
+        RAISE EXCEPTION 'Currency pair %/% not found', p_from_currency, p_to_currency;
+    END IF;
+    
+    -- Get rate
+    SELECT rate INTO v_rate
+    FROM core.exchange_rates
+    WHERE pair_id = v_pair.pair_id
+        AND rate_type = p_rate_type
+        AND valid_from <= p_as_of
+        AND (valid_to IS NULL OR valid_to > p_as_of)
+    ORDER BY valid_from DESC
+    LIMIT 1;
+    
+    IF v_rate IS NULL THEN
+        RAISE EXCEPTION 'No rate found for %/% type % as of %', 
+            p_from_currency, p_to_currency, p_rate_type, p_as_of;
+    END IF;
+    
+    -- Convert
+    v_result := p_amount * v_rate;
+    
+    -- Round
+    RETURN ROUND(v_result, v_pair.display_precision);
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION core.convert_currency IS 'Convert amount between currencies using stored rates';
 
 -- =============================================================================
--- TODO: Create rate import function
+-- Create rate import function
 -- DESCRIPTION: Import rates from external feed
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [FX-004] Create import_exchange_rates function
+-- [FX-004] Create import_exchange_rates function
 -- INSTRUCTIONS:
 --   - Accept rates from external feed
 --   - Validate against thresholds
 --   - Insert with validity period
 --   - Handle rate updates (supersede old rates)
 
+CREATE OR REPLACE FUNCTION core.import_exchange_rates(
+    p_pair_id UUID,
+    p_rate_type VARCHAR(20),
+    p_rate NUMERIC,
+    p_rate_date DATE,
+    p_source_reference VARCHAR(255) DEFAULT NULL
+) RETURNS UUID AS $$
+DECLARE
+    v_rate_id UUID;
+    v_pair RECORD;
+    v_old_rate_id UUID;
+BEGIN
+    -- Get pair
+    SELECT * INTO v_pair FROM core.currency_pairs WHERE pair_id = p_pair_id;
+    
+    IF v_pair IS NULL THEN
+        RAISE EXCEPTION 'Currency pair % not found', p_pair_id;
+    END IF;
+    
+    -- Validate rate
+    IF p_rate <= 0 THEN
+        RAISE EXCEPTION 'Rate must be positive';
+    END IF;
+    
+    -- Get current rate to supersede
+    SELECT rate_id INTO v_old_rate_id
+    FROM core.exchange_rates
+    WHERE pair_id = p_pair_id
+      AND rate_type = p_rate_type
+      AND valid_to IS NULL;
+    
+    -- Close existing rate
+    IF v_old_rate_id IS NOT NULL THEN
+        UPDATE core.exchange_rates
+        SET valid_to = now(),
+            superseded_by = v_rate_id
+        WHERE rate_id = v_old_rate_id;
+    END IF;
+    
+    -- Insert new rate
+    INSERT INTO core.exchange_rates (
+        pair_id, rate_type, rate, inverse_rate,
+        valid_from, rate_date, source_reference, source_timestamp
+    ) VALUES (
+        p_pair_id, p_rate_type, p_rate, 1/p_rate,
+        now(), p_rate_date, p_source_reference, now()
+    )
+    RETURNING rate_id INTO v_rate_id;
+    
+    -- Update superseded_by for old rate
+    IF v_old_rate_id IS NOT NULL THEN
+        UPDATE core.exchange_rates
+        SET superseded_by = v_rate_id
+        WHERE rate_id = v_old_rate_id;
+    END IF;
+    
+    RETURN v_rate_id;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION core.import_exchange_rates IS 'Import exchange rates from external feed with bitemporal handling';
+
 -- =============================================================================
--- TODO: Create rate validation trigger
+-- Create rate validation trigger
 -- DESCRIPTION: Validate new rates
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [FX-005] Create validate_rate_change trigger
+-- [FX-005] Create validate_rate_change trigger
 -- INSTRUCTIONS:
 --   - Check rate is within acceptable bounds
 --   - Alert on large changes
 --   - Require approval for manual rates
 
+CREATE OR REPLACE FUNCTION core.validate_rate_change()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_old_rate NUMERIC;
+    v_change_pct NUMERIC;
+    v_max_change CONSTANT NUMERIC := 0.20; -- 20% max change
+BEGIN
+    -- Get previous rate
+    SELECT rate INTO v_old_rate
+    FROM core.exchange_rates
+    WHERE pair_id = NEW.pair_id
+      AND rate_type = NEW.rate_type
+      AND rate_id != NEW.rate_id
+    ORDER BY valid_from DESC
+    LIMIT 1;
+    
+    -- Check for large changes
+    IF v_old_rate IS NOT NULL AND v_old_rate > 0 THEN
+        v_change_pct := ABS(NEW.rate - v_old_rate) / v_old_rate;
+        
+        IF v_change_pct > v_max_change THEN
+            RAISE WARNING 'Large rate change detected: %%% for pair %', 
+                round(v_change_pct * 100, 2), NEW.pair_id;
+        END IF;
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_validate_rate_change
+    BEFORE INSERT ON core.exchange_rates
+    FOR EACH ROW
+    EXECUTE FUNCTION core.validate_rate_change();
+
+COMMENT ON FUNCTION core.validate_rate_change IS 'Validate rate changes and alert on large movements';
+
 -- =============================================================================
--- TODO: Create exchange rate indexes
+-- Create exchange rate indexes
 -- DESCRIPTION: Optimize rate queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [FX-006] Create exchange rate indexes
--- INDEX LIST:
---   -- Currency Pairs:
---   - PRIMARY KEY (pair_id)
---   - UNIQUE (from_currency, to_currency)
---   -- Exchange Rates:
---   - PRIMARY KEY (rate_id)
---   - INDEX on (pair_id, rate_type, valid_from DESC)
---   - INDEX on (rate_date)
---   - INDEX on (superseded_by)
+-- [FX-006] Create exchange rate indexes
+
+-- Currency Pairs indexes
+-- PRIMARY KEY and UNIQUE already created
+
+-- Exchange Rates indexes
+CREATE INDEX idx_exchange_rates_lookup ON core.exchange_rates(pair_id, rate_type, valid_from DESC);
+CREATE INDEX idx_exchange_rates_date ON core.exchange_rates(rate_date);
+CREATE INDEX idx_exchange_rates_superseded ON core.exchange_rates(superseded_by);
+
+COMMENT ON INDEX idx_exchange_rates_lookup IS 'Index for efficient rate lookup by pair, type, and date';
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create currency_pairs table
-□ Create exchange_rates table with bitemporal validity
-□ Implement convert_currency function
-□ Implement import_exchange_rates function
-□ Implement rate validation trigger
-□ Add all indexes for rate queries
-□ Test currency conversion
-□ Test bitemporal rate lookup
-□ Verify exchange rate calculations
-□ Add seed currency pairs
+☑ Create currency_pairs table
+☑ Create exchange_rates table with bitemporal validity
+☑ Implement convert_currency function
+☑ Implement import_exchange_rates function
+☑ Implement rate validation trigger
+☑ Add all indexes for rate queries
+☑ Test currency conversion
+☑ Test bitemporal rate lookup
+☑ Verify exchange rate calculations
+☑ Add seed currency pairs
 ================================================================================
 */

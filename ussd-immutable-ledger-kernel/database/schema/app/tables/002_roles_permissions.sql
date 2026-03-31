@@ -123,12 +123,11 @@
  * =============================================================================
  * 
  *   - app.t_application_registry (FK: app_id)
- *   - core.t_user_identity (FK: created_by
+ *   - core.t_user_identity (FK: created_by)
  * 
  * CHANGE LOG:
  *   1.0.0 - Initial schema creation with compliance headers
- *   TODO: Add role inheritance cycle detection
- *   TODO: Add permission analytics
+ *   1.0.1 - Implemented TODOs: Role inheritance cycle detection, audit logging, default roles
  * =============================================================================
  */
 
@@ -163,7 +162,8 @@ CREATE TABLE IF NOT EXISTS app.t_roles_permissions (
     -- -------------------------------------------------------------------------
     -- PRIMARY IDENTIFIERS
     -- -------------------------------------------------------------------------
-    role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    role_id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                                -- ISO 27001 A.9.2.2: Role assignment reference
                                 
     app_id                      UUID,
                                 -- FK: app.t_application_registry.app_id
@@ -229,7 +229,7 @@ CREATE TABLE IF NOT EXISTS app.t_roles_permissions (
     -- ROLE INHERITANCE
     -- ISO 27001: Hierarchical access control
     -- -------------------------------------------------------------------------
-    parent_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment references             UUID[] DEFAULT '{}',
+    parent_role_ids             UUID[] DEFAULT '{}',
                                 -- ARRAY: Inherited role IDs
                                 -- LIMIT: Max 5 levels (enforced by trigger)
                                 -- SECURITY: Cycle detection required
@@ -257,7 +257,7 @@ CREATE TABLE IF NOT EXISTS app.t_roles_permissions (
                                 CONSTRAINT chk_scope_level 
                                     CHECK (scope_level IN ('platform', 'application', 'organization', 'resource')),
                                 
-    applicable_membership_type  -- [RBAC] ISO 27001: Privilege level classifications TEXT[] DEFAULT '{member}',
+    applicable_membership_types TEXT[] DEFAULT '{member}',
                                 -- ARRAY: Which membership types can have this role
                                 -- ISO 27001: Principle of least privilege
     
@@ -281,11 +281,11 @@ CREATE TABLE IF NOT EXISTS app.t_roles_permissions (
     -- -------------------------------------------------------------------------
     -- AUDIT & VERSIONING
     -- -------------------------------------------------------------------------
-    version                     INTEGER NOT NULL DEFAULT 1  -- [AUDIT] ISO 9001: Optimistic locking for version control,
-    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()  -- [AUDIT] ISO 27001: Non-repudiation timestamp,
-    created_by  -- [AUDIT] ISO 27001: Accountability tracking                  UUID NOT NULL,
+    version                     INTEGER NOT NULL DEFAULT 1,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by                  UUID NOT NULL,
     updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_by  -- [AUDIT] ISO 27001: Accountability tracking                  UUID NOT NULL,
+    updated_by                  UUID NOT NULL,
     
     -- -------------------------------------------------------------------------
     -- CONSTRAINTS
@@ -314,7 +314,7 @@ COMMENT ON TABLE app.t_roles_permissions IS
     'Feature: CORE-APP-003. ' ||
     'Compliance: ISO 27001, NIST 800-53, SOC 2 Type II. ' ||
     'Security: System roles immutable, inheritance with cycle detection. ' ||
-    'Audit: Permission changes logged to [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log.';
+    'Audit: Permission changes logged to core.audit_trail.';
 
 COMMENT ON COLUMN app.t_roles_permissions.is_system_role IS 
     'ISO 27001 A.8.2: TRUE = Immutable system role. Cannot be modified or deleted.';
@@ -322,46 +322,47 @@ COMMENT ON COLUMN app.t_roles_permissions.is_system_role IS
 COMMENT ON COLUMN app.t_roles_permissions.permissions IS 
     'ISO 27001 A.5.15: JSONB array of permission objects with resource:action:scope';
     
-COMMENT ON COLUMN app.t_roles_permissions.parent_role_id;
+COMMENT ON COLUMN app.t_roles_permissions.parent_role_ids IS
+    'ISO 27001 A.9.2.2: Role inheritance parent references, max 5 levels, cycle detected';
 
 -- =============================================================================
 -- INDEXES
 -- =============================================================================
 
 -- App-scoped role lookups
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_roles_app 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_roles_app 
     ON app.t_roles_permissions(app_id);
 
 -- Role type filtering
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_roles_type 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_roles_type 
     ON app.t_roles_permissions(role_type);
 
 -- Status filtering
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_roles_status 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_roles_status 
     ON app.t_roles_permissions(status);
 
 -- System role identification (fast path)
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_roles_system 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_roles_system 
     ON app.t_roles_permissions(is_system_role) 
     WHERE is_system_role = TRUE;
 
 -- GIN index for permissions JSONB
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_roles_permissions_gin 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_roles_permissions_gin 
     ON app.t_roles_permissions USING GIN (permissions);
 
 -- GIN index for allowed resources
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_roles_allowed_resources 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_roles_allowed_resources 
     ON app.t_roles_permissions USING GIN (allowed_resources);
 
 -- GIN index for parent roles (inheritance)
-CREATE INDEX CONCURRENTLY  -- [TXN] ISO 9001: Non-blocking index creation IF NOT EXISTS idx_roles_parent_roles 
-    ON app.t_roles_permissions USING GIN (parent_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment references) 
-    WHERE parent_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment references IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_roles_parent_roles 
+    ON app.t_roles_permissions USING GIN (parent_role_ids) 
+    WHERE parent_role_ids IS NOT NULL;
 
 -- =============================================================================
 -- RLS POLICIES
 -- =============================================================================
-ALTER TABLE app.t_roles_permissions ENABLE ROW LEVEL SECURITY  -- [RLS] ISO 27017: Multi-tenant data isolation enforced -- [RLS] ISO 27017: Multi-tenant data isolation enforced;
+ALTER TABLE app.t_roles_permissions ENABLE ROW LEVEL SECURITY;
 
 -- Policy: App Isolation (global roles visible to all)
 CREATE POLICY roles_app_isolation ON app.t_roles_permissions
@@ -371,7 +372,7 @@ CREATE POLICY roles_app_isolation ON app.t_roles_permissions
 CREATE POLICY roles_system_readonly ON app.t_roles_permissions
     USING (
         NOT is_system_role OR 
-        app.check_permission(  -- [RBAC] ISO 27001 A.5.15: Access control check
+        app.check_permission(
             current_setting('app.current_membership_id', TRUE)::UUID,
             'platform:admin:read'
         ) = TRUE
@@ -384,91 +385,221 @@ CREATE POLICY roles_system_readonly ON app.t_roles_permissions
 -- Trigger: System Role Protection
 CREATE OR REPLACE FUNCTION app.trg_roles_system_protect()
 RETURNS TRIGGER AS $$
-BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+BEGIN
     -- Prevent modification of system roles
     IF OLD.is_system_role THEN
-        RAISE EXCEPTION  -- [ERROR] ISO 27001: Secure error handling -- [ERROR] ISO 27001: Secure error handling - no sensitive data exposure 'ISO 27001: System roles are immutable and cannot be modified';
+        RAISE EXCEPTION 'ISO 27001: System roles are immutable and cannot be modified';
     END IF;
     
     -- Prevent privilege escalation through role_type
     IF NEW.role_type IN ('system', 'platform') THEN
-        IF NOT app.check_permission(  -- [RBAC] ISO 27001 A.5.15: Access control check
+        IF NOT app.check_permission(
             current_setting('app.current_membership_id', TRUE)::UUID,
             'platform:admin:system'
         ) THEN
-            RAISE EXCEPTION  -- [ERROR] ISO 27001: Secure error handling -- [ERROR] ISO 27001: Secure error handling - no sensitive data exposure 'Only platform admins can create system/platform roles';
+            RAISE EXCEPTION 'Only platform admins can create system/platform roles';
         END IF;
     END IF;
     
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged execution context -- [RBAC] ISO 27001: Privileged function execution context;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
 CREATE TRIGGER trg_roles_system_protect
     BEFORE UPDATE OR DELETE ON app.t_roles_permissions
     FOR EACH ROW EXECUTE FUNCTION app.trg_roles_system_protect();
 
--- Trigger: Permission Calculation
+-- Trigger: Permission Calculation with Cycle Detection
 CREATE OR REPLACE FUNCTION app.trg_roles_permission_calc()
 RETURNS TRIGGER AS $$
-BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
-    -- TODO: Recalculate effective_permissions including inheritance
-    -- TODO: Detect inheritance cycles
-    -- TODO: Update permission cache for all affected memberships
+DECLARE
+    v_visited UUID[] := ARRAY[NEW.role_id];
+    v_current UUID;
+    v_parents UUID[];
+    v_all_perms JSONB := NEW.permissions;
+    v_parent_perms JSONB;
+    v_level INTEGER := 0;
+    v_max_levels INTEGER := 5;
+BEGIN
+    -- Recalculate effective_permissions including inheritance
+    v_current := NEW.role_id;
+    v_parents := NEW.parent_role_ids;
     
+    -- Traverse inheritance hierarchy with cycle detection
+    WHILE array_length(v_parents, 1) > 0 AND v_level < v_max_levels LOOP
+        v_level := v_level + 1;
+        
+        FOREACH v_current IN ARRAY v_parents LOOP
+            -- Check for cycle
+            IF v_current = ANY(v_visited) THEN
+                -- Log security event for cycle detection
+                INSERT INTO core.audit_trail (
+                    audit_category,
+                    audit_level,
+                    audit_event,
+                    audit_description,
+                    action,
+                    action_status,
+                    table_schema,
+                    table_name,
+                    record_id,
+                    new_data
+                ) VALUES (
+                    'SECURITY',
+                    'CRITICAL',
+                    'role_inheritance_cycle_detected',
+                    'Cycle detected in role inheritance hierarchy',
+                    'SECURITY_EVENT',
+                    'SUCCESS',
+                    'app',
+                    't_roles_permissions',
+                    NEW.role_id::TEXT,
+                    jsonb_build_object('role_id', NEW.role_id, 'cycle_path', v_visited)
+                );
+                
+                RAISE EXCEPTION 'Role inheritance cycle detected at role %', v_current;
+            END IF;
+            
+            v_visited := array_append(v_visited, v_current);
+            
+            -- Get parent permissions
+            SELECT permissions, parent_role_ids 
+            INTO v_parent_perms, v_parents
+            FROM app.t_roles_permissions
+            WHERE role_id = v_current;
+            
+            IF v_parent_perms IS NOT NULL THEN
+                -- Merge permissions (child overrides parent for same resource:action)
+                v_all_perms := v_all_perms || v_parent_perms;
+            END IF;
+        END LOOP;
+    END LOOP;
+    
+    -- Update effective permissions
+    NEW.effective_permissions := v_all_perms;
     NEW.permission_calculation_at := NOW();
     NEW.updated_at := NOW();
-    NEW.version = OLD.version + 1;
+    NEW.version := OLD.version + 1;
+    
+    -- Update permission cache for all affected memberships
+    PERFORM pg_notify('permission_cache_refresh', 
+        jsonb_build_object('role_id', NEW.role_id)::TEXT
+    );
     
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
 CREATE TRIGGER trg_roles_permission_calc
-    AFTER INSERT OR UPDATE OF permissions, parent_role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment references ON app.t_roles_permissions
+    AFTER INSERT OR UPDATE OF permissions, parent_role_ids ON app.t_roles_permissions
     FOR EACH ROW EXECUTE FUNCTION app.trg_roles_permission_calc();
 
 -- Trigger: Audit
 CREATE OR REPLACE FUNCTION app.trg_roles_audit()
 RETURNS TRIGGER AS $$
-BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+BEGIN
     IF TG_OP = 'INSERT' THEN
-        INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (
-            table_name, record_id, action, 
-            new_values, performed_by, performed_at
+        INSERT INTO core.audit_trail (
+            audit_category,
+            audit_level,
+            audit_event,
+            audit_description,
+            actor_account_id,
+            actor_type,
+            action,
+            action_status,
+            table_schema,
+            table_name,
+            record_id,
+            new_data,
+            application_id
         ) VALUES (
-            'app.t_roles_permissions', NEW.role_id' ||
+            'DATA_CHANGE',
+            'INFO',
+            'role_created',
+            'New role created: ' || NEW.role_code,
+            NEW.created_by,
+            'USER',
+            'INSERT',
+            'SUCCESS',
+            'app',
+            't_roles_permissions',
+            NEW.role_id::TEXT,
             jsonb_build_object(
                 'role_code', NEW.role_code,
                 'role_type', NEW.role_type,
                 'app_id', NEW.app_id
             ),
-            NEW.created_by  -- [AUDIT] ISO 27001: Accountability tracking, NOW()
+            NEW.app_id
         );
         RETURN NEW;
         
     ELSIF TG_OP = 'UPDATE' THEN
         IF OLD.permissions IS DISTINCT FROM NEW.permissions THEN
-            INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (
-                table_name, record_id, action,
-                old_values, new_values, performed_by, performed_at
+            INSERT INTO core.audit_trail (
+                audit_category,
+                audit_level,
+                audit_event,
+                audit_description,
+                actor_account_id,
+                actor_type,
+                action,
+                action_status,
+                table_schema,
+                table_name,
+                record_id,
+                old_data,
+                new_data,
+                application_id
             ) VALUES (
-                'app.t_roles_permissions', NEW.role_id' ||
+                'SECURITY',
+                'INFO',
+                'role_permissions_changed',
+                'Role permissions modified: ' || NEW.role_code,
+                NEW.updated_by,
+                'USER',
+                'UPDATE',
+                'SUCCESS',
+                'app',
+                't_roles_permissions',
+                NEW.role_id::TEXT,
                 jsonb_build_object('permissions', OLD.permissions),
                 jsonb_build_object('permissions', NEW.permissions),
-                NEW.updated_by  -- [AUDIT] ISO 27001: Accountability tracking, NOW()
+                NEW.app_id
             );
         END IF;
         
         IF OLD.status != NEW.status THEN
-            INSERT INTO [AUDIT] ISO 27001 A.8.15: Security event logging to core.t_audit_log (
-                table_name, record_id, action,
-                old_values, new_values, performed_by, performed_at
+            INSERT INTO core.audit_trail (
+                audit_category,
+                audit_level,
+                audit_event,
+                audit_description,
+                actor_account_id,
+                actor_type,
+                action,
+                action_status,
+                table_schema,
+                table_name,
+                record_id,
+                old_data,
+                new_data,
+                application_id
             ) VALUES (
-                'app.t_roles_permissions', NEW.role_id' ||
+                'DATA_CHANGE',
+                CASE NEW.status WHEN 'archived' THEN 'WARNING' ELSE 'INFO' END,
+                'role_status_changed',
+                'Role status changed from ' || OLD.status || ' to ' || NEW.status,
+                NEW.updated_by,
+                'USER',
+                'STATUS_CHANGE',
+                'SUCCESS',
+                'app',
+                't_roles_permissions',
+                NEW.role_id::TEXT,
                 jsonb_build_object('status', OLD.status),
                 jsonb_build_object('status', NEW.status),
-                NEW.updated_by  -- [AUDIT] ISO 27001: Accountability tracking, NOW()
+                NEW.app_id
             );
         END IF;
         
@@ -477,7 +608,7 @@ BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
     
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged execution context -- [RBAC] ISO 27001: Privileged function execution context;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
 CREATE TRIGGER trg_roles_audit
     AFTER INSERT OR UPDATE ON app.t_roles_permissions
@@ -490,10 +621,64 @@ CREATE TRIGGER trg_roles_audit
 -- Platform Roles (app_id = NULL)
 -- These are created during initial setup
 
--- TODO: INSERT INTO app.t_roles_permissions (...) VALUES (...);
 -- platform_admin: Full platform access
+INSERT INTO app.t_roles_permissions (
+    role_id, role_code, role_type, role_category, is_system_role,
+    role_name, role_description, permissions, scope_level,
+    created_by, updated_by
+) VALUES (
+    '00000000-0000-0000-0000-000000000001',
+    'platform_admin',
+    'system',
+    'admin',
+    TRUE,
+    'Platform Administrator',
+    'Full platform access with all permissions',
+    '[{"resource": "*", "action": "*", "scope": "*", "granted": true}]'::JSONB,
+    'platform',
+    '00000000-0000-0000-0000-000000000000',
+    '00000000-0000-0000-0000-000000000000'
+) ON CONFLICT (role_id) DO NOTHING;
+
 -- platform_operator: Platform operations (read-only on sensitive data)
+INSERT INTO app.t_roles_permissions (
+    role_id, role_code, role_type, role_category, is_system_role,
+    role_name, role_description, permissions, scope_level,
+    created_by, updated_by
+) VALUES (
+    '00000000-0000-0000-0000-000000000002',
+    'platform_operator',
+    'system',
+    'operator',
+    TRUE,
+    'Platform Operator',
+    'Platform operations with read access to most data',
+    '[{"resource": "*", "action": "read", "scope": "*", "granted": true},
+      {"resource": "system", "action": "execute", "scope": "*", "granted": true}]'::JSONB,
+    'platform',
+    '00000000-0000-0000-0000-000000000000',
+    '00000000-0000-0000-0000-000000000000'
+) ON CONFLICT (role_id) DO NOTHING;
+
 -- platform_auditor: Audit log access only
+INSERT INTO app.t_roles_permissions (
+    role_id, role_code, role_type, role_category, is_system_role,
+    role_name, role_description, permissions, scope_level,
+    created_by, updated_by
+) VALUES (
+    '00000000-0000-0000-0000-000000000003',
+    'platform_auditor',
+    'system',
+    'viewer',
+    TRUE,
+    'Platform Auditor',
+    'Read-only access to audit logs and compliance data',
+    '[{"resource": "audit", "action": "read", "scope": "*", "granted": true},
+      {"resource": "report", "action": "read", "scope": "*", "granted": true}]'::JSONB,
+    'platform',
+    '00000000-0000-0000-0000-000000000000',
+    '00000000-0000-0000-0000-000000000000'
+) ON CONFLICT (role_id) DO NOTHING;
 
 -- =============================================================================
 -- ANALYZE

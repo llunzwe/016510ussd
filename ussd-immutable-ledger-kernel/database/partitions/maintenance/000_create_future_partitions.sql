@@ -333,7 +333,7 @@ RETURNS TABLE (
     status TEXT
 ) AS $$
 DECLARE
-    v_threshold INTEGER := current_setting('app.storage_alert_threshold_percent')::INTEGER;
+    v_threshold INTEGER := COALESCE(current_setting('app.storage_alert_threshold_percent', true)::INTEGER, 85);
 BEGIN
     RETURN QUERY
     SELECT 

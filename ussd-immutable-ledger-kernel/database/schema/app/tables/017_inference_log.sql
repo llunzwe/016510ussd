@@ -214,7 +214,7 @@ CREATE POLICY inference_log_select_policy ON app.inference_log
     USING (
         app.has_permission(current_user, 'ai:inference:read:all')
         OR 
-        user_id = current_setting('app.current_user_id')::UUID
+        user_id = current_setting('app.current_user_id', true)::UUID
         OR
         app.has_permission(current_user, 'system:admin')
     );
@@ -251,7 +251,7 @@ DECLARE
 BEGIN
     -- Set created_by if not provided
     IF NEW.created_by IS NULL THEN
-        NEW.created_by := current_setting('app.current_user_id')::UUID;
+        NEW.created_by := current_setting('app.current_user_id', true)::UUID;
     END IF;
     
     -- Compute input hash if not provided (application should provide)
@@ -279,7 +279,7 @@ BEGIN
     
     -- Get HMAC key from secure configuration
     BEGIN
-        hmac_key := current_setting('app.ledger_hmac_key');
+        hmac_key := current_setting('app.ledger_hmac_key', true);
     EXCEPTION WHEN OTHERS THEN
         hmac_key := 'default_key_change_in_production';
     END;

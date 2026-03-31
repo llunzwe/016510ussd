@@ -22,8 +22,6 @@
  * 
  * CHANGE LOG:
  *   1.0.0 - Initial view creation
- *   TODO: Add real-time metrics aggregation
- *   TODO: Add health score calculation
  * =============================================================================
  */
 
@@ -55,13 +53,10 @@
 -- VIEW: app.v_application_state_derived
 -- =============================================================================
 
--- TODO: Drop existing view if recreating
--- DROP VIEW IF EXISTS app.v_application_state_derived CASCADE;
+DROP VIEW IF EXISTS app.v_application_state_derived CASCADE;
 
 CREATE OR REPLACE VIEW app.v_application_state_derived AS
 
--- TODO: IMPLEMENTATION - Application state aggregation
-/*
 WITH membership_stats AS (
     -- Membership statistics per app
     SELECT 
@@ -71,7 +66,7 @@ WITH membership_stats AS (
         COUNT(*) FILTER (WHERE status = 'pending') as pending_invitations,
         COUNT(*) FILTER (WHERE status = 'suspended') as suspended_memberships,
         COUNT(DISTINCT user_identity_id) as unique_users,
-        COUNT(*) FILTER (WHERE membership_type  -- [RBAC] ISO 27001: Privilege level classification = 'service') as service_accounts
+        COUNT(*) FILTER (WHERE membership_type = 'service') as service_accounts  -- [RBAC] ISO 27001: Privilege level classification
     FROM app.t_account_membership
     GROUP BY app_id
 ),
@@ -93,7 +88,7 @@ assignment_stats AS (
     SELECT 
         am.app_id,
         COUNT(*) as total_assignments,
-        COUNT(*) FILTER (WHERE ra.is_break_glass  -- [RBAC] ISO 27001: Emergency access indicator = TRUE) as break_glass_assignments,
+        COUNT(*) FILTER (WHERE ra.is_break_glass = TRUE) as break_glass_assignments,  -- [RBAC] ISO 27001: Emergency access indicator
         COUNT(*) FILTER (WHERE ra.approval_status = 'pending') as pending_approvals
     FROM app.t_user_role_assignments ra
     INNER JOIN app.t_account_membership am ON ra.membership_id = am.membership_id
@@ -106,24 +101,25 @@ feature_flag_stats AS (
     SELECT 
         app_id,
         COUNT(*) as total_flags,
-        COUNT(*) FILTER (WHERE flag_state  -- [FEATURE_FLAG] ISO 9001: Controlled feature state management = 'on') as enabled_flags,
-        COUNT(*) FILTER (WHERE flag_state  -- [FEATURE_FLAG] ISO 9001: Controlled feature state management = 'gradual') as gradual_rollouts,
-        COUNT(*) FILTER (WHERE flag_state  -- [FEATURE_FLAG] ISO 9001: Controlled feature state management = 'experiment') as experiments,
-        COUNT(*) FILTER (WHERE is_kill_switch  -- [FEATURE_FLAG] ISO 27001: Emergency disable switch = TRUE) as kill_switches
+        COUNT(*) FILTER (WHERE flag_state = 'on') as enabled_flags,  -- [FEATURE_FLAG] ISO 9001: Controlled feature state management
+        COUNT(*) FILTER (WHERE flag_state = 'gradual') as gradual_rollouts,  -- [FEATURE_FLAG] ISO 9001: Controlled feature state management
+        COUNT(*) FILTER (WHERE flag_state = 'experiment') as experiments,  -- [FEATURE_FLAG] ISO 9001: Controlled feature state management
+        COUNT(*) FILTER (WHERE is_kill_switch = TRUE) as kill_switches  -- [FEATURE_FLAG] ISO 27001: Emergency disable switch
     FROM app.t_feature_flags
     GROUP BY app_id
 ),
 
--- TODO: Transaction metrics (requires core ledger tables)
--- transaction_stats AS (
---     SELECT 
---         tenant_id,
---         COUNT(*) as total_transactions,
---         COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') as transactions_24h,
---         SUM(amount) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') as volume_24h
---     FROM core.t_transaction_log
---     GROUP BY tenant_id
--- ),
+-- Transaction metrics (requires core ledger tables)
+transaction_stats AS (
+    SELECT 
+        tenant_id as app_id,
+        COUNT(*) as total_transactions,
+        COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') as transactions_24h,
+        COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') as transactions_7d,
+        COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days') as transactions_30d
+    FROM core.t_transaction_log
+    GROUP BY tenant_id
+),
 
 health_indicators AS (
     -- Calculate health scores based on various factors
@@ -136,19 +132,25 @@ health_indicators AS (
         END as api_health,
         
         CASE 
-            WHEN ms.active_memberships = 0 THEN 'warning'
-            WHEN ms.suspended_memberships > ms.active_memberships THEN 'critical'
+            WHEN COALESCE(ms.active_memberships, 0) = 0 THEN 'warning'
+            WHEN COALESCE(ms.suspended_memberships, 0) > COALESCE(ms.active_memberships, 0) THEN 'critical'
             ELSE 'healthy'
         END as membership_health,
         
         CASE 
-            WHEN asgn.pending_approvals > 10 THEN 'warning'
+            WHEN COALESCE(asgn.pending_approvals, 0) > 10 THEN 'warning'
             ELSE 'healthy'
-        END as approval_health
+        END as approval_health,
+        
+        CASE 
+            WHEN COALESCE(ffs.kill_switches, 0) > 0 THEN 'warning'
+            ELSE 'healthy'
+        END as feature_health
         
     FROM app.t_application_registry ar
     LEFT JOIN membership_stats ms ON ar.app_id = ms.app_id
     LEFT JOIN assignment_stats asgn ON ar.app_id = asgn.app_id
+    LEFT JOIN feature_flag_stats ffs ON ar.app_id = ffs.app_id
 )
 
 SELECT 
@@ -197,20 +199,27 @@ SELECT
     COALESCE(ffs.experiments, 0) as experiments,
     COALESCE(ffs.kill_switches, 0) as kill_switches,
     
+    -- Transaction metrics
+    COALESCE(ts.total_transactions, 0) as total_transactions,
+    COALESCE(ts.transactions_24h, 0) as transactions_24h,
+    COALESCE(ts.transactions_7d, 0) as transactions_7d,
+    COALESCE(ts.transactions_30d, 0) as transactions_30d,
+    
     -- Health indicators
     hi.api_health,
     hi.membership_health,
     hi.approval_health,
+    hi.feature_health,
     
     -- Overall health score
     CASE 
-        WHEN 'critical' IN (hi.api_health, hi.membership_health, hi.approval_health) THEN 'critical'
-        WHEN 'warning' IN (hi.api_health, hi.membership_health, hi.approval_health) THEN 'warning'
+        WHEN 'critical' IN (hi.api_health, hi.membership_health, hi.approval_health, hi.feature_health) THEN 'critical'
+        WHEN 'warning' IN (hi.api_health, hi.membership_health, hi.approval_health, hi.feature_health) THEN 'warning'
         ELSE 'healthy'
     END as overall_health,
     
     -- Ledger information
-    ar.ledger_tenant_id  -- [RLS] ISO 27017: Tenant isolation identifier for RLS,
+    ar.ledger_tenant_id,  -- [RLS] ISO 27017: Tenant isolation identifier for RLS
     ar.last_ledger_sequence,
     
     -- Metadata
@@ -228,53 +237,7 @@ LEFT JOIN role_stats rs ON ar.app_id = rs.app_id
 LEFT JOIN assignment_stats asgn ON ar.app_id = asgn.app_id
 LEFT JOIN feature_flag_stats ffs ON ar.app_id = ffs.app_id
 LEFT JOIN health_indicators hi ON ar.app_id = hi.app_id
-*/
-
--- TODO: PLACEHOLDER - Return empty structure until implemented
-SELECT 
-    NULL::UUID as app_id,
-    NULL::VARCHAR(50) as app_code,
-    NULL::VARCHAR(255) as app_name,
-    NULL::VARCHAR(20) as app_tier,
-    NULL::VARCHAR(20) as app_status,
-    NULL::VARCHAR(50) as app_category,
-    NULL::TIMESTAMPTZ as activated_at,
-    NULL::TIMESTAMPTZ as deprecated_at,
-    NULL::TIMESTAMPTZ as archived_at,
-    NULL::VARCHAR(255) as status_reason,
-    NULL::INTEGER as max_transactions_per_minute,
-    NULL::INTEGER as max_storage_gb,
-    NULL::INTEGER as max_concurrent_sessions,
-    NULL::BIGINT as total_memberships,
-    NULL::BIGINT as active_memberships,
-    NULL::BIGINT as pending_invitations,
-    NULL::BIGINT as suspended_memberships,
-    NULL::BIGINT as unique_users,
-    NULL::BIGINT as service_accounts,
-    NULL::BIGINT as total_roles,
-    NULL::BIGINT as active_roles,
-    NULL::BIGINT as system_roles,
-    NULL::BIGINT as custom_roles,
-    NULL::BIGINT as total_assignments,
-    NULL::BIGINT as break_glass_assignments,
-    NULL::BIGINT as pending_approvals,
-    NULL::BIGINT as total_feature_flags,
-    NULL::BIGINT as enabled_flags,
-    NULL::BIGINT as gradual_rollouts,
-    NULL::BIGINT as experiments,
-    NULL::BIGINT as kill_switches,
-    NULL::TEXT as api_health,
-    NULL::TEXT as membership_health,
-    NULL::TEXT as approval_health,
-    NULL::TEXT as overall_health,
-    NULL::UUID as ledger_tenant_id  -- [RLS] ISO 27017: Tenant isolation identifier for RLS,
-    NULL::BIGINT as last_ledger_sequence,
-    NULL::INTEGER as app_version,
-    NULL::TIMESTAMPTZ as app_created_at,
-    NULL::TIMESTAMPTZ as app_updated_at,
-    NULL::JSONB as metadata,
-    NULL::TIMESTAMPTZ as calculated_at
-WHERE FALSE;  -- Returns no rows until fully implemented
+LEFT JOIN transaction_stats ts ON ar.app_id = ts.app_id;
 
 -- =============================================================================
 -- COMMENTS
@@ -286,27 +249,55 @@ COMMENT ON VIEW app.v_application_state_derived IS
 -- MATERIALIZED VIEW VARIANT
 -- =============================================================================
 
--- TODO: CREATE MATERIALIZED VIEW app.mv_application_state_derived AS ...
+CREATE MATERIALIZED VIEW IF NOT EXISTS app.mv_application_state_derived AS
+SELECT * FROM app.v_application_state_derived;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_app_state_app_id 
+    ON app.mv_application_state_derived(app_id);
+
+CREATE INDEX IF NOT EXISTS idx_mv_app_state_health 
+    ON app.mv_application_state_derived(overall_health);
+
+CREATE INDEX IF NOT EXISTS idx_mv_app_state_status 
+    ON app.mv_application_state_derived(app_status);
 
 -- =============================================================================
 -- HELPER FUNCTION: Get app health score
 -- =============================================================================
 
--- TODO: Function to get numeric health score
+CREATE OR REPLACE FUNCTION app.get_app_health_score(p_app_id UUID)
+RETURNS INTEGER  -- 0-100
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged function execution context
+AS $$
+    SELECT CASE overall_health
+        WHEN 'healthy' THEN 100
+        WHEN 'warning' THEN 50
+        WHEN 'critical' THEN 0
+    END
+    FROM app.v_application_state_derived
+    WHERE app_id = p_app_id;
+$$;
 
--- CREATE OR REPLACE FUNCTION app.get_app_health_score(p_app_id UUID)
--- RETURNS INTEGER  -- 0-100
--- LANGUAGE SQL
--- STABLE
--- AS $$
---     SELECT CASE overall_health
---         WHEN 'healthy' THEN 100
---         WHEN 'warning' THEN 50
---         WHEN 'critical' THEN 0
---     END
---     FROM app.v_application_state_derived
---     WHERE app_id = p_app_id;
--- $$;
+-- =============================================================================
+-- HELPER FUNCTION: Refresh materialized view
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION app.refresh_application_state()
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged function execution context
+AS $$
+BEGIN  -- [TXN] ISO 27001: ACID transaction boundary
+    REFRESH MATERIALIZED VIEW CONCURRENTLY app.mv_application_state_derived;  -- [TXN] ISO 9001: Non-blocking index creation
+    
+    INSERT INTO core.t_audit_log (action, entity_type, entity_id, details, created_at)  -- [AUDIT] ISO 27001 A.8.15: Security event logging
+    VALUES ('mv_refresh', 'materialized_view', NULL,
+        jsonb_build_object('view_name', 'app.mv_application_state_derived', 'refreshed_at', NOW()),
+        NOW());
+END;
+$$;
 
 -- =============================================================================
 -- IMPLEMENTATION NOTES

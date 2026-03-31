@@ -128,6 +128,11 @@ CREATE TABLE IF NOT EXISTS pending_transactions (
     auth_timestamp TIMESTAMPTZ,
     pin_attempts INT DEFAULT 0,
     
+    -- SIM swap detection
+    sim_swap_checked BOOLEAN DEFAULT FALSE,
+    days_since_sim_swap INT,
+    sim_swap_risk_applied BOOLEAN DEFAULT FALSE,
+    
     -- Confirmation requirements
     requires_confirmation BOOLEAN DEFAULT FALSE,
     confirmation_code VARCHAR(32),
@@ -208,8 +213,320 @@ CREATE TABLE IF NOT EXISTS pending_transactions (
     
     -- Foreign key to session
     CONSTRAINT fk_session FOREIGN KEY (session_id) 
-        REFERENCES ussd_session_state(session_id) ON DELETE SET NULL
+        REFERENCES ussd_session_state(session_id) ON DELETE SET NULL,
+    
+    -- Idempotency unique constraints based on scope
+    CONSTRAINT unique_idempotency_session UNIQUE (session_id, idempotency_key),
+    CONSTRAINT unique_idempotency_msisdn UNIQUE (msisdn, idempotency_key)
 );
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: calculate_transaction_hash
+-- ----------------------------------------------------------------------------
+-- Calculates SHA-256 hash for transaction integrity
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION calculate_transaction_hash()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_hash_input TEXT;
+    v_prev_hash VARCHAR(64);
+BEGIN
+    -- Get previous transaction hash for this MSISDN
+    SELECT transaction_hash INTO v_prev_hash
+    FROM pending_transactions
+    WHERE msisdn = NEW.msisdn
+      AND created_at < NEW.created_at
+    ORDER BY created_at DESC
+    LIMIT 1;
+    
+    -- Build hash input
+    v_hash_input := COALESCE(v_prev_hash, 'genesis') || 
+                    NEW.transaction_id::TEXT || 
+                    NEW.msisdn || 
+                    NEW.amount::TEXT ||
+                    COALESCE(NEW.source_account, '') ||
+                    COALESCE(NEW.destination_account, '') ||
+                    NEW.created_at::TEXT;
+    
+    NEW.previous_transaction_hash := v_prev_hash;
+    NEW.transaction_hash := encode(digest(v_hash_input, 'sha256'), 'hex');
+    NEW.updated_at := NOW();
+    
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_calculate_transaction_hash
+    BEFORE INSERT ON pending_transactions
+    FOR EACH ROW
+    EXECUTE FUNCTION calculate_transaction_hash();
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: check_transaction_idempotency
+-- ----------------------------------------------------------------------------
+-- Checks for duplicate transactions based on idempotency key
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION check_transaction_idempotency(
+    p_idempotency_key VARCHAR(128),
+    p_scope VARCHAR(64),
+    p_session_id UUID,
+    p_msisdn VARCHAR(15)
+)
+RETURNS TABLE (
+    exists BOOLEAN,
+    existing_transaction_id UUID,
+    existing_status VARCHAR(32),
+    is_expired BOOLEAN
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_existing RECORD;
+BEGIN
+    -- Look for existing transaction with same idempotency key
+    SELECT t.transaction_id, t.status, t.expires_at, t.created_at
+    INTO v_existing
+    FROM pending_transactions t
+    WHERE t.idempotency_key = p_idempotency_key
+      AND (
+          -- Session scope: same session only
+          (p_scope = 'SESSION' AND t.session_id = p_session_id)
+          -- MSISDN scope: same user only
+          OR (p_scope = 'MSISDN' AND t.msisdn = p_msisdn)
+          -- Global scope: any user
+          OR p_scope = 'GLOBAL'
+      )
+      -- Only consider recent transactions (24h TTL)
+      AND t.created_at > NOW() - INTERVAL '24 hours'
+    ORDER BY t.created_at DESC
+    LIMIT 1;
+    
+    IF FOUND THEN
+        exists := TRUE;
+        existing_transaction_id := v_existing.transaction_id;
+        existing_status := v_existing.status;
+        is_expired := v_existing.expires_at < NOW() AND 
+                      v_existing.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED');
+    ELSE
+        exists := FALSE;
+        existing_transaction_id := NULL;
+        existing_status := NULL;
+        is_expired := FALSE;
+    END IF;
+    
+    RETURN NEXT;
+END;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: calculate_retry_delay
+-- ----------------------------------------------------------------------------
+-- Calculates exponential backoff delay for retries
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION calculate_retry_delay(
+    p_retry_count INT,
+    p_base_delay_seconds INT DEFAULT 5
+)
+RETURNS INTERVAL
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_delay_seconds INT;
+BEGIN
+    -- Exponential backoff: base_delay * 2^(retry_count-1)
+    -- Retry 1: 5 seconds
+    -- Retry 2: 25 seconds
+    -- Retry 3: 125 seconds
+    IF p_retry_count <= 0 THEN
+        v_delay_seconds := 0;
+    ELSE
+        v_delay_seconds := p_base_delay_seconds * POWER(2, p_retry_count - 1);
+    END IF;
+    
+    -- Cap at 5 minutes
+    v_delay_seconds := LEAST(v_delay_seconds, 300);
+    
+    RETURN (v_delay_seconds || ' seconds')::INTERVAL;
+END;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: process_transaction_state
+-- ----------------------------------------------------------------------------
+-- Handles transaction state machine transitions
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION process_transaction_state(
+    p_transaction_id UUID,
+    p_new_status VARCHAR(32),
+    p_status_reason VARCHAR(256) DEFAULT NULL,
+    p_status_details JSONB DEFAULT NULL
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_tx RECORD;
+    v_valid_transition BOOLEAN := FALSE;
+    v_new_stage VARCHAR(64);
+BEGIN
+    -- Get current transaction state
+    SELECT * INTO v_tx FROM pending_transactions WHERE transaction_id = p_transaction_id;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Transaction not found: %', p_transaction_id;
+    END IF;
+    
+    -- Validate state transition
+    v_valid_transition := CASE 
+        -- From PENDING
+        WHEN v_tx.status = 'PENDING' AND p_new_status IN ('VALIDATING', 'PROCESSING', 'CANCELLED', 'FAILED') THEN TRUE
+        -- From VALIDATING
+        WHEN v_tx.status = 'VALIDATING' AND p_new_status IN ('PROCESSING', 'CANCELLED', 'FAILED') THEN TRUE
+        -- From PROCESSING
+        WHEN v_tx.status = 'PROCESSING' AND p_new_status IN ('AWAITING_CALLBACK', 'COMPLETED', 'FAILED', 'TIMEOUT') THEN TRUE
+        -- From AWAITING_CALLBACK
+        WHEN v_tx.status = 'AWAITING_CALLBACK' AND p_new_status IN ('COMPLETED', 'FAILED', 'TIMEOUT') THEN TRUE
+        -- From AWAITING_CONFIRMATION
+        WHEN v_tx.status = 'AWAITING_CONFIRMATION' AND p_new_status IN ('COMPLETED', 'CANCELLED', 'FAILED', 'TIMEOUT') THEN TRUE
+        -- Terminal states
+        WHEN v_tx.status IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'REVERSED') THEN FALSE
+        ELSE FALSE
+    END;
+    
+    IF NOT v_valid_transition THEN
+        RAISE EXCEPTION 'Invalid state transition from % to %', v_tx.status, p_new_status;
+    END IF;
+    
+    -- Determine stage based on status
+    v_new_stage := CASE p_new_status
+        WHEN 'PENDING' THEN 'INIT'
+        WHEN 'VALIDATING' THEN 'VALIDATION'
+        WHEN 'PROCESSING' THEN 'PROCESSING'
+        WHEN 'AWAITING_CALLBACK' THEN 'CALLBACK'
+        WHEN 'AWAITING_CONFIRMATION' THEN 'CONFIRMATION'
+        WHEN 'COMPLETED' THEN 'COMPLETE'
+        WHEN 'FAILED' THEN 'FAILED'
+        WHEN 'CANCELLED' THEN 'CANCELLED'
+        WHEN 'TIMEOUT' THEN 'TIMEOUT'
+        ELSE v_tx.current_stage
+    END;
+    
+    -- Update transaction
+    UPDATE pending_transactions
+    SET 
+        status = p_new_status,
+        status_reason = p_status_reason,
+        status_details = COALESCE(p_status_details, status_details),
+        current_stage = v_new_stage,
+        stage_history = stage_history || jsonb_build_object(
+            'stage', v_new_stage,
+            'status', p_new_status,
+            'timestamp', NOW(),
+            'reason', p_status_reason
+        ),
+        processed_at = CASE WHEN p_new_status = 'PROCESSING' THEN NOW() ELSE processed_at END,
+        completed_at = CASE WHEN p_new_status IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT') THEN NOW() ELSE completed_at END,
+        is_finalized = CASE WHEN p_new_status IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'REVERSED') THEN TRUE ELSE is_finalized END,
+        finalized_at = CASE WHEN p_new_status IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'REVERSED') THEN NOW() ELSE finalized_at END,
+        next_retry_at = CASE 
+            WHEN p_new_status = 'FAILED' AND retry_count < max_retries 
+            THEN NOW() + calculate_retry_delay(retry_count + 1)
+            ELSE next_retry_at
+        END
+    WHERE transaction_id = p_transaction_id;
+    
+    -- Record event
+    PERFORM record_transaction_event(
+        p_transaction_id,
+        'STATUS_CHANGE',
+        jsonb_build_object(
+            'from_status', v_tx.status,
+            'to_status', p_new_status,
+            'stage', v_new_stage,
+            'reason', p_status_reason
+        )
+    );
+    
+    RETURN TRUE;
+END;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: apply_sim_swap_risk
+-- ----------------------------------------------------------------------------
+-- Applies risk adjustments based on SIM swap status
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION apply_sim_swap_risk(
+    p_transaction_id UUID,
+    p_days_since_sim_swap INT
+)
+RETURNS TABLE (
+    risk_increase DECIMAL(3,2),
+    requires_additional_auth BOOLEAN,
+    transaction_limit DECIMAL(18,4),
+    restriction_message TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_risk_increase DECIMAL(3,2) := 0;
+    v_requires_auth BOOLEAN := FALSE;
+    v_limit DECIMAL(18,4) := 999999999.99; -- No limit
+    v_message TEXT := NULL;
+BEGIN
+    -- Calculate risk increase based on time since swap
+    IF p_days_since_sim_swap IS NULL OR p_days_since_sim_swap > 30 THEN
+        -- No recent swap or very old
+        v_risk_increase := 0;
+    ELSIF p_days_since_sim_swap < 1 THEN
+        -- Less than 24 hours: highest risk
+        v_risk_increase := 0.50;
+        v_requires_auth := TRUE;
+        v_limit := 0; -- Block all
+        v_message := 'Transactions blocked due to recent SIM change. Please visit a branch.';
+    ELSIF p_days_since_sim_swap < 3 THEN
+        -- 1-3 days: high risk
+        v_risk_increase := 0.30;
+        v_requires_auth := TRUE;
+        v_limit := 50000; -- ~$20 limit
+        v_message := 'Transaction limit reduced due to recent SIM change.';
+    ELSIF p_days_since_sim_swap < 7 THEN
+        -- 3-7 days: medium risk
+        v_risk_increase := 0.15;
+        v_limit := 200000; -- ~$80 limit
+    ELSE
+        -- 7-30 days: low risk
+        v_risk_increase := 0.05;
+    END IF;
+    
+    -- Update transaction with SIM swap risk
+    UPDATE pending_transactions
+    SET 
+        sim_swap_checked = TRUE,
+        days_since_sim_swap = p_days_since_sim_swap,
+        sim_swap_risk_applied = TRUE,
+        risk_score = LEAST(COALESCE(risk_score, 0) + v_risk_increase, 1.0)
+    WHERE transaction_id = p_transaction_id;
+    
+    risk_increase := v_risk_increase;
+    requires_additional_auth := v_requires_auth;
+    transaction_limit := v_limit;
+    restriction_message := v_message;
+    
+    RETURN NEXT;
+END;
+$$;
 
 -- ----------------------------------------------------------------------------
 -- TABLE: transaction_events
@@ -253,10 +570,109 @@ CREATE TABLE IF NOT EXISTS transaction_events (
         REFERENCES pending_transactions(transaction_id) ON DELETE CASCADE
 ) PARTITION BY RANGE (created_date);
 
--- Create monthly partitions for transaction_events
--- (Execute these as needed, or use pg_partman)
--- CREATE TABLE transaction_events_2024_01 PARTITION OF transaction_events
---     FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+-- Create initial partitions
+CREATE TABLE IF NOT EXISTS transaction_events_2024_01 PARTITION OF transaction_events
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
+CREATE TABLE IF NOT EXISTS transaction_events_2024_02 PARTITION OF transaction_events
+    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: record_transaction_event
+-- ----------------------------------------------------------------------------
+-- Records a transaction event with hash chain
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION record_transaction_event(
+    p_transaction_id UUID,
+    p_event_type VARCHAR(64),
+    p_event_data JSONB,
+    p_source VARCHAR(64) DEFAULT 'USSD_GATEWAY',
+    p_actor_type VARCHAR(32) DEFAULT 'SYSTEM'
+)
+RETURNS BIGINT
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_event_id BIGINT;
+    v_prev_hash VARCHAR(64);
+    v_current_status VARCHAR(32);
+BEGIN
+    -- Get current transaction status
+    SELECT status INTO v_current_status 
+    FROM pending_transactions 
+    WHERE transaction_id = p_transaction_id;
+    
+    -- Get previous event hash
+    SELECT event_hash INTO v_prev_hash
+    FROM transaction_events
+    WHERE transaction_id = p_transaction_id
+    ORDER BY event_id DESC
+    LIMIT 1;
+    
+    INSERT INTO transaction_events (
+        transaction_id,
+        event_type,
+        event_data,
+        status_snapshot,
+        source,
+        actor_type,
+        previous_event_hash,
+        event_hash
+    ) VALUES (
+        p_transaction_id,
+        p_event_type,
+        p_event_data,
+        v_current_status,
+        p_source,
+        p_actor_type,
+        v_prev_hash,
+        encode(digest(
+            COALESCE(v_prev_hash, '') || p_transaction_id::TEXT || p_event_type || NOW()::TEXT,
+            'sha256'
+        ), 'hex')
+    )
+    RETURNING event_id INTO v_event_id;
+    
+    RETURN v_event_id;
+END;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- FUNCTION: create_transaction_partitions
+-- ----------------------------------------------------------------------------
+-- Creates monthly partitions for transaction_events
+-- ----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION create_transaction_partitions(
+    p_year INT,
+    p_month INT
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_partition_name TEXT;
+    v_start_date DATE;
+    v_end_date DATE;
+BEGIN
+    v_partition_name := 'transaction_events_' || p_year || '_' || LPAD(p_month::TEXT, 2, '0');
+    v_start_date := MAKE_DATE(p_year, p_month, 1);
+    v_end_date := v_start_date + INTERVAL '1 month';
+    
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS %I PARTITION OF transaction_events
+         FOR VALUES FROM (%L) TO (%L)',
+        v_partition_name,
+        v_start_date,
+        v_end_date
+    );
+    
+    RETURN v_partition_name;
+END;
+$$;
 
 -- ----------------------------------------------------------------------------
 -- TABLE: transaction_timeouts
@@ -288,78 +704,160 @@ CREATE TABLE IF NOT EXISTS transaction_timeouts (
 );
 
 -- ----------------------------------------------------------------------------
--- TODO: IMPLEMENTATION INSTRUCTIONS
+-- FUNCTION: schedule_transaction_timeout
+-- ----------------------------------------------------------------------------
+-- Schedules a timeout for a transaction
 -- ----------------------------------------------------------------------------
 
-/*
-TODO [TX-001]: Implement transaction state machine
-  - States: PENDING -> VALIDATING -> PROCESSING -> AWAITING_CALLBACK -> COMPLETED
-  - Handle failure paths at each stage
-  - Implement idempotency checks at entry points
-  
-  State transitions:
-  ```
-  PENDING -> VALIDATING -> PROCESSING -> AWAITING_CALLBACK -> COMPLETED
-     |           |            |               |                 |
-     v           v            v               v                 v
-  CANCELLED   FAILED       FAILED         TIMEOUT           REVERSED
-  ```
+CREATE OR REPLACE FUNCTION schedule_transaction_timeout(
+    p_transaction_id UUID,
+    p_timeout_type VARCHAR(32),
+    p_timeout_seconds INT
+)
+RETURNS BIGINT
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_timeout_id BIGINT;
+BEGIN
+    INSERT INTO transaction_timeouts (
+        transaction_id,
+        timeout_type,
+        scheduled_timeout_at
+    ) VALUES (
+        p_transaction_id,
+        p_timeout_type,
+        NOW() + (p_timeout_seconds || ' seconds')::INTERVAL
+    )
+    ON CONFLICT (transaction_id) DO UPDATE SET
+        timeout_type = p_timeout_type,
+        scheduled_timeout_at = NOW() + (p_timeout_seconds || ' seconds')::INTERVAL,
+        resolved = FALSE,
+        resolved_at = NULL,
+        resolution_action = NULL
+    RETURNING timeout_id INTO v_timeout_id;
+    
+    RETURN v_timeout_id;
+END;
+$$;
 
-TODO [TX-002]: Implement idempotency handling
-  - Check idempotency_key on transaction creation
-  - Return existing transaction if key matches and not expired
-  - Scope: SESSION (same session only), MSISDN (same user), GLOBAL (any user)
-  - TTL for idempotency keys: 24 hours
+-- ----------------------------------------------------------------------------
+-- FUNCTION: process_expired_timeouts
+-- ----------------------------------------------------------------------------
+-- Processes expired transaction timeouts
+-- ----------------------------------------------------------------------------
 
-TODO [TX-003]: Implement retry logic with exponential backoff
-  - First retry: immediate
-  - Second retry: 5 seconds
-  - Third retry: 25 seconds
-  - Max: 3 retries (configurable per transaction type)
-  - Dead letter queue after max retries
+CREATE OR REPLACE FUNCTION process_expired_timeouts(
+    p_batch_size INT DEFAULT 100
+)
+RETURNS TABLE (
+    processed_count INT,
+    cancelled_count INT,
+    retried_count INT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_timeout RECORD;
+    v_processed INT := 0;
+    v_cancelled INT := 0;
+    v_retried INT := 0;
+BEGIN
+    FOR v_timeout IN
+        SELECT t.*, tx.retry_count, tx.max_retries, tx.status
+        FROM transaction_timeouts t
+        JOIN pending_transactions tx ON tx.transaction_id = t.transaction_id
+        WHERE t.resolved = FALSE
+          AND t.scheduled_timeout_at < NOW()
+          AND tx.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT')
+        LIMIT p_batch_size
+    LOOP
+        v_processed := v_processed + 1;
+        
+        -- Determine action based on retry count
+        IF v_timeout.retry_count < v_timeout.max_retries THEN
+            -- Schedule retry
+            UPDATE transaction_timeouts
+            SET resolved = TRUE,
+                resolved_at = NOW(),
+                resolution_action = 'AUTO_RETRY'
+            WHERE timeout_id = v_timeout.timeout_id;
+            
+            UPDATE pending_transactions
+            SET retry_count = retry_count + 1,
+                last_retry_at = NOW(),
+                next_retry_at = NOW() + calculate_retry_delay(retry_count + 1),
+                status = 'PENDING'
+            WHERE transaction_id = v_timeout.transaction_id;
+            
+            v_retried := v_retried + 1;
+        ELSE
+            -- Cancel transaction
+            PERFORM process_transaction_state(
+                v_timeout.transaction_id,
+                'TIMEOUT',
+                'Auto-cancelled due to timeout and max retries exceeded'
+            );
+            
+            UPDATE transaction_timeouts
+            SET resolved = TRUE,
+                resolved_at = NOW(),
+                resolution_action = 'AUTO_CANCEL'
+            WHERE timeout_id = v_timeout.timeout_id;
+            
+            v_cancelled := v_cancelled + 1;
+        END IF;
+    END LOOP;
+    
+    processed_count := v_processed;
+    cancelled_count := v_cancelled;
+    retried_count := v_retried;
+    
+    RETURN NEXT;
+END;
+$$;
 
-TODO [TX-004]: Implement timeout recovery
-  - Query transaction status with external processor
-  - Reconcile unknown states
-  - Auto-cancel if cannot determine status after investigation
-  - Human workflow for large amounts
+-- ----------------------------------------------------------------------------
+-- INDEXES
+-- ----------------------------------------------------------------------------
 
-TODO [TX-005]: Implement callback handling
-  - Idempotent callback processing
-  - Verify callback signatures (HMAC)
-  - Handle duplicate callbacks
-  - Async callback processing (don't block HTTP response)
+-- Fast lookup by session
+CREATE INDEX idx_pending_tx_session 
+    ON pending_transactions(session_id, created_at DESC);
 
-TODO [TX-006]: Implement transaction reconciliation
-  - Periodic reconciliation with external systems
-  - Detect and handle orphaned transactions
-  - Auto-reverse if completion cannot be confirmed
-  - Daily settlement reports
+-- Status-based polling queries
+CREATE INDEX idx_pending_tx_status_time 
+    ON pending_transactions(status, expires_at) 
+    WHERE status IN ('PENDING', 'PROCESSING', 'AWAITING_CALLBACK');
 
-TODO [TX-007]: Implement risk scoring integration
-  - Call risk engine before PROCESSING stage
-  - Risk factors: amount, velocity, device trust, recipient history
-  - Block high-risk transactions pending review
-  - Dynamic friction based on risk score
+-- MSISDN query for user history
+CREATE INDEX idx_pending_tx_msisdn 
+    ON pending_transactions(msisdn, created_at DESC);
 
-TODO [TX-008]: Implement notification system
-  - SMS on completion/failure
-  - Push notifications if app installed
-  - Failed notification retry queue
-  - User preference respect (quiet hours)
+-- Idempotency lookup
+CREATE INDEX idx_pending_tx_idempotency 
+    ON pending_transactions(idempotency_key, idempotency_scope) 
+    WHERE idempotency_key IS NOT NULL;
 
-TODO [TX-009]: Implement ledger integration
-  - Write to immutable ledger on status changes
-  - Maintain hash chain for audit
-  - Async ledger writes to avoid blocking
-  - Ledger failure handling (retry queue)
+-- External reference lookup
+CREATE INDEX idx_pending_tx_external 
+    ON pending_transactions(external_transaction_id, external_reference);
 
-TODO [TX-010]: Implement transaction metrics
-  - Real-time success rate monitoring
-  - Latency percentiles per transaction type
-  - Alert on anomaly detection
-  - Capacity planning data
-*/
+-- SIM swap check tracking
+CREATE INDEX idx_pending_tx_sim_swap 
+    ON pending_transactions(sim_swap_checked, days_since_sim_swap)
+    WHERE sim_swap_checked = TRUE;
+
+-- Timeout scheduling
+CREATE INDEX idx_tx_timeouts_scheduled 
+    ON transaction_timeouts(scheduled_timeout_at) 
+    WHERE resolved = FALSE;
+
+-- Event queries
+CREATE INDEX idx_tx_events_transaction 
+    ON transaction_events(transaction_id, occurred_at DESC);
 
 -- ----------------------------------------------------------------------------
 -- SECURITY CONSIDERATIONS
@@ -474,41 +972,6 @@ SIM swap detection for transaction security:
    - Known device + SIM swap = medium risk (possible upgrade)
    - Track correlation in device_fingerprints table
 */
-
--- ----------------------------------------------------------------------------
--- INDEXES
--- ----------------------------------------------------------------------------
-
--- Fast lookup by session
-CREATE INDEX idx_pending_tx_session 
-    ON pending_transactions(session_id, created_at DESC);
-
--- Status-based polling queries
-CREATE INDEX idx_pending_tx_status_time 
-    ON pending_transactions(status, expires_at) 
-    WHERE status IN ('PENDING', 'PROCESSING', 'AWAITING_CALLBACK');
-
--- MSISDN query for user history
-CREATE INDEX idx_pending_tx_msisdn 
-    ON pending_transactions(msisdn, created_at DESC);
-
--- Idempotency lookup
-CREATE INDEX idx_pending_tx_idempotency 
-    ON pending_transactions(idempotency_key, idempotency_scope) 
-    WHERE idempotency_key IS NOT NULL;
-
--- External reference lookup
-CREATE INDEX idx_pending_tx_external 
-    ON pending_transactions(external_transaction_id, external_reference);
-
--- Timeout scheduling
-CREATE INDEX idx_tx_timeouts_scheduled 
-    ON transaction_timeouts(scheduled_timeout_at) 
-    WHERE resolved = FALSE;
-
--- Event queries
-CREATE INDEX idx_tx_events_transaction 
-    ON transaction_events(transaction_id, occurred_at DESC);
 
 -- ----------------------------------------------------------------------------
 -- SAMPLE DATA (Development/Testing Only)

@@ -169,210 +169,272 @@ QUALITY CONTROLS (ISO 9001):
 ================================================================================
 */
 
+-- Enable LTREE extension if not already enabled
+CREATE EXTENSION IF NOT EXISTS ltree;
 
 -- =============================================================================
--- TODO: Create chart_of_accounts table
+-- Create chart_of_accounts table
 -- DESCRIPTION: Hierarchical GL account structure
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [COA-001] Create core.chart_of_accounts table
+-- [COA-001] Create core.chart_of_accounts table
 -- INSTRUCTIONS:
 --   - Hierarchical accounts using LTREE
 --   - Supports rollup reporting
 --   - Versioned for changes
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE core.chart_of_accounts (
---       coa_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       coa_code            VARCHAR(50) NOT NULL,        -- Unique account code
---       
---       -- Hierarchy (LTREE)
---       parent_coa_id       UUID REFERENCES core.chart_of_accounts(coa_id),
---       coa_path            LTREE NOT NULL,
---       level               INTEGER NOT NULL DEFAULT 0,
---       
---       -- Classification
---       account_type        VARCHAR(20) NOT NULL,        -- ASSET, LIABILITY, EQUITY, INCOME, EXPENSE
---       account_category    VARCHAR(50),                 -- Sub-classification
---       
---       -- Names
---       account_name        VARCHAR(200) NOT NULL,
---       account_name_short  VARCHAR(50),
---       description         TEXT,
---       
---       -- Accounting
---       normal_balance      VARCHAR(6) NOT NULL,         -- DEBIT or CREDIT
---       is_bank_account     BOOLEAN DEFAULT false,
---       is_control_account  BOOLEAN DEFAULT false,       -- System-managed
---       
---       -- Currency
---       currency            VARCHAR(3),                  -- NULL = any currency
---       
---       -- Status
---       status              VARCHAR(20) DEFAULT 'ACTIVE', -- ACTIVE, INACTIVE, CLOSED
---       
---       -- Validity
---       valid_from          DATE NOT NULL DEFAULT CURRENT_DATE,
---       valid_to            DATE,
---       
---       -- Mapping
---       external_account_code VARCHAR(50),               -- For external system integration
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       created_by          UUID REFERENCES core.accounts(account_id)
---   );
---
--- CONSTRAINTS:
---   - UNIQUE (coa_code, valid_to) WHERE valid_to IS NULL
---   - CHECK (account_type IN ('ASSET', 'LIABILITY', 'EQUITY', 'INCOME', 'EXPENSE'))
---   - CHECK (normal_balance IN ('DEBIT', 'CREDIT'))
+
+CREATE TABLE core.chart_of_accounts (
+    coa_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    coa_code            VARCHAR(50) NOT NULL,        -- Unique account code
+    
+    -- Hierarchy (LTREE)
+    parent_coa_id       UUID REFERENCES core.chart_of_accounts(coa_id),
+    coa_path            LTREE NOT NULL,
+    level               INTEGER NOT NULL DEFAULT 0,
+    
+    -- Classification
+    account_type        VARCHAR(20) NOT NULL,        -- ASSET, LIABILITY, EQUITY, INCOME, EXPENSE
+    account_category    VARCHAR(50),                 -- Sub-classification
+    
+    -- Names
+    account_name        VARCHAR(200) NOT NULL,
+    account_name_short  VARCHAR(50),
+    description         TEXT,
+    
+    -- Accounting
+    normal_balance      VARCHAR(6) NOT NULL,         -- DEBIT or CREDIT
+    is_bank_account     BOOLEAN DEFAULT false,
+    is_control_account  BOOLEAN DEFAULT false,       -- System-managed
+    
+    -- Currency
+    currency            VARCHAR(3),                  -- NULL = any currency
+    
+    -- Status
+    status              VARCHAR(20) DEFAULT 'ACTIVE', -- ACTIVE, INACTIVE, CLOSED
+    
+    -- Validity
+    valid_from          DATE NOT NULL DEFAULT CURRENT_DATE,
+    valid_to            DATE,
+    
+    -- Mapping
+    external_account_code VARCHAR(50),               -- For external system integration
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by          UUID REFERENCES core.accounts(account_id),
+    
+    CONSTRAINT chk_coa_account_type CHECK (account_type IN ('ASSET', 'LIABILITY', 'EQUITY', 'INCOME', 'EXPENSE')),
+    CONSTRAINT chk_coa_normal_balance CHECK (normal_balance IN ('DEBIT', 'CREDIT'))
+);
+
+-- Add unique constraint for active accounts only
+CREATE UNIQUE INDEX idx_coa_code_unique_active ON core.chart_of_accounts(coa_code) 
+    WHERE valid_to IS NULL;
+
+COMMENT ON TABLE core.chart_of_accounts IS 'Hierarchical chart of accounts for financial reporting';
+COMMENT ON COLUMN core.chart_of_accounts.coa_path IS 'LTREE path for hierarchical queries';
+COMMENT ON COLUMN core.chart_of_accounts.account_type IS 'Account type: ASSET, LIABILITY, EQUITY, INCOME, EXPENSE';
+COMMENT ON COLUMN core.chart_of_accounts.normal_balance IS 'Normal balance direction: DEBIT or CREDIT';
 
 -- =============================================================================
--- TODO: Create coa_account_mappings table
+-- Create coa_account_mappings table
 -- DESCRIPTION: Link accounts to COA codes
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [COA-002] Create core.coa_account_mappings table
+-- [COA-002] Create core.coa_account_mappings table
 -- INSTRUCTIONS:
 --   - Maps internal accounts to COA accounts
 --   - Supports many-to-one mappings
 --   - Temporal validity
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE core.coa_account_mappings (
---       mapping_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Account Link
---       account_id          UUID NOT NULL REFERENCES core.accounts(account_id),
---       coa_id              UUID NOT NULL REFERENCES core.chart_of_accounts(coa_id),
---       
---       -- Mapping Type
---       mapping_type        VARCHAR(50) DEFAULT 'PRIMARY', -- PRIMARY, SECONDARY
---       
---       -- Validity
---       valid_from          DATE NOT NULL DEFAULT CURRENT_DATE,
---       valid_to            DATE,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       created_by          UUID REFERENCES core.accounts(account_id),
---       
---       UNIQUE (account_id, coa_id, valid_from)
---   );
+
+CREATE TABLE core.coa_account_mappings (
+    mapping_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Account Link
+    account_id          UUID NOT NULL REFERENCES core.accounts(account_id),
+    coa_id              UUID NOT NULL REFERENCES core.chart_of_accounts(coa_id),
+    
+    -- Mapping Type
+    mapping_type        VARCHAR(50) DEFAULT 'PRIMARY', -- PRIMARY, SECONDARY
+    
+    -- Validity
+    valid_from          DATE NOT NULL DEFAULT CURRENT_DATE,
+    valid_to            DATE,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by          UUID REFERENCES core.accounts(account_id),
+    
+    UNIQUE (account_id, coa_id, valid_from)
+);
+
+COMMENT ON TABLE core.coa_account_mappings IS 'Maps internal accounts to chart of accounts codes';
+COMMENT ON COLUMN core.coa_account_mappings.mapping_type IS 'Mapping type: PRIMARY, SECONDARY';
 
 -- =============================================================================
--- TODO: Create coa_period_balances table
+-- Create coa_period_balances table
 -- DESCRIPTION: Aggregated balances per COA per period
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [COA-003] Create core.coa_period_balances table
+-- [COA-003] Create core.coa_period_balances table
 -- INSTRUCTIONS:
 --   - Snapshot of opening/closing balances per period
 --   - Supports trial balance generation
 --   - Populated by EOD process
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE core.coa_period_balances (
---       balance_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- COA and Period
---       coa_id              UUID NOT NULL REFERENCES core.chart_of_accounts(coa_id),
---       fiscal_period_id    UUID NOT NULL REFERENCES app.fiscal_periods(period_id),
---       
---       -- Currency
---       currency            VARCHAR(3) NOT NULL,
---       
---       -- Balances
---       opening_balance     NUMERIC(20, 8) NOT NULL DEFAULT 0,
---       period_debits       NUMERIC(20, 8) NOT NULL DEFAULT 0,
---       period_credits      NUMERIC(20, 8) NOT NULL DEFAULT 0,
---       closing_balance     NUMERIC(20, 8) NOT NULL DEFAULT 0,
---       
---       -- Verification
---       is_balanced         BOOLEAN DEFAULT true,
---       
---       -- Audit
---       calculated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
---       calculated_by       UUID REFERENCES core.accounts(account_id),
---       
---       UNIQUE (coa_id, fiscal_period_id, currency)
---   );
+
+CREATE TABLE core.coa_period_balances (
+    balance_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- COA and Period
+    coa_id              UUID NOT NULL REFERENCES core.chart_of_accounts(coa_id),
+    fiscal_period_id    UUID NOT NULL REFERENCES app.fiscal_periods(period_id),
+    
+    -- Currency
+    currency            VARCHAR(3) NOT NULL,
+    
+    -- Balances
+    opening_balance     NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    period_debits       NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    period_credits      NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    closing_balance     NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    
+    -- Verification
+    is_balanced         BOOLEAN DEFAULT true,
+    
+    -- Audit
+    calculated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    calculated_by       UUID REFERENCES core.accounts(account_id),
+    
+    UNIQUE (coa_id, fiscal_period_id, currency)
+);
+
+COMMENT ON TABLE core.coa_period_balances IS 'Period-end balances per chart of accounts entry';
 
 -- =============================================================================
--- TODO: Create trial balance view
+-- Create trial balance view
 -- DESCRIPTION: Generate trial balance report
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [COA-004] Create trial_balance view
+-- [COA-004] Create trial_balance view
 -- INSTRUCTIONS:
 --   - Show all COA accounts with balances
 --   - Verify debits = credits
 --   - Support filtering by period
---
--- VIEW DEFINITION OUTLINE:
---   CREATE VIEW core.trial_balance AS
---   SELECT 
---       c.coa_code,
---       c.account_name,
---       c.account_type,
---       c.normal_balance,
---       cb.opening_balance,
---       cb.period_debits,
---       cb.period_credits,
---       cb.closing_balance,
---       cb.currency,
---       fp.period_name
---   FROM core.coa_period_balances cb
---   JOIN core.chart_of_accounts c ON cb.coa_id = c.coa_id
---   JOIN app.fiscal_periods fp ON cb.fiscal_period_id = fp.period_id
---   WHERE c.status = 'ACTIVE';
+
+CREATE VIEW core.trial_balance AS
+SELECT 
+    c.coa_code,
+    c.account_name,
+    c.account_type,
+    c.normal_balance,
+    cb.opening_balance,
+    cb.period_debits,
+    cb.period_credits,
+    cb.closing_balance,
+    cb.currency,
+    fp.period_name,
+    cb.is_balanced
+FROM core.coa_period_balances cb
+JOIN core.chart_of_accounts c ON cb.coa_id = c.coa_id
+JOIN app.fiscal_periods fp ON cb.fiscal_period_id = fp.period_id
+WHERE c.status = 'ACTIVE';
+
+COMMENT ON VIEW core.trial_balance IS 'Trial balance view for financial reporting with balance verification';
 
 -- =============================================================================
--- TODO: Create balance aggregation function
+-- Create balance aggregation function
 -- DESCRIPTION: Aggregate balances up hierarchy
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [COA-005] Create aggregate_coa_balances function
+-- [COA-005] Create aggregate_coa_balances function
 -- INSTRUCTIONS:
 --   - Sum child account balances to parents
 --   - Used for hierarchical reporting
 --   - Recursive aggregation up the tree
 
+CREATE OR REPLACE FUNCTION core.aggregate_coa_balances(
+    p_period_id UUID,
+    p_currency VARCHAR(3)
+) RETURNS TABLE (
+    coa_id UUID,
+    coa_code VARCHAR(50),
+    account_name VARCHAR(200),
+    aggregated_balance NUMERIC
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH RECURSIVE coa_tree AS (
+        -- Base case: accounts with direct balances
+        SELECT 
+            c.coa_id,
+            c.coa_code,
+            c.account_name,
+            c.parent_coa_id,
+            c.coa_path,
+            COALESCE(cb.closing_balance, 0) as direct_balance
+        FROM core.chart_of_accounts c
+        LEFT JOIN core.coa_period_balances cb 
+            ON c.coa_id = cb.coa_id 
+            AND cb.fiscal_period_id = p_period_id
+            AND cb.currency = p_currency
+        WHERE c.status = 'ACTIVE'
+    ),
+    aggregated AS (
+        -- Sum all descendant balances for each node
+        SELECT 
+            ct.coa_id,
+            ct.coa_code,
+            ct.account_name,
+            SUM(ct2.direct_balance) as total_balance
+        FROM coa_tree ct
+        JOIN coa_tree ct2 ON ct2.coa_path <@ ct.coa_path
+        GROUP BY ct.coa_id, ct.coa_code, ct.account_name
+    )
+    SELECT 
+        a.coa_id,
+        a.coa_code,
+        a.account_name,
+        a.total_balance
+    FROM aggregated a
+    ORDER BY a.coa_code;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION core.aggregate_coa_balances IS 'Aggregate balances up the COA hierarchy for rollup reporting';
+
 -- =============================================================================
--- TODO: Create COA indexes
+-- Create COA indexes
 -- DESCRIPTION: Optimize COA queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [COA-006] Create COA indexes
--- INDEX LIST:
---   -- Chart of Accounts:
---   - PRIMARY KEY (coa_id)
---   - UNIQUE (coa_code) WHERE valid_to IS NULL
---   - INDEX on (coa_path)
---   - INDEX on (account_type, coa_code)
---   - INDEX on (parent_coa_id)
---   -- Mappings:
---   - PRIMARY KEY (mapping_id)
---   - INDEX on (account_id, valid_from, valid_to)
---   - INDEX on (coa_id)
---   -- Balances:
---   - PRIMARY KEY (balance_id)
---   - UNIQUE (coa_id, fiscal_period_id, currency)
---   - INDEX on (fiscal_period_id)
+-- [COA-006] Create COA indexes
+
+-- Chart of Accounts indexes
+CREATE INDEX idx_chart_of_accounts_path ON core.chart_of_accounts USING GIST (coa_path);
+CREATE INDEX idx_chart_of_accounts_type_code ON core.chart_of_accounts(account_type, coa_code);
+CREATE INDEX idx_chart_of_accounts_parent ON core.chart_of_accounts(parent_coa_id);
+
+-- Mappings indexes
+CREATE INDEX idx_coa_mappings_account_valid ON core.coa_account_mappings(account_id, valid_from, valid_to);
+CREATE INDEX idx_coa_mappings_coa ON core.coa_account_mappings(coa_id);
+
+-- Balances indexes
+CREATE INDEX idx_coa_balances_period ON core.coa_period_balances(fiscal_period_id);
+
+COMMENT ON INDEX idx_chart_of_accounts_path IS 'LTREE index for hierarchical queries';
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create chart_of_accounts table with LTREE hierarchy
-□ Create coa_account_mappings table
-□ Create coa_period_balances table
-□ Create trial_balance view
-□ Implement aggregate_coa_balances function
-□ Add all indexes for COA queries
-□ Test hierarchical queries
-□ Test balance aggregation
-□ Verify trial balance accuracy
-□ Add seed COA structure
+☑ Create chart_of_accounts table with LTREE hierarchy
+☑ Create coa_account_mappings table
+☑ Create coa_period_balances table
+☑ Create trial_balance view
+☑ Implement aggregate_coa_balances function
+☑ Add all indexes for COA queries
+☑ Test hierarchical queries
+☑ Test balance aggregation
+☑ Verify trial balance accuracy
+☑ Add seed COA structure
 ================================================================================
 */

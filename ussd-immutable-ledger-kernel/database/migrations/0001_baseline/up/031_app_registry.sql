@@ -170,149 +170,165 @@ TENANCY ISOLATION:
 
 
 -- =============================================================================
--- TODO: Create applications table
+-- IMPLEMENTED: Create applications table
 -- DESCRIPTION: Application registry
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [APP-001] Create app.applications table
--- INSTRUCTIONS:
---   - Append-only table
---   - Status changes create new version rows
---   - Links to owner account
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.applications (
---       application_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       application_code    VARCHAR(50) UNIQUE NOT NULL,
---       
---       -- Identity
---       application_name    VARCHAR(100) NOT NULL,
---       description         TEXT,
---       
---       -- Ownership
---       owner_account_id    UUID REFERENCES core.accounts(account_id),
---       owner_name          VARCHAR(200),
---       
---       -- Configuration
---       base_currency       VARCHAR(3) DEFAULT 'USD',
---       timezone            VARCHAR(50) DEFAULT 'UTC',
---       default_language    VARCHAR(10) DEFAULT 'en',
---       
---       -- Settings JSON
---       settings            JSONB DEFAULT '{}',
---       
---       -- Status
---       status              VARCHAR(20) NOT NULL DEFAULT 'PENDING',
---                           -- PENDING, ACTIVE, SUSPENDED, ARCHIVED
---       status_reason       TEXT,
---       
---       -- Versioning
---       version             INTEGER NOT NULL DEFAULT 1,
---       previous_version_id UUID REFERENCES app.applications(application_id),
---       is_current          BOOLEAN DEFAULT true,
---       
---       -- Validity
---       valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       valid_to            TIMESTAMPTZ,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       created_by          UUID REFERENCES core.accounts(account_id),
---       superseded_by       UUID REFERENCES app.applications(application_id)
---   );
---
+-- [APP-001] Create app.applications table
+CREATE TABLE app.applications (
+    application_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    application_code    VARCHAR(50) NOT NULL,
+    
+    -- Identity
+    application_name    VARCHAR(100) NOT NULL,
+    description         TEXT,
+    
+    -- Ownership
+    owner_account_id    UUID REFERENCES core.accounts(account_id),
+    owner_name          VARCHAR(200),
+    
+    -- Configuration
+    base_currency       VARCHAR(3) DEFAULT 'USD',
+    timezone            VARCHAR(50) DEFAULT 'UTC',
+    default_language    VARCHAR(10) DEFAULT 'en',
+    
+    -- Settings JSON
+    settings            JSONB DEFAULT '{}',
+    
+    -- Status
+    status              VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+                        -- PENDING, ACTIVE, SUSPENDED, ARCHIVED
+    status_reason       TEXT,
+    
+    -- Versioning
+    version             INTEGER NOT NULL DEFAULT 1,
+    previous_version_id UUID REFERENCES app.applications(application_id),
+    is_current          BOOLEAN DEFAULT true,
+    
+    -- Validity
+    valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_to            TIMESTAMPTZ,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by          UUID REFERENCES core.accounts(account_id),
+    superseded_by       UUID REFERENCES app.applications(application_id)
+);
+
 -- CONSTRAINTS:
---   - UNIQUE (application_code) WHERE is_current = true
---   - CHECK (status IN ('PENDING', 'ACTIVE', 'SUSPENDED', 'ARCHIVED'))
+ALTER TABLE app.applications
+    ADD CONSTRAINT chk_applications_status 
+        CHECK (status IN ('PENDING', 'ACTIVE', 'SUSPENDED', 'ARCHIVED'));
+
+CREATE UNIQUE INDEX idx_applications_code_current 
+    ON app.applications (application_code) 
+    WHERE is_current = true;
+
+COMMENT ON TABLE app.applications IS 'Application registry with versioning for multi-tenant isolation';
+COMMENT ON COLUMN app.applications.status IS 'Application status: PENDING, ACTIVE, SUSPENDED, ARCHIVED';
+COMMENT ON COLUMN app.applications.is_current IS 'True if this is the current version of the application record';
 
 -- =============================================================================
--- TODO: Create application_versions view
+-- IMPLEMENTED: Create application_versions view
 -- DESCRIPTION: Convenience view for current applications
 -- PRIORITY: MEDIUM
 -- =============================================================================
--- TODO: [APP-002] Create current_applications view
--- INSTRUCTIONS:
---   - Show only current (non-superseded) applications
---
--- VIEW DEFINITION:
---   CREATE VIEW app.current_applications AS
---   SELECT * FROM app.applications
---   WHERE is_current = true AND valid_to IS NULL;
+-- [APP-002] Create current_applications view
+CREATE VIEW app.current_applications AS
+SELECT * FROM app.applications
+WHERE is_current = true AND valid_to IS NULL;
+
+COMMENT ON VIEW app.current_applications IS 'View showing only current (non-superseded) applications';
 
 -- =============================================================================
--- TODO: Create application lifecycle function
+-- IMPLEMENTED: Create application lifecycle function
 -- DESCRIPTION: Change application status
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [APP-003] Create change_application_status function
--- INSTRUCTIONS:
---   - Create new version row on status change
---   - Link previous version
---   - Update is_current flags
---   - Record audit
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.change_application_status(
---       p_application_id UUID,
---       p_new_status VARCHAR(20),
---       p_reason TEXT,
---       p_changed_by UUID
---   ) RETURNS UUID AS $$
---   DECLARE
---       v_old_app RECORD;
---       v_new_id UUID;
---   BEGIN
---       -- Get current version
---       SELECT * INTO v_old_app 
---       FROM app.applications 
---       WHERE application_id = p_application_id AND is_current = true;
---       
---       -- Create new version
---       INSERT INTO app.applications (
---           application_code, application_name, description,
---           owner_account_id, base_currency, timezone, settings,
---           status, status_reason, version, previous_version_id,
---           is_current, valid_from, created_by
---       ) VALUES (
---           v_old_app.application_code, v_old_app.application_name, v_old_app.description,
---           v_old_app.owner_account_id, v_old_app.base_currency, v_old_app.timezone,
---           v_old_app.settings, p_new_status, p_reason, v_old_app.version + 1,
---           p_application_id, true, now(), p_changed_by
---       )
---       RETURNING application_id INTO v_new_id;
---       
---       -- Mark old version as superseded
---       UPDATE app.applications
---       SET is_current = false, valid_to = now(), superseded_by = v_new_id
---       WHERE application_id = p_application_id;
---       
---       RETURN v_new_id;
---   END;
---   $$ LANGUAGE plpgsql;
+-- [APP-003] Create change_application_status function
+CREATE OR REPLACE FUNCTION app.change_application_status(
+    p_application_id UUID,
+    p_new_status VARCHAR(20),
+    p_reason TEXT,
+    p_changed_by UUID
+) RETURNS UUID AS $$
+DECLARE
+    v_old_app RECORD;
+    v_new_id UUID;
+BEGIN
+    -- Validate status
+    IF p_new_status NOT IN ('PENDING', 'ACTIVE', 'SUSPENDED', 'ARCHIVED') THEN
+        RAISE EXCEPTION 'Invalid status: %', p_new_status 
+            USING HINT = 'Valid statuses are: PENDING, ACTIVE, SUSPENDED, ARCHIVED';
+    END IF;
+    
+    -- Get current version
+    SELECT * INTO v_old_app 
+    FROM app.applications 
+    WHERE application_id = p_application_id AND is_current = true;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Application not found or not current: %', p_application_id;
+    END IF;
+    
+    -- Create new version
+    INSERT INTO app.applications (
+        application_code, application_name, description,
+        owner_account_id, owner_name, base_currency, timezone, default_language, settings,
+        status, status_reason, version, previous_version_id,
+        is_current, valid_from, created_by, created_at
+    ) VALUES (
+        v_old_app.application_code, v_old_app.application_name, v_old_app.description,
+        v_old_app.owner_account_id, v_old_app.owner_name, v_old_app.base_currency, 
+        v_old_app.timezone, v_old_app.default_language, v_old_app.settings,
+        p_new_status, p_reason, v_old_app.version + 1,
+        p_application_id, true, now(), p_changed_by, now()
+    )
+    RETURNING application_id INTO v_new_id;
+    
+    -- Mark old version as superseded
+    UPDATE app.applications
+    SET is_current = false, valid_to = now(), superseded_by = v_new_id
+    WHERE application_id = p_application_id;
+    
+    RETURN v_new_id;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION app.change_application_status IS 'Changes application status by creating a new version record';
 
 -- =============================================================================
--- TODO: Create application indexes
+-- IMPLEMENTED: Create application indexes
 -- DESCRIPTION: Optimize application queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [APP-004] Create application indexes
--- INDEX LIST:
---   - PRIMARY KEY (application_id)
---   - UNIQUE (application_code) WHERE is_current = true
---   - INDEX on (owner_account_id, is_current)
---   - INDEX on (status, is_current)
---   - INDEX on (valid_from, valid_to)
+-- [APP-004] Create application indexes
+-- PRIMARY KEY (application_id) - created with table
+-- UNIQUE (application_code) WHERE is_current = true - created above
+
+CREATE INDEX idx_applications_owner_current 
+    ON app.applications (owner_account_id, is_current);
+
+CREATE INDEX idx_applications_status_current 
+    ON app.applications (status, is_current);
+
+CREATE INDEX idx_applications_validity 
+    ON app.applications (valid_from, valid_to);
+
+CREATE INDEX idx_applications_previous_version 
+    ON app.applications (previous_version_id) 
+    WHERE previous_version_id IS NOT NULL;
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create app.applications table with versioning
-□ Create current_applications view
-□ Implement change_application_status function
-□ Add all indexes for application queries
-□ Test status change workflow
-□ Test versioning behavior
-□ Verify current application uniqueness
-□ Add seed applications
+☑ Create app.applications table with versioning
+☑ Create current_applications view
+☑ Implement change_application_status function
+☑ Add all indexes for application queries
+☐ Test status change workflow
+☐ Test versioning behavior
+☐ Verify current application uniqueness
+☐ Add seed applications
 ================================================================================
 */

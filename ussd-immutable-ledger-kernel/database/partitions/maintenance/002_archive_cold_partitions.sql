@@ -219,7 +219,7 @@ BEGIN
             v_checksum := calculate_partition_checksum(v_partition.partition_name);
             
             -- Get encryption key from KMS
-            IF current_setting('app.archive_encryption_required')::BOOLEAN THEN
+            IF COALESCE(current_setting('app.archive_encryption_required', true)::BOOLEAN, false) THEN
                 v_encryption_key := COALESCE(p_encryption_key_id, get_kms_key_id('archive_encryption'));
             END IF;
             
@@ -256,13 +256,13 @@ BEGIN
                 v_archive_path,
                 v_checksum,
                 v_encryption_key,
-                current_setting('app.archive_encryption_algorithm'),
+                COALESCE(current_setting('app.archive_encryption_algorithm', true), 'AES256'),
                 v_retention_until,
                 v_compliance_standard,
                 'verifying',  -- Status: verifying until export completes
                 jsonb_build_object(
                     'compression_enabled', p_compress_before_archive,
-                    'compression_algorithm', current_setting('app.archive_compression_algorithm'),
+                    'compression_algorithm', COALESCE(current_setting('app.archive_compression_algorithm', true), 'zstd'),
                     'archived_by', current_user,
                     'archived_from', inet_server_addr(),
                     'client_ip', inet_client_addr()

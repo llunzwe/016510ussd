@@ -174,246 +174,243 @@ SECURITY:
 
 
 -- =============================================================================
--- TODO: Create permissions table
+-- IMPLEMENTED: Create permissions table
 -- DESCRIPTION: Catalog of available permissions
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [PERM-001] Create app.permissions table
--- INSTRUCTIONS:
---   - Immutable registry of permissions
---   - Categorized by resource and action
---   - Can be global or application-specific
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.permissions (
---       permission_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       permission_code     VARCHAR(100) NOT NULL,       -- contribution:create
---       
---       -- Structure
---       resource            VARCHAR(50) NOT NULL,        -- contribution, loan, account
---       action              VARCHAR(50) NOT NULL,        -- create, read, update, delete, approve
---       scope               VARCHAR(50),                 -- own, group, all
---       
---       -- Description
---       permission_name     VARCHAR(200) NOT NULL,
---       description         TEXT,
---       
---       -- Scope
---       application_id      UUID REFERENCES app.applications(application_id), -- NULL = global
---       
---       -- Status
---       is_active           BOOLEAN DEFAULT true,
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
---
+-- [PERM-001] Create app.permissions table
+CREATE TABLE app.permissions (
+    permission_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    permission_code     VARCHAR(100) NOT NULL,       -- contribution:create
+    
+    -- Structure
+    resource            VARCHAR(50) NOT NULL,        -- contribution, loan, account
+    action              VARCHAR(50) NOT NULL,        -- create, read, update, delete, approve
+    scope               VARCHAR(50),                 -- own, group, all
+    
+    -- Description
+    permission_name     VARCHAR(200) NOT NULL,
+    description         TEXT,
+    
+    -- Scope
+    application_id      UUID REFERENCES app.applications(application_id), -- NULL = global
+    
+    -- Status
+    is_active           BOOLEAN DEFAULT true,
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- CONSTRAINTS:
---   - UNIQUE (permission_code, application_id)
+CREATE UNIQUE INDEX idx_permissions_code_app 
+    ON app.permissions (permission_code, COALESCE(application_id, '00000000-0000-0000-0000-000000000000'::UUID));
+
+COMMENT ON TABLE app.permissions IS 'Catalog of available permissions for RBAC';
+COMMENT ON COLUMN app.permissions.permission_code IS 'Unique code like contribution:create or loan:approve';
 
 -- =============================================================================
--- TODO: Create roles table
+-- IMPLEMENTED: Create roles table
 -- DESCRIPTION: Role definitions per application
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [PERM-002] Create app.roles table
--- INSTRUCTIONS:
---   - Versioned role definitions
---   - Hierarchical (can inherit from parent role)
---   - Application-specific or global
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.roles (
---       role_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       role_code           VARCHAR(50) NOT NULL,
---       
---       -- Identity
---       role_name           VARCHAR(100) NOT NULL,
---       description         TEXT,
---       
---       -- Hierarchy
---       parent_role_id      UUID REFERENCES app.roles(role_id),
---       role_path           LTREE,
---       
---       -- Scope
---       application_id      UUID REFERENCES app.applications(application_id), -- NULL = global
---       
---       -- Settings
---       is_system_role      BOOLEAN DEFAULT false,       -- Cannot be modified
---       is_default_role     BOOLEAN DEFAULT false,       -- Assigned on enrollment
---       
---       -- Versioning
---       version             INTEGER DEFAULT 1,
---       valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       valid_to            TIMESTAMPTZ,
---       
---       -- Status
---       status              VARCHAR(20) DEFAULT 'ACTIVE', -- ACTIVE, DEPRECATED
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       created_by          UUID REFERENCES core.accounts(account_id)
---   );
---
+-- [PERM-002] Create app.roles table
+CREATE TABLE app.roles (
+    role_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    role_code           VARCHAR(50) NOT NULL,
+    
+    -- Identity
+    role_name           VARCHAR(100) NOT NULL,
+    description         TEXT,
+    
+    -- Hierarchy
+    parent_role_id      UUID REFERENCES app.roles(role_id),
+    role_path           LTREE,
+    
+    -- Scope
+    application_id      UUID REFERENCES app.applications(application_id), -- NULL = global
+    
+    -- Settings
+    is_system_role      BOOLEAN DEFAULT false,       -- Cannot be modified
+    is_default_role     BOOLEAN DEFAULT false,       -- Assigned on enrollment
+    
+    -- Versioning
+    version             INTEGER DEFAULT 1,
+    valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_to            TIMESTAMPTZ,
+    
+    -- Status
+    status              VARCHAR(20) DEFAULT 'ACTIVE', -- ACTIVE, DEPRECATED
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by          UUID REFERENCES core.accounts(account_id)
+);
+
 -- CONSTRAINTS:
---   - UNIQUE (role_code, application_id, valid_to) WHERE valid_to IS NULL
+CREATE UNIQUE INDEX idx_roles_code_app_current 
+    ON app.roles (role_code, COALESCE(application_id, '00000000-0000-0000-0000-000000000000'::UUID)) 
+    WHERE valid_to IS NULL;
+
+COMMENT ON TABLE app.roles IS 'Role definitions with hierarchy support per application';
+COMMENT ON COLUMN app.roles.role_path IS 'LTREE path for hierarchical queries';
 
 -- =============================================================================
--- TODO: Create role_permissions table
+-- IMPLEMENTED: Create role_permissions table
 -- DESCRIPTION: Permission grants per role
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [PERM-003] Create app.role_permissions table
--- INSTRUCTIONS:
---   - Many-to-many between roles and permissions
---   - Versioned
---   - Supports negative permissions (deny)
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.role_permissions (
---       grant_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Links
---       role_id             UUID NOT NULL REFERENCES app.roles(role_id),
---       permission_id       UUID NOT NULL REFERENCES app.permissions(permission_id),
---       
---       -- Grant Type
---       grant_type          VARCHAR(10) DEFAULT 'ALLOW', -- ALLOW, DENY
---       
---       -- Conditions (optional JSON for conditional grants)
---       conditions          JSONB,                       -- { "max_amount": 1000 }
---       
---       -- Validity
---       valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       valid_to            TIMESTAMPTZ,
---       
---       -- Audit
---       granted_by          UUID REFERENCES core.accounts(account_id),
---       granted_at          TIMESTAMPTZ NOT NULL DEFAULT now()
---   );
---
+-- [PERM-003] Create app.role_permissions table
+CREATE TABLE app.role_permissions (
+    grant_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Links
+    role_id             UUID NOT NULL REFERENCES app.roles(role_id),
+    permission_id       UUID NOT NULL REFERENCES app.permissions(permission_id),
+    
+    -- Grant Type
+    grant_type          VARCHAR(10) DEFAULT 'ALLOW', -- ALLOW, DENY
+    
+    -- Conditions (optional JSON for conditional grants)
+    conditions          JSONB,                       -- { "max_amount": 1000 }
+    
+    -- Validity
+    valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_to            TIMESTAMPTZ,
+    
+    -- Audit
+    granted_by          UUID REFERENCES core.accounts(account_id),
+    granted_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- CONSTRAINTS:
---   - UNIQUE (role_id, permission_id, valid_to) WHERE valid_to IS NULL
+CREATE UNIQUE INDEX idx_role_permissions_current 
+    ON app.role_permissions (role_id, permission_id) 
+    WHERE valid_to IS NULL;
+
+COMMENT ON TABLE app.role_permissions IS 'Many-to-many link between roles and permissions with grant types';
 
 -- =============================================================================
--- TODO: Create effective_permissions view
+-- IMPLEMENTED: Create effective_permissions view
 -- DESCRIPTION: Resolved permissions per role
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [PERM-004] Create effective_permissions view
--- INSTRUCTIONS:
---   - Include role hierarchy (inherit from parent)
---   - Resolve conflicts (DENY overrides ALLOW)
---   - Filter to current grants only
---
--- VIEW DEFINITION OUTLINE:
---   CREATE VIEW app.effective_permissions AS
---   WITH RECURSIVE role_tree AS (
---       -- Base case
---       SELECT role_id, role_id as root_role, role_path, 0 as level
---       FROM app.roles WHERE status = 'ACTIVE'
---       
---       UNION ALL
---       
---       -- Recursive case
---       SELECT r.role_id, rt.root_role, r.role_path, rt.level + 1
---       FROM app.roles r
---       JOIN role_tree rt ON r.parent_role_id = rt.role_id
---       WHERE r.status = 'ACTIVE'
---   )
---   SELECT DISTINCT ON (rt.root_role, p.permission_code)
---       rt.root_role as role_id,
---       p.permission_id,
---       p.permission_code,
---       rp.grant_type,
---       rp.conditions
---   FROM role_tree rt
---   JOIN app.role_permissions rp ON rp.role_id = rt.role_id
---   JOIN app.permissions p ON rp.permission_id = p.permission_id
---   WHERE rp.valid_to IS NULL
---     AND p.is_active = true
---   ORDER BY rt.root_role, p.permission_code, rt.level, 
---            CASE rp.grant_type WHEN 'DENY' THEN 0 ELSE 1 END;
+-- [PERM-004] Create effective_permissions view
+CREATE VIEW app.effective_permissions AS
+WITH RECURSIVE role_tree AS (
+    -- Base case
+    SELECT role_id, role_id as root_role, role_path, 0 as level
+    FROM app.roles WHERE status = 'ACTIVE' AND valid_to IS NULL
+    
+    UNION ALL
+    
+    -- Recursive case
+    SELECT r.role_id, rt.root_role, r.role_path, rt.level + 1
+    FROM app.roles r
+    JOIN role_tree rt ON r.parent_role_id = rt.role_id
+    WHERE r.status = 'ACTIVE' AND r.valid_to IS NULL
+)
+SELECT DISTINCT ON (rt.root_role, p.permission_code)
+    rt.root_role as role_id,
+    p.permission_id,
+    p.permission_code,
+    rp.grant_type,
+    rp.conditions
+FROM role_tree rt
+JOIN app.role_permissions rp ON rp.role_id = rt.role_id
+JOIN app.permissions p ON rp.permission_id = p.permission_id
+WHERE rp.valid_to IS NULL
+  AND p.is_active = true
+ORDER BY rt.root_role, p.permission_code, rt.level, 
+         CASE rp.grant_type WHEN 'DENY' THEN 0 ELSE 1 END;
+
+COMMENT ON VIEW app.effective_permissions IS 'Resolved permissions per role including inherited permissions from parent roles';
 
 -- =============================================================================
--- TODO: Create permission check function
+-- IMPLEMENTED: Create permission check function
 -- DESCRIPTION: Check if role has permission
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [PERM-005] Create has_permission function
--- INSTRUCTIONS:
---   - Check effective permissions for role
---   - Validate conditions if present
---   - Return boolean result
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.has_permission(
---       p_role_id UUID,
---       p_permission_code VARCHAR(100),
---       p_context JSONB DEFAULT '{}'
---   ) RETURNS BOOLEAN AS $$
---   DECLARE
---       v_grant RECORD;
---   BEGIN
---       SELECT * INTO v_grant
---       FROM app.effective_permissions
---       WHERE role_id = p_role_id AND permission_code = p_permission_code;
---       
---       IF NOT FOUND THEN
---           RETURN false;
---       END IF;
---       
---       IF v_grant.grant_type = 'DENY' THEN
---           RETURN false;
---       END IF;
---       
---       -- Check conditions if present
---       IF v_grant.conditions IS NOT NULL THEN
---           -- Example: Check max_amount condition
---           IF v_grant.conditions->>'max_amount' IS NOT NULL THEN
---               IF (p_context->>'amount')::numeric > (v_grant.conditions->>'max_amount')::numeric THEN
---                   RETURN false;
---               END IF;
---           END IF;
---       END IF;
---       
---       RETURN true;
---   END;
---   $$ LANGUAGE plpgsql STABLE;
+-- [PERM-005] Create has_permission function
+CREATE OR REPLACE FUNCTION app.has_permission(
+    p_role_id UUID,
+    p_permission_code VARCHAR(100),
+    p_context JSONB DEFAULT '{}'
+) RETURNS BOOLEAN AS $$
+DECLARE
+    v_grant RECORD;
+BEGIN
+    SELECT * INTO v_grant
+    FROM app.effective_permissions
+    WHERE role_id = p_role_id AND permission_code = p_permission_code;
+    
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    
+    IF v_grant.grant_type = 'DENY' THEN
+        RETURN false;
+    END IF;
+    
+    -- Check conditions if present
+    IF v_grant.conditions IS NOT NULL THEN
+        -- Example: Check max_amount condition
+        IF v_grant.conditions->>'max_amount' IS NOT NULL THEN
+            IF (p_context->>'amount')::numeric > (v_grant.conditions->>'max_amount')::numeric THEN
+                RETURN false;
+            END IF;
+        END IF;
+    END IF;
+    
+    RETURN true;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION app.has_permission IS 'Checks if a role has a specific permission, optionally validating conditions';
 
 -- =============================================================================
--- TODO: Create role indexes
+-- IMPLEMENTED: Create role indexes
 -- DESCRIPTION: Optimize role queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [PERM-006] Create role indexes
--- INDEX LIST:
---   -- Permissions:
---   - PRIMARY KEY (permission_id)
---   - UNIQUE (permission_code, application_id)
---   - INDEX on (resource, action)
---   -- Roles:
---   - PRIMARY KEY (role_id)
---   - UNIQUE (role_code, application_id) WHERE valid_to IS NULL
---   - INDEX on (parent_role_id)
---   - INDEX on (application_id, status)
---   -- Role Permissions:
---   - PRIMARY KEY (grant_id)
---   - UNIQUE (role_id, permission_id) WHERE valid_to IS NULL
---   - INDEX on (permission_id)
+-- [PERM-006] Create role indexes
+-- Permissions:
+-- PRIMARY KEY (permission_id) - created with table
+-- UNIQUE (permission_code, application_id) - created above
+
+CREATE INDEX idx_permissions_resource_action 
+    ON app.permissions (resource, action);
+
+-- Roles:
+-- PRIMARY KEY (role_id) - created with table
+-- UNIQUE (role_code, application_id) WHERE valid_to IS NULL - created above
+
+CREATE INDEX idx_roles_parent 
+    ON app.roles (parent_role_id) 
+    WHERE parent_role_id IS NOT NULL;
+
+CREATE INDEX idx_roles_app_status 
+    ON app.roles (application_id, status);
+
+-- Role Permissions:
+-- PRIMARY KEY (grant_id) - created with table
+-- UNIQUE (role_id, permission_id) WHERE valid_to IS NULL - created above
+
+CREATE INDEX idx_role_permissions_permission 
+    ON app.role_permissions (permission_id);
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create permissions table
-□ Create roles table with hierarchy
-□ Create role_permissions table
-□ Create effective_permissions view
-□ Implement has_permission function
-□ Add all indexes for role queries
-□ Test permission inheritance
-□ Test condition evaluation
-□ Verify role versioning
-□ Add seed roles and permissions
+☑ Create permissions table
+☑ Create roles table with hierarchy
+☑ Create role_permissions table
+☑ Create effective_permissions view
+☑ Implement has_permission function
+☑ Add all indexes for role queries
+☐ Test permission inheritance
+☐ Test condition evaluation
+☐ Verify role versioning
+☐ Add seed roles and permissions
 ================================================================================
 */

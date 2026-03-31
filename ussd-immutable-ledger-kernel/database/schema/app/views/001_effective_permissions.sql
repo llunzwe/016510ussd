@@ -19,8 +19,6 @@
  * 
  * CHANGE LOG:
  *   1.0.0 - Initial view creation
- *   TODO: Add permission conflict resolution
- *   TODO: Add permission analytics
  * =============================================================================
  */
 
@@ -52,27 +50,25 @@
 -- VIEW: app.v_effective_permissions
 -- =============================================================================
 
--- TODO: Drop existing view if recreating
--- DROP VIEW IF EXISTS app.v_effective_permissions CASCADE;
+DROP VIEW IF EXISTS app.v_effective_permissions CASCADE;
 
 CREATE OR REPLACE VIEW app.v_effective_permissions AS
 
--- TODO: IMPLEMENTATION - Effective permissions aggregation
-/*
 WITH active_roles AS (
     -- Get all active roles per membership from base view
     SELECT 
         membership_id,
-        role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference,
+        role_id,  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
         role_code,
         inheritance_level,
         direct_permissions,
         resource_scope,
-        is_break_glassignment_type  -- [RBAC] ISO 27001: Assignment classification (direct/inherited/delegated),
+        assignment_type,  -- [RBAC] ISO 27001: Assignment classification (direct/inherited/delegated)
+        is_break_glass,  -- [RBAC] ISO 27001: Emergency access indicator
         -- Priority: break_glass > direct > inherited
         CASE 
-            WHEN is_break_glass  -- [RBAC] ISO 27001: Emergency access indicator THEN 0
-            WHEN assignment_type  -- [RBAC] ISO 27001: Assignment classification (direct/inherited/delegated) = 'direct' THEN 1
+            WHEN is_break_glass THEN 0  -- [RBAC] ISO 27001: Emergency access indicator
+            WHEN assignment_type = 'direct' THEN 1  -- [RBAC] ISO 27001: Assignment classification (direct/inherited/delegated)
             ELSE 2 + inheritance_level
         END as permission_priority
     FROM app.v_current_active_roles
@@ -83,30 +79,33 @@ expanded_permissions AS (
     -- Expand JSON permission arrays into rows
     SELECT 
         ar.membership_id,
-        ar.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference,
+        ar.role_id,  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
         ar.role_code,
         ar.permission_priority,
         ar.resource_scope,
         jsonb_array_elements(ar.direct_permissions) as permission,
-        ar.is_break_glass  -- [RBAC] ISO 27001: Emergency access indicator
+        ar.is_break_glass,  -- [RBAC] ISO 27001: Emergency access indicator
+        ar.assignment_type  -- [RBAC] ISO 27001: Assignment classification (direct/inherited/delegated)
     FROM active_roles ar
     WHERE ar.direct_permissions IS NOT NULL
+      AND jsonb_array_length(ar.direct_permissions) > 0
 ),
 
 permission_details AS (
     -- Extract permission details
     SELECT 
         ep.membership_id,
-        ep.role_id  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference,
+        ep.role_id,  -- [RBAC] ISO 27001 A.9.2.2: Role assignment reference
         ep.role_code,
         ep.permission_priority,
         ep.resource_scope,
-        ep.permission->>'resource' as resource,
-        ep.permission->>'action' as action,
+        COALESCE(ep.permission->>'resource', '*') as resource,
+        COALESCE(ep.permission->>'action', '*') as action,
         ep.permission->>'scope' as permission_scope,
         ep.permission->>'condition' as condition,
-        (ep.permission->>'deny')::BOOLEAN as is_deny,
-        ep.is_break_glass  -- [RBAC] ISO 27001: Emergency access indicator
+        COALESCE((ep.permission->>'deny')::BOOLEAN, FALSE) as is_deny,
+        ep.is_break_glass,  -- [RBAC] ISO 27001: Emergency access indicator
+        ep.assignment_type  -- [RBAC] ISO 27001: Assignment classification (direct/inherited/delegated)
     FROM expanded_permissions ep
 ),
 
@@ -120,13 +119,15 @@ aggregated_permissions AS (
         BOOL_OR(pd.is_deny) as has_deny,
         BOOL_OR(NOT pd.is_deny) as has_allow,
         -- Collect all scopes
-        ARRAY_AGG(DISTINCT pd.permission_scope) FILTER (WHERE NOT pd.is_deny) as allowed_scopes,
+        ARRAY_AGG(DISTINCT pd.permission_scope) FILTER (WHERE pd.permission_scope IS NOT NULL AND NOT pd.is_deny) as allowed_scopes,
         -- Min priority wins
         MIN(pd.permission_priority) as effective_priority,
         -- Collect source roles
         ARRAY_AGG(DISTINCT pd.role_code) as source_roles,
         -- Check if any from break-glass
-        BOOL_OR(pd.is_break_glass  -- [RBAC] ISO 27001: Emergency access indicator) as includes_break_glass
+        BOOL_OR(pd.is_break_glass) as includes_break_glass,  -- [RBAC] ISO 27001: Emergency access indicator
+        -- Collect conditions
+        ARRAY_AGG(DISTINCT pd.condition) FILTER (WHERE pd.condition IS NOT NULL AND NOT pd.is_deny) as conditions
     FROM permission_details pd
     GROUP BY pd.membership_id, pd.resource, pd.action
 )
@@ -135,7 +136,7 @@ SELECT
     ap.membership_id,
     am.user_identity_id,
     am.app_id,
-    ar.app_code,
+    am.app_code,
     
     -- Aggregated permissions as JSONB array
     jsonb_agg(
@@ -147,40 +148,27 @@ SELECT
                 WHEN ap.has_deny AND NOT ap.has_allow THEN FALSE  -- Only deny
                 ELSE ap.has_allow  -- Allow wins or no deny
             END,
-            'scopes', ap.allowed_scopes,
+            'scopes', COALESCE(ap.allowed_scopes, ARRAY[]::TEXT[]),
             'sources', ap.source_roles,
-            'via_break_glass', ap.includes_break_glass
+            'via_break_glass', ap.includes_break_glass,
+            'priority', ap.effective_priority,
+            'conditions', COALESCE(ap.conditions, ARRAY[]::TEXT[])
         )
     ) as permissions,
     
     -- Permission summary
     COUNT(DISTINCT ap.resource || ':' || ap.action) as total_permissions,
-    COUNT(DISTINCT CASE WHEN ap.has_allow THEN ap.resource || ':' || ap.action END) as allowed_count,
-    COUNT(DISTINCT CASE WHEN ap.has_deny THEN ap.resource || ':' || ap.action END) as denied_count,
+    COUNT(DISTINCT CASE WHEN ap.has_allow AND (NOT ap.has_deny OR ap.effective_priority = 0) THEN ap.resource || ':' || ap.action END) as allowed_count,
+    COUNT(DISTINCT CASE WHEN ap.has_deny AND (NOT ap.has_allow OR ap.effective_priority > 0) THEN ap.resource || ':' || ap.action END) as denied_count,
     
     -- Metadata
     NOW() as calculated_at,
-    MAX(ap.effective_priority) as max_role_priority
+    MIN(ap.effective_priority) as max_role_priority  -- Lower number = higher priority
 
 FROM aggregated_permissions ap
 INNER JOIN app.t_account_membership am ON ap.membership_id = am.membership_id
 INNER JOIN app.t_application_registry ar ON am.app_id = ar.app_id
-GROUP BY ap.membership_id, am.user_identity_id, am.app_id, ar.app_code
-*/
-
--- TODO: PLACEHOLDER - Return empty structure until implemented
-SELECT 
-    NULL::UUID as membership_id,
-    NULL::UUID as user_identity_id,
-    NULL::UUID as app_id,
-    NULL::VARCHAR(50) as app_code,
-    NULL::JSONB as permissions,
-    NULL::INTEGER as total_permissions,
-    NULL::INTEGER as allowed_count,
-    NULL::INTEGER as denied_count,
-    NULL::TIMESTAMPTZ as calculated_at,
-    NULL::INTEGER as max_role_priority
-WHERE FALSE;  -- Returns no rows until fully implemented
+GROUP BY ap.membership_id, am.user_identity_id, am.app_id, ar.app_code;
 
 -- =============================================================================
 -- COMMENTS
@@ -192,47 +180,79 @@ COMMENT ON VIEW app.v_effective_permissions IS
 -- HELPER FUNCTION: Check specific permission
 -- =============================================================================
 
--- TODO: Function to check if membership has specific permission
-
--- CREATE OR REPLACE FUNCTION app.has_effective_permission(
---     p_membership_id UUID,
---     p_resource TEXT,
---     p_action TEXT
--- )
--- RETURNS BOOLEAN
--- LANGUAGE SQL
--- STABLE
--- SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged function execution context
--- AS $$
---     SELECT EXISTS (
---         SELECT 1 
---         FROM app.v_effective_permissions ep,
---              jsonb_array_elements(ep.permissions) as perm
---         WHERE ep.membership_id = p_membership_id
---           AND perm->>'resource' = p_resource
---           AND perm->>'action' = p_action
---           AND (perm->>'granted')::BOOLEAN = TRUE
---     );
--- $$;
+CREATE OR REPLACE FUNCTION app.has_effective_permission(
+    p_membership_id UUID,
+    p_resource TEXT,
+    p_action TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged function execution context
+AS $$
+    SELECT EXISTS (
+        SELECT 1 
+        FROM app.v_effective_permissions ep,
+             jsonb_array_elements(ep.permissions) as perm
+        WHERE ep.membership_id = p_membership_id
+          AND perm->>'resource' = p_resource
+          AND perm->>'action' = p_action
+          AND (perm->>'granted')::BOOLEAN = TRUE
+    );
+$$;
 
 -- =============================================================================
 -- HELPER FUNCTION: Get membership permissions
 -- =============================================================================
 
--- TODO: Function to get all permissions for membership
+CREATE OR REPLACE FUNCTION app.get_membership_permissions(
+    p_membership_id UUID
+)
+RETURNS JSONB
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged function execution context
+AS $$
+    SELECT COALESCE(
+        (SELECT permissions 
+         FROM app.v_effective_permissions 
+         WHERE membership_id = p_membership_id),
+        '[]'::JSONB
+    );
+$$;
 
--- CREATE OR REPLACE FUNCTION app.get_membership_permissions(
---     p_membership_id UUID
--- )
--- RETURNS JSONB
--- LANGUAGE SQL
--- STABLE
--- SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged function execution context
--- AS $$
---     SELECT permissions 
---     FROM app.v_effective_permissions 
---     WHERE membership_id = p_membership_id;
--- $$;
+-- =============================================================================
+-- HELPER FUNCTION: Check permission with wildcards
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION app.check_permission(
+    p_membership_id UUID,
+    p_resource TEXT,
+    p_action TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER  -- [RBAC] ISO 27001: Privileged function execution context
+AS $$
+    SELECT EXISTS (
+        SELECT 1 
+        FROM app.v_effective_permissions ep,
+             jsonb_array_elements(ep.permissions) as perm
+        WHERE ep.membership_id = p_membership_id
+          AND (perm->>'granted')::BOOLEAN = TRUE
+          AND (
+              -- Exact match
+              (perm->>'resource' = p_resource AND perm->>'action' = p_action)
+              -- Wildcard resource
+              OR (perm->>'resource' = '*' AND perm->>'action' = p_action)
+              -- Wildcard action
+              OR (perm->>'resource' = p_resource AND perm->>'action' = '*')
+              -- Both wildcards
+              OR (perm->>'resource' = '*' AND perm->>'action' = '*')
+          )
+    );
+$$;
 
 -- =============================================================================
 -- IMPLEMENTATION NOTES

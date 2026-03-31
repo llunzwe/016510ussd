@@ -170,7 +170,7 @@ CREATE POLICY model_registry_select_policy ON app.model_registry
             app.has_permission(current_user, 'ai:models:read')
             OR 
             -- Model owner can always view
-            created_by = current_setting('app.current_user_id')::UUID
+            created_by = current_setting('app.current_user_id', true)::UUID
             OR
             -- Admin override
             app.has_permission(current_user, 'system:admin')
@@ -193,7 +193,7 @@ CREATE POLICY model_registry_update_policy ON app.model_registry
         (
             app.has_permission(current_user, 'ai:models:update')
             OR
-            created_by = current_setting('app.current_user_id')::UUID
+            created_by = current_setting('app.current_user_id', true)::UUID
             OR
             app.has_permission(current_user, 'system:admin')
         )
@@ -229,7 +229,7 @@ BEGIN
     
     -- Auto-update timestamp and user
     NEW.updated_at = CURRENT_TIMESTAMP;
-    NEW.updated_by = current_setting('app.current_user_id')::UUID;
+    NEW.updated_by = current_setting('app.current_user_id', true)::UUID;
     
     -- Validate metadata structure (basic schema validation)
     IF NEW.metadata ? 'parameters' AND 
@@ -244,7 +244,7 @@ BEGIN
     ) VALUES (
         'model_registry', OLD.id, 'UPDATE',
         to_jsonb(OLD), to_jsonb(NEW),
-        current_setting('app.current_user_id')::UUID
+        current_setting('app.current_user_id', true)::UUID
     );
     
     RETURN NEW;
@@ -262,7 +262,7 @@ RETURNS TRIGGER AS $$
 BEGIN
     -- Set created_by if not provided
     IF NEW.created_by IS NULL THEN
-        NEW.created_by := current_setting('app.current_user_id')::UUID;
+        NEW.created_by := current_setting('app.current_user_id', true)::UUID;
     END IF;
     
     -- Log to audit table

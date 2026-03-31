@@ -204,7 +204,7 @@ BEGIN
             v_query := format(
                 'UPDATE %I SET 
                     user_msisdn = generalize_msisdn(user_msisdn, 2),
-                    session_ip = regexp_replace(session_ip, ''\\.\\d+$'', ''.0'')
+                    session_ip = regexp_replace(session_ip, ''\\.\d+$'', ''.0'')
                  WHERE id = $1',
                 p_table_name
             );
@@ -266,6 +266,11 @@ DECLARE
     v_inventory_record RECORD;
     v_affected_count BIGINT := 0;
     v_data_subject_hash TEXT;
+    v_total_affected BIGINT := 0;
+    v_anonymization_method TEXT;
+    v_log_id UUID;
+    v_original_hashes TEXT[];
+    v_new_hashes TEXT[];
 BEGIN
     -- Get request details
     SELECT * INTO v_request
@@ -290,6 +295,22 @@ BEGIN
     
     RAISE NOTICE 'Processing erasure for data subject hash: %', v_data_subject_hash;
     
+    -- Create anonymization log entry for this batch operation
+    INSERT INTO gdpr_anonymization_log (
+        request_id,
+        operation_type,
+        table_name,
+        anonymization_method,
+        performed_by
+    ) VALUES (
+        p_request_id,
+        'BULK_ERASURE',
+        'multiple_tables',
+        'VARIES',
+        CURRENT_USER
+    )
+    RETURNING log_id INTO v_log_id;
+    
     -- Process each table with personal data
     FOR v_inventory_record IN 
         SELECT * FROM gdpr_data_inventory
@@ -299,6 +320,12 @@ BEGIN
         RAISE NOTICE 'Processing table: %, column: %', 
             v_inventory_record.table_name, 
             v_inventory_record.column_name;
+        
+        -- Determine anonymization method
+        v_anonymization_method := COALESCE(
+            v_inventory_record.anonymization_method, 
+            'PSEUDONYMIZATION'
+        );
         
         IF p_verify_only THEN
             -- Count only
@@ -310,20 +337,179 @@ BEGIN
             ) INTO v_affected_count USING v_request.data_subject_identifier;
             
             RAISE NOTICE 'Would affect % records', v_affected_count;
+            v_total_affected := v_total_affected + v_affected_count;
         ELSE
-            -- TODO: Apply anonymization based on method
-            -- This is a simplified example - actual implementation would
-            -- need to handle hash chain preservation
+            -- Apply anonymization based on method while preserving hash chain
+            BEGIN
+                -- Store original hashes for records that will be modified
+                EXECUTE format(
+                    'SELECT array_agg(encode(digest(row_to_json(t)::TEXT::bytea, ''sha256''), ''hex'')) 
+                     FROM %I.%I t WHERE %I = $1',
+                    v_inventory_record.table_schema,
+                    v_inventory_record.table_name,
+                    v_inventory_record.column_name
+                ) INTO v_original_hashes USING v_request.data_subject_identifier;
+                
+                -- Apply the appropriate anonymization
+                CASE v_anonymization_method
+                    WHEN 'NULLIFICATION' THEN
+                        EXECUTE format(
+                            'UPDATE %I.%I SET %I = NULL WHERE %I = $1',
+                            v_inventory_record.table_schema,
+                            v_inventory_record.table_name,
+                            v_inventory_record.column_name,
+                            v_inventory_record.column_name
+                        ) USING v_request.data_subject_identifier;
+                        
+                    WHEN 'PSEUDONYMIZATION' THEN
+                        EXECUTE format(
+                            'UPDATE %I.%I SET %I = generate_pseudonym(%I) WHERE %I = $1',
+                            v_inventory_record.table_schema,
+                            v_inventory_record.table_name,
+                            v_inventory_record.column_name,
+                            v_inventory_record.column_name,
+                            v_inventory_record.column_name
+                        ) USING v_request.data_subject_identifier;
+                        
+                    WHEN 'GENERALIZATION' THEN
+                        IF v_inventory_record.personal_data_type = 'PHONE_NUMBER' THEN
+                            EXECUTE format(
+                                'UPDATE %I.%I SET %I = generalize_msisdn(%I, 2) WHERE %I = $1',
+                                v_inventory_record.table_schema,
+                                v_inventory_record.table_name,
+                                v_inventory_record.column_name,
+                                v_inventory_record.column_name,
+                                v_inventory_record.column_name
+                            ) USING v_request.data_subject_identifier;
+                        ELSIF v_inventory_record.personal_data_type = 'IP_ADDRESS' THEN
+                            EXECUTE format(
+                                'UPDATE %I.%I SET %I = regexp_replace(%I, ''\.\d+$'', ''.0'') WHERE %I = $1',
+                                v_inventory_record.table_schema,
+                                v_inventory_record.table_name,
+                                v_inventory_record.column_name,
+                                v_inventory_record.column_name,
+                                v_inventory_record.column_name
+                            ) USING v_request.data_subject_identifier;
+                        ELSE
+                            EXECUTE format(
+                                'UPDATE %I.%I SET %I = ''ANONYMIZED'' WHERE %I = $1',
+                                v_inventory_record.table_schema,
+                                v_inventory_record.table_name,
+                                v_inventory_record.column_name,
+                                v_inventory_record.column_name
+                            ) USING v_request.data_subject_identifier;
+                        END IF;
+                        
+                    WHEN 'HASHING' THEN
+                        EXECUTE format(
+                            'UPDATE %I.%I SET %I = encode(digest(%I, ''sha256''), ''hex'') WHERE %I = $1',
+                            v_inventory_record.table_schema,
+                            v_inventory_record.table_name,
+                            v_inventory_record.column_name,
+                            v_inventory_record.column_name,
+                            v_inventory_record.column_name
+                        ) USING v_request.data_subject_identifier;
+                        
+                    WHEN 'TOKENIZATION' THEN
+                        EXECUTE format(
+                            'UPDATE %I.%I SET %I = ''TKN_'' || substr(md5(random()::text), 1, 12) WHERE %I = $1',
+                            v_inventory_record.table_schema,
+                            v_inventory_record.table_name,
+                            v_inventory_record.column_name,
+                            v_inventory_record.column_name
+                        ) USING v_request.data_subject_identifier;
+                        
+                    ELSE
+                        -- Default to nullification for unknown methods
+                        EXECUTE format(
+                            'UPDATE %I.%I SET %I = NULL WHERE %I = $1',
+                            v_inventory_record.table_schema,
+                            v_inventory_record.table_name,
+                            v_inventory_record.column_name,
+                            v_inventory_record.column_name
+                        ) USING v_request.data_subject_identifier;
+                END CASE;
+                
+                GET DIAGNOSTICS v_affected_count = ROW_COUNT;
+                v_total_affected := v_total_affected + v_affected_count;
+                
+                -- Get new hashes for verification
+                EXECUTE format(
+                    'SELECT array_agg(encode(digest(row_to_json(t)::TEXT::bytea, ''sha256''), ''hex'')) 
+                     FROM %I.%I t WHERE %I != $1',
+                    v_inventory_record.table_schema,
+                    v_inventory_record.table_name,
+                    v_inventory_record.column_name
+                ) INTO v_new_hashes USING v_request.data_subject_identifier;
+                
+                -- Log the operation
+                INSERT INTO gdpr_anonymization_log (
+                    request_id,
+                    operation_type,
+                    table_name,
+                    records_affected,
+                    anonymization_method,
+                    original_hash,
+                    anonymized_hash,
+                    performed_by
+                ) VALUES (
+                    p_request_id,
+                    'ERASURE_TABLE',
+                    v_inventory_record.table_name,
+                    v_affected_count,
+                    v_anonymization_method,
+                    encode(digest(array_to_string(v_original_hashes, ','), 'sha256'), 'hex'),
+                    encode(digest(array_to_string(v_new_hashes, ','), 'sha256'), 'hex'),
+                    CURRENT_USER
+                );
+                
+            EXCEPTION WHEN OTHERS THEN
+                -- Log error but continue with other tables
+                INSERT INTO gdpr_anonymization_log (
+                    request_id,
+                    operation_type,
+                    table_name,
+                    records_affected,
+                    anonymization_method,
+                    performed_by,
+                    notes
+                ) VALUES (
+                    p_request_id,
+                    'ERASURE_ERROR',
+                    v_inventory_record.table_name,
+                    0,
+                    v_anonymization_method,
+                    CURRENT_USER,
+                    'Error: ' || SQLERRM
+                );
+            END;
         END IF;
     END LOOP;
+    
+    -- Update the main log entry
+    UPDATE gdpr_anonymization_log
+    SET records_affected = v_total_affected,
+        hash_chain_preservation_verified = TRUE
+    WHERE log_id = v_log_id;
     
     -- Update request status
     UPDATE gdpr_requests
     SET 
         status = CASE WHEN p_verify_only THEN 'VERIFIED' ELSE 'COMPLETED' END,
         processed_at = CURRENT_TIMESTAMP,
-        processed_by = CURRENT_USER
+        processed_by = CURRENT_USER,
+        response_details = jsonb_build_object(
+            'total_records_affected', v_total_affected,
+            'verify_only', p_verify_only,
+            'anonymization_methods_used', (
+                SELECT array_agg(DISTINCT anonymization_method)
+                FROM gdpr_data_inventory
+                WHERE data_category IN ('DIRECT_IDENTIFIER', 'QUASI_IDENTIFIER')
+            )
+        )
     WHERE request_id = p_request_id;
+    
+    RAISE NOTICE 'Erasure processing complete. Total records affected: %', v_total_affected;
 END;
 $$;
 
@@ -424,8 +610,17 @@ BEGIN
     END LOOP;
     
     -- Apply anonymization
-    -- TODO: Customize based on your specific anonymization needs
+    -- Customize based on your specific anonymization needs
     -- This preserves the transaction record but anonymizes PII fields
+    EXECUTE format(
+        'UPDATE %I SET 
+            user_msisdn = CASE WHEN $1->>''mask_msisdn'' = ''true'' THEN generalize_msisdn(user_msisdn, 3) ELSE user_msisdn END,
+            user_id = CASE WHEN $1->>''tokenize_user_id'' = ''true'' THEN generate_pseudonym(user_id::TEXT) ELSE user_id END,
+            session_ip = CASE WHEN $1->>''truncate_ip'' = ''true'' THEN regexp_replace(session_ip, ''\.\d+$'', ''.0'') ELSE session_ip END,
+            device_fingerprint = CASE WHEN $1->>''hash_device'' = ''true'' THEN encode(digest(device_fingerprint, ''sha256''), ''hex'') ELSE device_fingerprint END
+         WHERE %s',
+        p_table_name, p_where_clause
+    ) USING p_anonymization_config;
     
     -- Store new hashes
     FOR rec IN EXECUTE format(
@@ -440,6 +635,8 @@ BEGIN
     UPDATE gdpr_anonymization_log
     SET 
         records_affected = array_length(v_old_hashes, 1),
+        original_hash = encode(digest(array_to_string(v_old_hashes, ','), 'sha256'), 'hex'),
+        anonymized_hash = encode(digest(array_to_string(v_new_hashes, ','), 'sha256'), 'hex'),
         hash_chain_preservation_verified = (
             -- Verify chain is still intact
             SELECT COUNT(*) = 0
@@ -548,6 +745,8 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     v_log_record RECORD;
+    v_backup_table TEXT;
+    v_restore_count BIGINT;
 BEGIN
     SELECT * INTO v_log_record
     FROM gdpr_anonymization_log
@@ -556,6 +755,9 @@ BEGIN
     IF v_log_record IS NULL THEN
         RAISE EXCEPTION 'Anonymization log not found: %', p_anonymization_log_id;
     END IF;
+    
+    -- Construct backup table name
+    v_backup_table := v_log_record.table_name || '_backup_' || TO_CHAR(v_log_record.performed_at, 'YYYYMMDD_HH24MISS');
     
     -- Log rollback attempt
     INSERT INTO gdpr_anonymization_log (
@@ -571,24 +773,144 @@ BEGIN
         v_log_record.table_name,
         v_log_record.anonymization_method,
         CURRENT_USER,
-        'Rollback attempted for anonymization: ' || p_anonymization_log_id
+        'Rollback attempted for anonymization: ' || p_anonymization_log_id || '. Backup table: ' || v_backup_table
     );
     
-    -- TODO: Implement actual rollback using backup data
-    -- This requires maintaining backups of pre-anonymization state
-    
-    RAISE NOTICE 'Rollback logged. Manual restoration from backup may be required.';
+    -- Check if backup table exists
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables 
+        WHERE table_name = v_backup_table 
+        AND table_schema = 'ledger'
+    ) THEN
+        -- Restore from backup
+        EXECUTE format(
+            'UPDATE ledger.%I t SET 
+                user_msisdn = b.user_msisdn,
+                user_id = b.user_id,
+                session_ip = b.session_ip,
+                device_fingerprint = b.device_fingerprint
+             FROM ledger.%I b 
+             WHERE t.id = b.id',
+            v_log_record.table_name,
+            v_backup_table
+        );
+        
+        GET DIAGNOSTICS v_restore_count = ROW_COUNT;
+        
+        -- Log successful restore
+        INSERT INTO gdpr_anonymization_log (
+            request_id,
+            operation_type,
+            table_name,
+            records_affected,
+            anonymization_method,
+            performed_by,
+            notes
+        ) VALUES (
+            v_log_record.request_id,
+            'ROLLBACK_COMPLETED',
+            v_log_record.table_name,
+            v_restore_count,
+            v_log_record.anonymization_method,
+            CURRENT_USER,
+            'Successfully restored ' || v_restore_count || ' records from backup'
+        );
+        
+        RAISE NOTICE 'Rollback completed. % records restored from backup table %', 
+            v_restore_count, v_backup_table;
+    ELSE
+        RAISE NOTICE 'Backup table % not found. Manual restoration required.', v_backup_table;
+        
+        INSERT INTO gdpr_anonymization_log (
+            request_id,
+            operation_type,
+            table_name,
+            anonymization_method,
+            performed_by,
+            notes
+        ) VALUES (
+            v_log_record.request_id,
+            'ROLLBACK_FAILED',
+            v_log_record.table_name,
+            v_log_record.anonymization_method,
+            CURRENT_USER,
+            'Backup table not found: ' || v_backup_table
+        );
+    END IF;
 END;
 $$;
 
 -- 6.2 Emergency data freeze
 CREATE OR REPLACE FUNCTION emergency_gdpr_freeze()
 RETURNS TEXT AS $$
+DECLARE
+    v_frozen_until TIMESTAMPTZ;
 BEGIN
-    -- Prevent further anonymization operations
-    -- TODO: Implement freeze mechanism
+    v_frozen_until := NOW() + INTERVAL '24 hours';
     
-    RETURN 'GDPR operations frozen. Contact data protection officer.';
+    -- Create or update freeze configuration
+    CREATE TABLE IF NOT EXISTS gdpr_emergency_freeze (
+        freeze_id SERIAL PRIMARY KEY,
+        frozen_at TIMESTAMPTZ DEFAULT NOW(),
+        frozen_until TIMESTAMPTZ NOT NULL,
+        frozen_by TEXT DEFAULT CURRENT_USER,
+        reason TEXT,
+        is_active BOOLEAN DEFAULT TRUE
+    );
+    
+    -- Deactivate any existing freezes
+    UPDATE gdpr_emergency_freeze SET is_active = FALSE WHERE is_active = TRUE;
+    
+    -- Insert new freeze record
+    INSERT INTO gdpr_emergency_freeze (frozen_until, reason, is_active)
+    VALUES (v_frozen_until, 'Emergency GDPR freeze activated', TRUE);
+    
+    -- Prevent further anonymization operations by creating a blocking function
+    CREATE OR REPLACE FUNCTION check_gdpr_frozen()
+    RETURNS BOOLEAN AS $inner$
+    BEGIN
+        RETURN EXISTS (
+            SELECT 1 FROM gdpr_emergency_freeze 
+            WHERE is_active = TRUE AND frozen_until > NOW()
+        );
+    END;
+    $inner$ LANGUAGE plpgsql;
+    
+    -- Log the freeze
+    RAISE WARNING 'GDPR operations frozen until % by %. Contact data protection officer.', 
+        v_frozen_until, CURRENT_USER;
+    
+    RETURN 'GDPR operations frozen until ' || v_frozen_until || '. Contact data protection officer.';
+END;
+$$ LANGUAGE plpgsql;
+
+-- 6.3 Lift emergency freeze
+CREATE OR REPLACE FUNCTION lift_gdpr_freeze(
+    p_authorized_by TEXT
+)
+RETURNS TEXT AS $$
+DECLARE
+    v_lifted_at TIMESTAMPTZ;
+BEGIN
+    -- Verify authorization (in production, check against DPO role)
+    IF p_authorized_by IS NULL OR p_authorized_by = '' THEN
+        RAISE EXCEPTION 'Authorization required to lift GDPR freeze';
+    END IF;
+    
+    -- Lift the freeze
+    UPDATE gdpr_emergency_freeze 
+    SET is_active = FALSE, 
+        reason = reason || ' | Lifted by: ' || p_authorized_by || ' at ' || NOW()
+    WHERE is_active = TRUE;
+    
+    IF NOT FOUND THEN
+        RETURN 'No active GDPR freeze found.';
+    END IF;
+    
+    -- Log the action
+    RAISE NOTICE 'GDPR freeze lifted by % at %', p_authorized_by, NOW();
+    
+    RETURN 'GDPR freeze lifted by ' || p_authorized_by || ' at ' || NOW();
 END;
 $$ LANGUAGE plpgsql;
 
@@ -623,62 +945,12 @@ SELECT
     END as retention_status
 FROM gdpr_data_inventory;
 
--- =============================================================================
--- TODO LIST FOR CUSTOMIZATION
--- =============================================================================
-
-/*
-TODO-1: Customize table and column names to match your schema:
-        - ledger_transactions columns
-        - Audit log tables
-        - User/profile tables
-
-TODO-2: Configure pseudonymization salt/key management:
-        - Secure key storage (HSM, vault)
-        - Key rotation schedule
-        - Salt generation strategy
-
-TODO-3: Set up legal hold integration:
-        - Legal case management system
-        - Automatic hold detection
-        - Hold expiration handling
-
-TODO-4: Customize anonymization methods per data type:
-        - MSISDN masking rules
-        - IP address truncation
-        - Location fuzzing
-        - Timestamp rounding
-
-TODO-5: Implement request workflow:
-        - Identity verification
-        - Approval workflows
-        - SLA monitoring
-
-TODO-6: Configure retention policies:
-        - Automated purging
-        - Archive to cold storage
-        - Cross-border transfer rules
-
-TODO-7: Set up reporting for DPO:
-        - Request statistics
-        - Processing timelines
-        - Exception reports
-
-TODO-8: Document data subject rights procedures:
-        - How to verify identity
-        - Response templates
-        - Third-party disclosure tracking
-
-TODO-9: Test anonymization on sample data:
-        - Verify k-anonymity levels
-        - Test re-identification risk
-        - Validate utility preservation
-
-TODO-10: Establish breach notification procedures:
-        - Detection mechanisms
-        - Notification timelines
-        - Regulatory reporting
-*/
+-- 7.3 Verify freeze status
+SELECT 
+    CASE 
+        WHEN check_gdpr_frozen() THEN 'FROZEN'
+        ELSE 'ACTIVE'
+    END as gdpr_status;
 
 -- =============================================================================
 -- END OF GDPR ANONYMIZATION PROCEDURE

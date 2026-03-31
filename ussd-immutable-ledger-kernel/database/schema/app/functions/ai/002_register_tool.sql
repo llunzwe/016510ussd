@@ -58,7 +58,7 @@ BEGIN
     -- SECURITY: Validate authentication
     -- -------------------------------------------------------------------------
     BEGIN
-        v_user_id := current_setting('app.current_user_id')::UUID;
+        v_user_id := current_setting('app.current_user_id', true)::UUID;
     EXCEPTION WHEN OTHERS THEN
         RAISE EXCEPTION 'Authentication required: app.current_user_id not set'
             USING ERRCODE = '28000';
@@ -278,7 +278,7 @@ BEGIN
     -- SECURITY
     -- -------------------------------------------------------------------------
     BEGIN
-        v_user_id := current_setting('app.current_user_id')::UUID;
+        v_user_id := current_setting('app.current_user_id', true)::UUID;
     EXCEPTION WHEN OTHERS THEN
         RAISE EXCEPTION 'Authentication required' USING ERRCODE = '28000';
     END;

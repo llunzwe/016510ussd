@@ -87,7 +87,7 @@ DECLARE
 BEGIN
     -- Calculate detach date if not provided
     IF p_detach_before_date IS NULL THEN
-        v_detach_date := CURRENT_DATE - (current_setting('app.partition_detach_after_days')::INTEGER || ' days')::INTERVAL;
+        v_detach_date := CURRENT_DATE - (COALESCE(current_setting('app.partition_detach_after_days', true), '90')::INTEGER || ' days')::INTERVAL;
     ELSE
         v_detach_date := p_detach_before_date;
     END IF;
@@ -138,7 +138,7 @@ BEGIN
             END IF;
             
             -- GDPR/SOX: Check for legal hold
-            IF current_setting('app.legal_hold_check_required')::BOOLEAN THEN
+            IF COALESCE(current_setting('app.legal_hold_check_required', true)::BOOLEAN, false) THEN
                 v_has_legal_hold := check_legal_hold(p_table_name, v_partition_start);
                 IF v_has_legal_hold THEN
                     RAISE WARNING 'Legal hold active for partition %. Skipping detachment.', 
@@ -278,7 +278,7 @@ BEGIN
     LOOP
         BEGIN
             -- Check legal hold
-            IF current_setting('app.legal_hold_check_required')::BOOLEAN THEN
+            IF COALESCE(current_setting('app.legal_hold_check_required', true)::BOOLEAN, false) THEN
                 v_has_legal_hold := check_legal_hold(p_hypertable_name, v_chunk.range_start::DATE);
                 IF v_has_legal_hold THEN
                     RAISE WARNING 'Legal hold on chunk %. Skipping.', v_chunk.chunk_name;

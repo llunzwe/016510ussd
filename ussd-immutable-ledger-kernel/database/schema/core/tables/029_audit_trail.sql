@@ -128,60 +128,83 @@ MONITORING:
 */
 
 -- -----------------------------------------------------------------------------
--- TABLE STRUCTURE (Reference)
+-- CREATE TABLE: audit_trail (partitioned)
 -- -----------------------------------------------------------------------------
-/*
-CREATE TABLE ussd_core.audit_trail (
+CREATE TABLE core.audit_trail (
     -- Primary identifier
     audit_id BIGSERIAL,
+    audit_reference VARCHAR(100) UNIQUE NOT NULL,
     
     -- Audit classification
     audit_category VARCHAR(50) NOT NULL
-        CHECK (audit_category IN ('DATA_ACCESS', 'DATA_CHANGE', 'SECURITY', 'ADMIN', 'SYSTEM')),
+        CHECK (audit_category IN ('DATA_ACCESS', 'DATA_CHANGE', 'SECURITY', 'ADMIN', 'SYSTEM', 'COMPLIANCE')),
     audit_level VARCHAR(20) NOT NULL
         CHECK (audit_level IN ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')),
     audit_event VARCHAR(100) NOT NULL,
+    audit_description TEXT,
     
     -- Actor information
     actor_account_id UUID,
-    actor_type VARCHAR(50),  -- 'USER', 'SYSTEM', 'API', 'BATCH'
+    actor_type VARCHAR(50) DEFAULT 'USER',  -- 'USER', 'SYSTEM', 'API', 'BATCH', 'SERVICE'
+    actor_name VARCHAR(255),
     session_id TEXT,
+    api_key_id UUID,
     
     -- Action details
-    action VARCHAR(50) NOT NULL,  -- 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'LOGIN', etc.
-    action_status VARCHAR(20) NOT NULL,  -- 'SUCCESS', 'FAILURE', 'DENIED'
+    action VARCHAR(50) NOT NULL,  -- 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'LOGIN', 'LOGOUT', etc.
+    action_status VARCHAR(20) NOT NULL  -- 'SUCCESS', 'FAILURE', 'DENIED', 'PENDING'
+        CHECK (action_status IN ('SUCCESS', 'FAILURE', 'DENIED', 'PENDING')),
+    action_result TEXT,
     
     -- Target object
     table_schema VARCHAR(50),
     table_name VARCHAR(100),
     record_id TEXT,
+    record_type VARCHAR(50),
     
-    -- Change data
+    -- Change data (for DATA_CHANGE category)
     old_data JSONB,
     new_data JSONB,
     change_summary TEXT,
+    changed_fields TEXT[],
     
     -- Context
     application_id UUID,
     transaction_id UUID,
     correlation_id UUID,
+    request_id TEXT,
+    workflow_id UUID,
     
     -- Client information
     client_ip INET,
+    client_ip_country VARCHAR(2),
     user_agent TEXT,
-    request_id TEXT,
+    device_fingerprint VARCHAR(64),
+    geolocation JSONB,
     
     -- Query information
     query_text TEXT,
+    query_hash VARCHAR(64),
     row_count INTEGER,
     execution_time_ms INTEGER,
     
-    -- Integrity
-    record_hash VARCHAR(64) NOT NULL,
+    -- Error information
+    error_code VARCHAR(50),
+    error_message TEXT,
+    stack_trace TEXT,
+    
+    -- Integrity (hash chain)
+    record_hash VARCHAR(64) NOT NULL DEFAULT 'PENDING',
     previous_audit_hash VARCHAR(64),  -- For hash chain
+    chain_verified BOOLEAN DEFAULT FALSE,
+    
+    -- Retention
+    retention_class VARCHAR(20) DEFAULT 'STANDARD'  -- 'SHORT', 'STANDARD', 'LONG', 'PERMANENT'
+        CHECK (retention_class IN ('SHORT', 'STANDARD', 'LONG', 'PERMANENT')),
+    purge_after_date DATE,
     
     -- Timing
-    created_at TIMESTAMPTZ NOT NULL DEFAULT ussd_core.precise_now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT core.precise_now(),
     
     -- Partition key
     partition_date DATE NOT NULL DEFAULT CURRENT_DATE,
@@ -189,7 +212,412 @@ CREATE TABLE ussd_core.audit_trail (
     -- Constraints
     PRIMARY KEY (audit_id, partition_date)
 ) PARTITION BY RANGE (partition_date);
-*/
+
+-- -----------------------------------------------------------------------------
+-- CREATE INITIAL PARTITION
+-- -----------------------------------------------------------------------------
+CREATE TABLE core.audit_trail_2024_01 
+    PARTITION OF core.audit_trail
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
+CREATE TABLE core.audit_trail_2024_02 
+    PARTITION OF core.audit_trail
+    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+
+CREATE TABLE core.audit_trail_2024_03 
+    PARTITION OF core.audit_trail
+    FOR VALUES FROM ('2024-03-01') TO ('2024-04-01');
+
+-- Default partition for overflow
+CREATE TABLE core.audit_trail_default 
+    PARTITION OF core.audit_trail
+    DEFAULT;
+
+-- -----------------------------------------------------------------------------
+-- INDEXES
+-- -----------------------------------------------------------------------------
+-- Time-based queries
+CREATE INDEX idx_audit_trail_time 
+    ON core.audit_trail(created_at DESC);
+
+-- Category and level filtering
+CREATE INDEX idx_audit_trail_category_level 
+    ON core.audit_trail(audit_category, audit_level, created_at DESC);
+
+-- Event type queries
+CREATE INDEX idx_audit_trail_event 
+    ON core.audit_trail(audit_event, created_at DESC);
+
+-- Actor tracking
+CREATE INDEX idx_audit_trail_actor 
+    ON core.audit_trail(actor_account_id, created_at DESC) 
+    WHERE actor_account_id IS NOT NULL;
+
+-- Table change tracking
+CREATE INDEX idx_audit_trail_table 
+    ON core.audit_trail(table_schema, table_name, created_at DESC) 
+    WHERE table_name IS NOT NULL;
+
+-- Record-specific history
+CREATE INDEX idx_audit_trail_record 
+    ON core.audit_trail(record_id, table_name, created_at DESC) 
+    WHERE record_id IS NOT NULL;
+
+-- Transaction correlation
+CREATE INDEX idx_audit_trail_transaction 
+    ON core.audit_trail(transaction_id, created_at DESC) 
+    WHERE transaction_id IS NOT NULL;
+
+-- Correlation tracking
+CREATE INDEX idx_audit_trail_correlation 
+    ON core.audit_trail(correlation_id, created_at DESC) 
+    WHERE correlation_id IS NOT NULL;
+
+-- Security event monitoring
+CREATE INDEX idx_audit_trail_security 
+    ON core.audit_trail(audit_category, action_status, created_at DESC) 
+    WHERE audit_category = 'SECURITY';
+
+-- Error tracking
+CREATE INDEX idx_audit_trail_errors 
+    ON core.audit_trail(audit_level, created_at DESC) 
+    WHERE audit_level IN ('ERROR', 'CRITICAL');
+
+-- IP tracking (security)
+CREATE INDEX idx_audit_trail_ip 
+    ON core.audit_trail(client_ip, created_at DESC) 
+    WHERE client_ip IS NOT NULL;
+
+-- Session tracking
+CREATE INDEX idx_audit_trail_session 
+    ON core.audit_trail(session_id, created_at DESC) 
+    WHERE session_id IS NOT NULL;
+
+-- Retention management
+CREATE INDEX idx_audit_trail_retention 
+    ON core.audit_trail(purge_after_date) 
+    WHERE purge_after_date IS NOT NULL;
+
+-- -----------------------------------------------------------------------------
+-- IMMUTABILITY TRIGGERS
+-- -----------------------------------------------------------------------------
+CREATE TRIGGER trg_audit_trail_prevent_update
+    BEFORE UPDATE ON core.audit_trail
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_update();
+
+CREATE TRIGGER trg_audit_trail_prevent_delete
+    BEFORE DELETE ON core.audit_trail
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_delete();
+
+-- -----------------------------------------------------------------------------
+-- HASH COMPUTATION AND CHAIN TRIGGER
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION core.compute_audit_hash()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_previous_hash VARCHAR(64);
+BEGIN
+    -- Get previous audit hash for chain
+    SELECT record_hash INTO v_previous_hash
+    FROM core.audit_trail
+    ORDER BY created_at DESC, audit_id DESC
+    LIMIT 1;
+    
+    NEW.previous_audit_hash := v_previous_hash;
+    
+    -- Compute record hash
+    NEW.record_hash := core.generate_hash(
+        COALESCE(NEW.audit_id::TEXT, '') || 
+        NEW.audit_reference || 
+        NEW.audit_category ||
+        NEW.audit_level ||
+        NEW.audit_event ||
+        COALESCE(NEW.actor_account_id::TEXT, '') ||
+        NEW.action ||
+        NEW.action_status ||
+        COALESCE(NEW.table_name, '') ||
+        COALESCE(NEW.record_id, '') ||
+        COALESCE(NEW.old_data::TEXT, '') ||
+        COALESCE(NEW.new_data::TEXT, '') ||
+        NEW.created_at::TEXT ||
+        COALESCE(v_previous_hash, '')
+    );
+    
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_audit_trail_compute_hash
+    BEFORE INSERT ON core.audit_trail
+    FOR EACH ROW
+    EXECUTE FUNCTION core.compute_audit_hash();
+
+-- -----------------------------------------------------------------------------
+-- HELPER FUNCTIONS
+-- -----------------------------------------------------------------------------
+
+-- Function to log an audit event
+CREATE OR REPLACE FUNCTION core.log_audit_event(
+    p_audit_category VARCHAR(50),
+    p_audit_level VARCHAR(20),
+    p_audit_event VARCHAR(100),
+    p_action VARCHAR(50),
+    p_action_status VARCHAR(20),
+    p_actor_account_id UUID DEFAULT NULL,
+    p_actor_type VARCHAR(50) DEFAULT 'SYSTEM',
+    p_table_schema VARCHAR(50) DEFAULT NULL,
+    p_table_name VARCHAR(100) DEFAULT NULL,
+    p_record_id TEXT DEFAULT NULL,
+    p_old_data JSONB DEFAULT NULL,
+    p_new_data JSONB DEFAULT NULL,
+    p_application_id UUID DEFAULT NULL,
+    p_transaction_id UUID DEFAULT NULL,
+    p_correlation_id UUID DEFAULT NULL,
+    p_client_ip INET DEFAULT NULL,
+    p_user_agent TEXT DEFAULT NULL,
+    p_error_message TEXT DEFAULT NULL
+)
+RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_audit_id BIGINT;
+    v_reference VARCHAR(100);
+    v_retention_class VARCHAR(20);
+    v_purge_date DATE;
+BEGIN
+    -- Determine retention based on level and category
+    v_retention_class := CASE 
+        WHEN p_audit_level = 'CRITICAL' OR p_audit_category = 'SECURITY' THEN 'PERMANENT'
+        WHEN p_audit_level = 'ERROR' OR p_audit_category IN ('DATA_CHANGE', 'ADMIN') THEN 'LONG'
+        WHEN p_audit_level = 'DEBUG' THEN 'SHORT'
+        ELSE 'STANDARD'
+    END;
+    
+    v_purge_date := CASE v_retention_class
+        WHEN 'SHORT' THEN CURRENT_DATE + INTERVAL '30 days'
+        WHEN 'STANDARD' THEN CURRENT_DATE + INTERVAL '2 years'
+        WHEN 'LONG' THEN CURRENT_DATE + INTERVAL '7 years'
+        ELSE NULL  -- PERMANENT
+    END;
+    
+    -- Generate reference
+    v_reference := 'AUD-' || TO_CHAR(NOW(), 'YYYYMMDD-HH24MISS-MS') || '-' || SUBSTRING(MD5(RANDOM()::TEXT), 1, 6);
+    
+    INSERT INTO core.audit_trail (
+        audit_reference,
+        audit_category,
+        audit_level,
+        audit_event,
+        actor_account_id,
+        actor_type,
+        action,
+        action_status,
+        table_schema,
+        table_name,
+        record_id,
+        old_data,
+        new_data,
+        application_id,
+        transaction_id,
+        correlation_id,
+        client_ip,
+        user_agent,
+        error_message,
+        retention_class,
+        purge_after_date
+    ) VALUES (
+        v_reference,
+        p_audit_category,
+        p_audit_level,
+        p_audit_event,
+        p_actor_account_id,
+        p_actor_type,
+        p_action,
+        p_action_status,
+        p_table_schema,
+        p_table_name,
+        p_record_id,
+        p_old_data,
+        p_new_data,
+        p_application_id,
+        p_transaction_id,
+        p_correlation_id,
+        p_client_ip,
+        p_user_agent,
+        p_error_message,
+        v_retention_class,
+        v_purge_date
+    ) RETURNING audit_id INTO v_audit_id;
+    
+    RETURN v_audit_id;
+END;
+$$;
+
+-- Function to get audit history for a record
+CREATE OR REPLACE FUNCTION core.get_record_audit_history(
+    p_table_schema VARCHAR(50),
+    p_table_name VARCHAR(100),
+    p_record_id TEXT,
+    p_limit INTEGER DEFAULT 100
+)
+RETURNS TABLE (
+    audit_id BIGINT,
+    created_at TIMESTAMPTZ,
+    audit_event VARCHAR(100),
+    actor_account_id UUID,
+    action VARCHAR(50),
+    action_status VARCHAR(20),
+    change_summary TEXT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        at.audit_id,
+        at.created_at,
+        at.audit_event,
+        at.actor_account_id,
+        at.action,
+        at.action_status,
+        at.change_summary
+    FROM core.audit_trail at
+    WHERE at.table_schema = p_table_schema
+      AND at.table_name = p_table_name
+      AND at.record_id = p_record_id
+    ORDER BY at.created_at DESC
+    LIMIT p_limit;
+END;
+$$;
+
+-- Function to get security events
+CREATE OR REPLACE FUNCTION core.get_security_events(
+    p_start_time TIMESTAMPTZ,
+    p_end_time TIMESTAMPTZ,
+    p_min_level VARCHAR(20) DEFAULT 'WARNING'
+)
+RETURNS TABLE (
+    audit_id BIGINT,
+    created_at TIMESTAMPTZ,
+    audit_event VARCHAR(100),
+    audit_level VARCHAR(20),
+    actor_account_id UUID,
+    action_status VARCHAR(20),
+    client_ip INET,
+    error_message TEXT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        at.audit_id,
+        at.created_at,
+        at.audit_event,
+        at.audit_level,
+        at.actor_account_id,
+        at.action_status,
+        at.client_ip,
+        at.error_message
+    FROM core.audit_trail at
+    WHERE at.audit_category = 'SECURITY'
+      AND at.created_at BETWEEN p_start_time AND p_end_time
+      AND at.audit_level >= p_min_level
+    ORDER BY at.created_at DESC;
+END;
+$$;
+
+-- Function to verify audit chain integrity
+CREATE OR REPLACE FUNCTION core.verify_audit_chain(
+    p_start_time TIMESTAMPTZ DEFAULT NULL,
+    p_end_time TIMESTAMPTZ DEFAULT NULL
+)
+RETURNS TABLE (
+    is_valid BOOLEAN,
+    total_records BIGINT,
+    verified_records BIGINT,
+    broken_at_audit_id BIGINT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_is_valid BOOLEAN := TRUE;
+    v_broken_at BIGINT := NULL;
+    v_total BIGINT;
+    v_verified BIGINT := 0;
+    v_record RECORD;
+    v_previous_hash VARCHAR(64) := NULL;
+    v_computed_hash VARCHAR(64);
+BEGIN
+    SELECT COUNT(*) INTO v_total
+    FROM core.audit_trail
+    WHERE (p_start_time IS NULL OR created_at >= p_start_time)
+      AND (p_end_time IS NULL OR created_at <= p_end_time);
+    
+    FOR v_record IN 
+        SELECT audit_id, record_hash, previous_audit_hash, created_at
+        FROM core.audit_trail
+        WHERE (p_start_time IS NULL OR created_at >= p_start_time)
+          AND (p_end_time IS NULL OR created_at <= p_end_time)
+        ORDER BY created_at, audit_id
+    LOOP
+        IF v_previous_hash IS DISTINCT FROM v_record.previous_audit_hash THEN
+            v_is_valid := FALSE;
+            v_broken_at := v_record.audit_id;
+            EXIT;
+        END IF;
+        
+        v_previous_hash := v_record.record_hash;
+        v_verified := v_verified + 1;
+    END LOOP;
+    
+    RETURN QUERY SELECT v_is_valid, v_total, v_verified, v_broken_at;
+END;
+$$;
+
+-- Function to get audit statistics
+CREATE OR REPLACE FUNCTION core.get_audit_statistics(
+    p_start_date DATE,
+    p_end_date DATE
+)
+RETURNS TABLE (
+    audit_category VARCHAR(50),
+    event_count BIGINT,
+    error_count BIGINT,
+    unique_actors BIGINT,
+    avg_execution_time_ms NUMERIC
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        at.audit_category,
+        COUNT(*) as event_count,
+        COUNT(*) FILTER (WHERE at.action_status = 'FAILURE') as error_count,
+        COUNT(DISTINCT at.actor_account_id) as unique_actors,
+        AVG(at.execution_time_ms)::NUMERIC as avg_execution_time_ms
+    FROM core.audit_trail at
+    WHERE at.created_at::DATE BETWEEN p_start_date AND p_end_date
+    GROUP BY at.audit_category
+    ORDER BY event_count DESC;
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- COMMENTS
+-- -----------------------------------------------------------------------------
+COMMENT ON TABLE core.audit_trail IS 'Comprehensive audit trail for all data access and modifications';
+COMMENT ON COLUMN core.audit_trail.audit_id IS 'Unique identifier for the audit record';
+COMMENT ON COLUMN core.audit_trail.audit_category IS 'DATA_ACCESS, DATA_CHANGE, SECURITY, ADMIN, SYSTEM, or COMPLIANCE';
+COMMENT ON COLUMN core.audit_trail.audit_level IS 'DEBUG, INFO, WARNING, ERROR, or CRITICAL';
+COMMENT ON COLUMN core.audit_trail.record_hash IS 'SHA-256 hash for integrity verification';
+COMMENT ON COLUMN core.audit_trail.previous_audit_hash IS 'Hash of previous audit record for chain verification';
 
 -- =============================================================================
 -- END OF FILE

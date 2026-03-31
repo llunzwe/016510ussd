@@ -25,8 +25,27 @@
 --   Sanitization          - Controlled data removal procedures
 -- =============================================================================
 
--- TODO: Ensure required extensions are available
--- CREATE EXTENSION IF NOT EXISTS pg_cron;
+-- Ensure required extensions are available
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+-- Create the main idempotency_keys table if not exists
+CREATE TABLE IF NOT EXISTS ledger.idempotency_keys (
+    key_hash TEXT PRIMARY KEY,
+    key_type TEXT NOT NULL DEFAULT 'transaction',
+    payload_hash BYTEA,
+    response_hash BYTEA,
+    processed_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
+    metadata JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_idempotency_keys_type_time 
+ON ledger.idempotency_keys(key_type, processed_at);
+
+CREATE INDEX IF NOT EXISTS idx_idempotency_keys_expires 
+ON ledger.idempotency_keys(expires_at) 
+WHERE expires_at IS NOT NULL;
 
 -- Configuration table for cleanup policies
 CREATE TABLE IF NOT EXISTS ledger.idempotency_cleanup_config (
@@ -64,6 +83,14 @@ CREATE TABLE IF NOT EXISTS ledger.idempotency_key_archive (
 CREATE INDEX idx_idempotency_archive_key_type 
 ON ledger.idempotency_key_archive(key_type, archived_at);
 
+-- Partition management for archive table
+CREATE TABLE IF NOT EXISTS ledger.idempotency_archive_partitions (
+    partition_name TEXT PRIMARY KEY,
+    partition_date DATE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    dropped_at TIMESTAMPTZ
+);
+
 -- Cleanup log for monitoring
 CREATE TABLE IF NOT EXISTS ledger.idempotency_cleanup_log (
     log_id BIGSERIAL PRIMARY KEY,
@@ -76,6 +103,31 @@ CREATE TABLE IF NOT EXISTS ledger.idempotency_cleanup_log (
     status TEXT DEFAULT 'RUNNING',
     error_message TEXT
 );
+
+-- Cleanup metrics export table
+CREATE TABLE IF NOT EXISTS ledger.idempotency_cleanup_metrics (
+    metric_id BIGSERIAL PRIMARY KEY,
+    measured_at TIMESTAMPTZ DEFAULT NOW(),
+    key_type TEXT,
+    total_keys BIGINT,
+    expired_keys BIGINT,
+    archived_keys BIGINT,
+    deleted_keys BIGINT,
+    avg_cleanup_duration_ms NUMERIC
+);
+
+-- Retention policy for archive table
+CREATE TABLE IF NOT EXISTS ledger.idempotency_archive_retention (
+    retention_id SERIAL PRIMARY KEY,
+    archive_retention_period INTERVAL NOT NULL DEFAULT '90 days',
+    max_archive_size_gb NUMERIC DEFAULT 100,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+INSERT INTO ledger.idempotency_archive_retention (archive_retention_period, max_archive_size_gb)
+VALUES ('90 days', 100)
+ON CONFLICT DO NOTHING;
 
 -- Main cleanup function
 CREATE OR REPLACE FUNCTION ledger.cleanup_expired_idempotency_keys()
@@ -263,29 +315,229 @@ BEGIN
 END;
 $$;
 
--- TODO: Create the main idempotency_keys table if not exists
-/*
-CREATE TABLE IF NOT EXISTS ledger.idempotency_keys (
-    key_hash TEXT PRIMARY KEY,
-    key_type TEXT NOT NULL DEFAULT 'transaction',
-    payload_hash BYTEA,
-    response_hash BYTEA,
-    processed_at TIMESTAMPTZ DEFAULT NOW(),
-    expires_at TIMESTAMPTZ,
-    metadata JSONB
-);
+-- Automatic partition management for archive table
+CREATE OR REPLACE FUNCTION ledger.manage_idempotency_archive_partitions()
+RETURNS TABLE(action_taken TEXT, partition_name TEXT, details TEXT)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_partition RECORD;
+    v_retention RECORD;
+    v_old_partition TEXT;
+    v_new_partition TEXT;
+    v_partition_date DATE;
+BEGIN
+    -- Get retention settings
+    SELECT * INTO v_retention
+    FROM ledger.idempotency_archive_retention
+    ORDER BY retention_id DESC
+    LIMIT 1;
+    
+    -- Create new monthly partition if needed
+    v_partition_date := DATE_TRUNC('month', NOW());
+    v_new_partition := 'idempotency_key_archive_' || TO_CHAR(v_partition_date, 'YYYY_MM');
+    
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.tables 
+        WHERE table_name = v_new_partition 
+        AND table_schema = 'ledger'
+    ) THEN
+        EXECUTE format(
+            'CREATE TABLE ledger.%I (LIKE ledger.idempotency_key_archive INCLUDING ALL)',
+            v_new_partition
+        );
+        
+        INSERT INTO ledger.idempotency_archive_partitions (partition_name, partition_date)
+        VALUES (v_new_partition, v_partition_date);
+        
+        action_taken := 'CREATED';
+        partition_name := v_new_partition;
+        details := 'Created new monthly partition for ' || TO_CHAR(v_partition_date, 'YYYY-MM');
+        RETURN NEXT;
+    END IF;
+    
+    -- Drop old partitions beyond retention
+    FOR v_partition IN 
+        SELECT partition_name, partition_date
+        FROM ledger.idempotency_archive_partitions
+        WHERE partition_date < NOW() - v_retention.archive_retention_period
+          AND dropped_at IS NULL
+    LOOP
+        EXECUTE format('DROP TABLE IF EXISTS ledger.%I', v_partition.partition_name);
+        
+        UPDATE ledger.idempotency_archive_partitions
+        SET dropped_at = NOW()
+        WHERE partition_name = v_partition.partition_name;
+        
+        action_taken := 'DROPPED';
+        partition_name := v_partition.partition_name;
+        details := 'Dropped partition beyond retention period';
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
 
-CREATE INDEX idx_idempotency_keys_type_time 
-ON ledger.idempotency_keys(key_type, processed_at);
+-- Metrics export function for cleanup job performance
+CREATE OR REPLACE FUNCTION ledger.export_idempotency_metrics()
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_result JSONB;
+BEGIN
+    -- Capture current metrics
+    INSERT INTO ledger.idempotency_cleanup_metrics (
+        key_type, total_keys, expired_keys, archived_keys, deleted_keys, avg_cleanup_duration_ms
+    )
+    SELECT 
+        s.key_type,
+        s.total_active_keys + s.expired_keys as total_keys,
+        s.expired_keys,
+        COALESCE(a.archived_count, 0) as archived_keys,
+        COALESCE(d.deleted_count, 0) as deleted_keys,
+        COALESCE(c.avg_duration_ms, 0) as avg_cleanup_duration_ms
+    FROM ledger.idempotency_key_stats() s
+    LEFT JOIN (
+        SELECT key_type, COUNT(*) as archived_count 
+        FROM ledger.idempotency_key_archive 
+        WHERE archived_at > NOW() - INTERVAL '1 hour'
+        GROUP BY key_type
+    ) a ON a.key_type = s.key_type
+    LEFT JOIN (
+        SELECT key_type, SUM(keys_deleted) as deleted_count
+        FROM ledger.idempotency_cleanup_log
+        WHERE started_at > NOW() - INTERVAL '1 hour'
+        GROUP BY key_type
+    ) d ON d.key_type = s.key_type
+    LEFT JOIN (
+        SELECT key_type, AVG(duration_ms) as avg_duration_ms
+        FROM ledger.idempotency_cleanup_log
+        WHERE started_at > NOW() - INTERVAL '24 hours'
+        GROUP BY key_type
+    ) c ON c.key_type = s.key_type;
+    
+    -- Build metrics JSON
+    SELECT jsonb_build_object(
+        'timestamp', NOW(),
+        'key_stats', jsonb_agg(jsonb_build_object(
+            'key_type', key_type,
+            'total_active', total_active_keys,
+            'expired', expired_keys,
+            'oldest', oldest_key_at
+        )),
+        'cleanup_stats', (
+            SELECT jsonb_build_object(
+                'runs_24h', COUNT(*),
+                'total_archived', SUM(keys_archived),
+                'total_deleted', SUM(keys_deleted),
+                'avg_duration_ms', AVG(duration_ms)
+            )
+            FROM ledger.idempotency_cleanup_log
+            WHERE started_at > NOW() - INTERVAL '24 hours'
+            AND status = 'COMPLETED'
+        ),
+        'archive_size_gb', (
+            SELECT pg_size_pretty(pg_total_relation_size('ledger.idempotency_key_archive'))
+        )
+    ) INTO v_result
+    FROM ledger.idempotency_key_stats();
+    
+    RETURN v_result;
+END;
+$$;
 
-CREATE INDEX idx_idempotency_keys_expires 
-ON ledger.idempotency_keys(expires_at) 
-WHERE expires_at IS NOT NULL;
-*/
+-- Retention policy enforcement for archive table
+CREATE OR REPLACE FUNCTION ledger.enforce_archive_retention_policy()
+RETURNS TABLE(records_purged BIGINT, reason TEXT)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_retention RECORD;
+    v_purged_count BIGINT;
+BEGIN
+    SELECT * INTO v_retention
+    FROM ledger.idempotency_archive_retention
+    ORDER BY retention_id DESC
+    LIMIT 1;
+    
+    -- Purge old archive records
+    DELETE FROM ledger.idempotency_key_archive
+    WHERE archived_at < NOW() - v_retention.archive_retention_period;
+    
+    GET DIAGNOSTICS v_purged_count = ROW_COUNT;
+    
+    records_purged := v_purged_count;
+    reason := 'Records exceeded retention period of ' || v_retention.archive_retention_period;
+    RETURN NEXT;
+    
+    -- Check archive size and purge if exceeds max
+    IF (
+        SELECT pg_total_relation_size('ledger.idempotency_key_archive') / (1024^3)
+    ) > v_retention.max_archive_size_gb THEN
+        DELETE FROM ledger.idempotency_key_archive
+        WHERE archive_id IN (
+            SELECT archive_id 
+            FROM ledger.idempotency_key_archive
+            ORDER BY archived_at ASC
+            LIMIT 10000
+        );
+        
+        GET DIAGNOSTICS v_purged_count = ROW_COUNT;
+        
+        records_purged := v_purged_count;
+        reason := 'Archive size exceeded ' || v_retention.max_archive_size_gb || ' GB limit';
+        RETURN NEXT;
+    END IF;
+END;
+$$;
 
--- TODO: Schedule cleanup job via pg_cron
--- SELECT cron.schedule('idempotency-cleanup', '*/5 * * * *', 'SELECT * FROM ledger.cleanup_expired_idempotency_keys()');
+-- Schedule cleanup job via pg_cron
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+        -- Schedule cleanup every 5 minutes
+        PERFORM cron.schedule('idempotency-cleanup', '*/5 * * * *', 'SELECT * FROM ledger.cleanup_expired_idempotency_keys()');
+        
+        -- Schedule partition management daily
+        PERFORM cron.schedule('idempotency-partition-mgmt', '0 1 * * *', 'SELECT * FROM ledger.manage_idempotency_archive_partitions()');
+        
+        -- Schedule retention policy enforcement daily
+        PERFORM cron.schedule('idempotency-retention', '0 2 * * *', 'SELECT * FROM ledger.enforce_archive_retention_policy()');
+        
+        -- Schedule metrics export every hour
+        PERFORM cron.schedule('idempotency-metrics', '0 * * * *', 'SELECT ledger.export_idempotency_metrics()');
+        
+        RAISE NOTICE 'Idempotency key cleanup scheduled via pg_cron';
+    END IF;
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Could not schedule idempotency cleanup via pg_cron: %', SQLERRM;
+END;
+$$;
 
--- TODO: Implement automatic partition management for archive table
--- TODO: Add metrics export for cleanup job performance
--- TODO: Create retention policy for archive table itself
+-- View for monitoring idempotency key status
+CREATE OR REPLACE VIEW ledger.idempotency_key_monitor AS
+SELECT 
+    s.key_type,
+    s.total_active_keys,
+    s.expired_keys,
+    s.oldest_key_at,
+    s.newest_key_at,
+    c.retention_period,
+    c.batch_size,
+    c.is_enabled,
+    COALESCE(l.keys_deleted, 0) as keys_deleted_last_24h,
+    COALESCE(a.archive_count, 0) as archived_count
+FROM ledger.idempotency_key_stats() s
+LEFT JOIN ledger.idempotency_cleanup_config c ON c.key_type = s.key_type
+LEFT JOIN (
+    SELECT key_type, SUM(keys_deleted) as keys_deleted
+    FROM ledger.idempotency_cleanup_log
+    WHERE started_at > NOW() - INTERVAL '24 hours'
+    GROUP BY key_type
+) l ON l.key_type = s.key_type
+LEFT JOIN (
+    SELECT key_type, COUNT(*) as archive_count
+    FROM ledger.idempotency_key_archive
+    GROUP BY key_type
+) a ON a.key_type = s.key_type;

@@ -90,19 +90,20 @@ RETENTION: 7 years
 ================================================================================
 */
 
--- -----------------------------------------------------------------------------
--- TABLE STRUCTURE (Reference)
--- -----------------------------------------------------------------------------
-/*
-CREATE TABLE ussd_core.reconciliation_runs (
+-- =============================================================================
+-- CREATE TABLE: reconciliation_runs
+-- =============================================================================
+
+CREATE TABLE core.reconciliation_runs (
     -- Primary identifier
-    run_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    run_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     run_reference VARCHAR(100) UNIQUE NOT NULL,
     
     -- Reconciliation definition
     reconciliation_type VARCHAR(50) NOT NULL
-        CHECK (reconciliation_type IN ('INTERNAL', 'BANK', 'CARD', 'WALLET', 'AGENT')),
-    counterparty_id UUID,
+        CHECK (reconciliation_type IN ('INTERNAL', 'BANK', 'CARD', 'WALLET', 'AGENT', 'EXCHANGE')),
+    counterparty_id UUID,  -- Bank, provider, etc.
+    counterparty_name VARCHAR(255),
     
     -- Period
     run_date DATE NOT NULL,
@@ -129,10 +130,13 @@ CREATE TABLE ussd_core.reconciliation_runs (
     -- External reference
     external_file_name VARCHAR(255),
     external_file_hash VARCHAR(64),
+    external_file_format VARCHAR(50),
     
     -- Timing
+    scheduled_at TIMESTAMPTZ,
     started_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
+    duration_ms INTEGER,
     
     -- Approval
     approved_by UUID,
@@ -141,13 +145,390 @@ CREATE TABLE ussd_core.reconciliation_runs (
     
     -- Error handling
     error_message TEXT,
+    error_details JSONB,
     retry_count INTEGER DEFAULT 0,
+    max_retries INTEGER DEFAULT 3,
+    
+    -- Configuration
+    matching_rules JSONB DEFAULT '{}',  -- Rules used for this run
+    tolerance_amount NUMERIC(20, 8) DEFAULT 0.01,
+    tolerance_percent NUMERIC(5, 4) DEFAULT 0.0001,
+    
+    -- Metadata
+    metadata JSONB DEFAULT '{}',
     
     -- Audit
-    created_at TIMESTAMPTZ NOT NULL DEFAULT ussd_core.precise_now(),
-    record_hash VARCHAR(64) NOT NULL
+    created_at TIMESTAMPTZ NOT NULL DEFAULT core.precise_now(),
+    created_by UUID,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT core.precise_now(),
+    record_hash VARCHAR(64) NOT NULL,
+    
+    -- Constraints
+    CONSTRAINT chk_period_valid CHECK (period_end >= period_start),
+    CONSTRAINT chk_completed_has_stats CHECK (
+        status NOT IN ('COMPLETED', 'APPROVED') OR internal_record_count IS NOT NULL
+    )
 );
-*/
+
+-- =============================================================================
+-- INDEXES
+-- =============================================================================
+
+-- Run reference lookup
+CREATE INDEX idx_reconciliation_runs_reference ON core.reconciliation_runs(run_reference);
+
+-- Type and date
+CREATE INDEX idx_reconciliation_runs_type_date ON core.reconciliation_runs(reconciliation_type, run_date DESC);
+
+-- Status monitoring
+CREATE INDEX idx_reconciliation_runs_status ON core.reconciliation_runs(status, started_at);
+
+-- Pending runs
+CREATE INDEX idx_reconciliation_runs_pending ON core.reconciliation_runs(run_id)
+    WHERE status IN ('PENDING', 'RUNNING');
+
+-- Counterparty lookup
+CREATE INDEX idx_reconciliation_runs_counterparty ON core.reconciliation_runs(counterparty_id, run_date DESC);
+
+-- Run date range
+CREATE INDEX idx_reconciliation_runs_date ON core.reconciliation_runs(run_date DESC);
+
+-- Period queries
+CREATE INDEX idx_reconciliation_runs_period ON core.reconciliation_runs(period_start, period_end);
+
+-- Approval tracking
+CREATE INDEX idx_reconciliation_runs_approval ON core.reconciliation_runs(approved_by, approved_at)
+    WHERE approved_by IS NOT NULL;
+
+-- =============================================================================
+-- UPDATE TIMESTAMP TRIGGER
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION core.update_reconciliation_timestamp()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    NEW.updated_at = core.precise_now();
+    
+    -- Calculate duration when completing
+    IF NEW.status IN ('COMPLETED', 'APPROVED', 'FAILED') AND OLD.status = 'RUNNING' THEN
+        NEW.duration_ms := EXTRACT(EPOCH FROM (core.precise_now() - OLD.started_at)) * 1000;
+    END IF;
+    
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_reconciliation_runs_update_timestamp
+    BEFORE UPDATE ON core.reconciliation_runs
+    FOR EACH ROW
+    EXECUTE FUNCTION core.update_reconciliation_timestamp();
+
+-- =============================================================================
+-- HASH COMPUTATION TRIGGER
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION core.compute_reconciliation_run_hash()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    NEW.record_hash := core.generate_hash(
+        NEW.run_id::TEXT || 
+        NEW.run_reference || 
+        NEW.reconciliation_type ||
+        NEW.period_start::TEXT ||
+        NEW.period_end::TEXT ||
+        NEW.created_at::TEXT
+    );
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_reconciliation_runs_compute_hash
+    BEFORE INSERT OR UPDATE ON core.reconciliation_runs
+    FOR EACH ROW
+    EXECUTE FUNCTION core.compute_reconciliation_run_hash();
+
+-- =============================================================================
+-- RLS POLICIES
+-- =============================================================================
+
+-- Enable RLS
+ALTER TABLE core.reconciliation_runs ENABLE ROW LEVEL SECURITY;
+
+-- Policy: All authenticated users can view reconciliation runs
+CREATE POLICY reconciliation_runs_read ON core.reconciliation_runs
+    FOR SELECT
+    TO ussd_app_user
+    USING (true);
+
+-- Policy: Kernel role has full access
+CREATE POLICY reconciliation_runs_kernel_access ON core.reconciliation_runs
+    FOR ALL
+    TO ussd_kernel_role
+    USING (true);
+
+-- =============================================================================
+-- HELPER FUNCTIONS
+-- =============================================================================
+
+-- Function to create a reconciliation run
+CREATE OR REPLACE FUNCTION core.create_reconciliation_run(
+    p_run_reference VARCHAR,
+    p_reconciliation_type VARCHAR,
+    p_period_start DATE,
+    p_period_end DATE,
+    p_counterparty_id UUID DEFAULT NULL,
+    p_counterparty_name VARCHAR DEFAULT NULL,
+    p_external_file_name VARCHAR DEFAULT NULL,
+    p_matching_rules JSONB DEFAULT '{}',
+    p_tolerance_amount NUMERIC DEFAULT 0.01,
+    p_created_by UUID DEFAULT NULL
+)
+RETURNS UUID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_run_id UUID;
+BEGIN
+    INSERT INTO core.reconciliation_runs (
+        run_reference,
+        reconciliation_type,
+        run_date,
+        period_start,
+        period_end,
+        counterparty_id,
+        counterparty_name,
+        external_file_name,
+        matching_rules,
+        tolerance_amount,
+        created_by
+    ) VALUES (
+        p_run_reference,
+        p_reconciliation_type,
+        CURRENT_DATE,
+        p_period_start,
+        p_period_end,
+        p_counterparty_id,
+        p_counterparty_name,
+        p_external_file_name,
+        p_matching_rules,
+        p_tolerance_amount,
+        p_created_by
+    )
+    RETURNING run_id INTO v_run_id;
+    
+    RETURN v_run_id;
+END;
+$$;
+
+-- Function to start a reconciliation run
+CREATE OR REPLACE FUNCTION core.start_reconciliation_run(
+    p_run_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE core.reconciliation_runs
+    SET 
+        status = 'RUNNING',
+        started_at = core.precise_now()
+    WHERE run_id = p_run_id
+    AND status = 'PENDING';
+    
+    RETURN FOUND;
+END;
+$$;
+
+-- Function to complete a reconciliation run
+CREATE OR REPLACE FUNCTION core.complete_reconciliation_run(
+    p_run_id UUID,
+    p_internal_record_count INTEGER,
+    p_external_record_count INTEGER,
+    p_matched_count INTEGER,
+    p_unmatched_internal_count INTEGER,
+    p_unmatched_external_count INTEGER,
+    p_internal_total_amount NUMERIC,
+    p_external_total_amount NUMERIC
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_discrepancy_count INTEGER;
+    v_discrepancy_amount NUMERIC(20, 8);
+BEGIN
+    v_discrepancy_count := p_unmatched_internal_count + p_unmatched_external_count;
+    v_discrepancy_amount := ABS(COALESCE(p_internal_total_amount, 0) - COALESCE(p_external_total_amount, 0));
+    
+    UPDATE core.reconciliation_runs
+    SET 
+        status = 'COMPLETED',
+        internal_record_count = p_internal_record_count,
+        external_record_count = p_external_record_count,
+        matched_count = p_matched_count,
+        unmatched_internal_count = p_unmatched_internal_count,
+        unmatched_external_count = p_unmatched_external_count,
+        discrepancy_count = v_discrepancy_count,
+        internal_total_amount = p_internal_total_amount,
+        external_total_amount = p_external_total_amount,
+        discrepancy_amount = v_discrepancy_amount,
+        completed_at = core.precise_now()
+    WHERE run_id = p_run_id
+    AND status = 'RUNNING';
+    
+    RETURN FOUND;
+END;
+$$;
+
+-- Function to fail a reconciliation run
+CREATE OR REPLACE FUNCTION core.fail_reconciliation_run(
+    p_run_id UUID,
+    p_error_message TEXT,
+    p_error_details JSONB DEFAULT NULL
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_current_retries INTEGER;
+BEGIN
+    SELECT retry_count INTO v_current_retries
+    FROM core.reconciliation_runs
+    WHERE run_id = p_run_id;
+    
+    UPDATE core.reconciliation_runs
+    SET 
+        status = CASE WHEN v_current_retries >= max_retries THEN 'FAILED' ELSE 'PENDING' END,
+        error_message = p_error_message,
+        error_details = p_error_details,
+        retry_count = retry_count + 1,
+        completed_at = CASE WHEN v_current_retries >= max_retries THEN core.precise_now() ELSE NULL END
+    WHERE run_id = p_run_id;
+    
+    RETURN FOUND;
+END;
+$$;
+
+-- Function to approve reconciliation exceptions
+CREATE OR REPLACE FUNCTION core.approve_reconciliation_exceptions(
+    p_run_id UUID,
+    p_approved_by UUID,
+    p_notes TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE core.reconciliation_runs
+    SET 
+        status = 'APPROVED',
+        approved_by = p_approved_by,
+        approved_at = core.precise_now(),
+        approval_notes = p_notes
+    WHERE run_id = p_run_id
+    AND status = 'COMPLETED';
+    
+    RETURN FOUND;
+END;
+$$;
+
+-- Function to get reconciliation summary
+CREATE OR REPLACE FUNCTION core.get_reconciliation_summary(
+    p_start_date DATE,
+    p_end_date DATE,
+    p_reconciliation_type VARCHAR DEFAULT NULL
+)
+RETURNS TABLE (
+    reconciliation_type VARCHAR,
+    total_runs BIGINT,
+    completed_runs BIGINT,
+    failed_runs BIGINT,
+    total_matched BIGINT,
+    total_unmatched BIGINT,
+    avg_discrepancy_pct NUMERIC
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        rr.reconciliation_type,
+        COUNT(*)::BIGINT as total_runs,
+        COUNT(*) FILTER (WHERE rr.status = 'COMPLETED')::BIGINT as completed_runs,
+        COUNT(*) FILTER (WHERE rr.status = 'FAILED')::BIGINT as failed_runs,
+        SUM(COALESCE(rr.matched_count, 0))::BIGINT as total_matched,
+        SUM(COALESCE(rr.unmatched_internal_count, 0) + COALESCE(rr.unmatched_external_count, 0))::BIGINT as total_unmatched,
+        AVG(
+            CASE 
+                WHEN rr.internal_total_amount = 0 THEN 0
+                ELSE ABS(rr.internal_total_amount - COALESCE(rr.external_total_amount, 0)) / rr.internal_total_amount * 100
+            END
+        )::NUMERIC(10, 4) as avg_discrepancy_pct
+    FROM core.reconciliation_runs rr
+    WHERE rr.run_date BETWEEN p_start_date AND p_end_date
+    AND (p_reconciliation_type IS NULL OR rr.reconciliation_type = p_reconciliation_type)
+    GROUP BY rr.reconciliation_type;
+END;
+$$;
+
+-- Function to get pending reconciliations
+CREATE OR REPLACE FUNCTION core.get_pending_reconciliations()
+RETURNS TABLE (
+    run_id UUID,
+    run_reference VARCHAR,
+    reconciliation_type VARCHAR,
+    counterparty_name VARCHAR,
+    run_date DATE,
+    scheduled_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        rr.run_id,
+        rr.run_reference,
+        rr.reconciliation_type,
+        rr.counterparty_name,
+        rr.run_date,
+        rr.scheduled_at
+    FROM core.reconciliation_runs rr
+    WHERE rr.status IN ('PENDING', 'RUNNING')
+    ORDER BY rr.scheduled_at, rr.run_date;
+END;
+$$;
+
+-- =============================================================================
+-- TABLE AND COLUMN COMMENTS
+-- =============================================================================
+
+COMMENT ON TABLE core.reconciliation_runs IS 
+    'Master records for reconciliation processes comparing internal and external systems.';
+
+COMMENT ON COLUMN core.reconciliation_runs.run_id IS 
+    'Unique identifier for the reconciliation run';
+COMMENT ON COLUMN core.reconciliation_runs.reconciliation_type IS 
+    'Type: INTERNAL, BANK, CARD, WALLET, AGENT, EXCHANGE';
+COMMENT ON COLUMN core.reconciliation_runs.status IS 
+    'Status: PENDING, RUNNING, COMPLETED, FAILED, APPROVED';
+COMMENT ON COLUMN core.reconciliation_runs.period_start IS 
+    'Start of reconciliation period';
+COMMENT ON COLUMN core.reconciliation_runs.period_end IS 
+    'End of reconciliation period';
+COMMENT ON COLUMN core.reconciliation_runs.matched_count IS 
+    'Number of successfully matched records';
+COMMENT ON COLUMN core.reconciliation_runs.discrepancy_count IS 
+    'Number of unmatched/discrepant records';
+COMMENT ON COLUMN core.reconciliation_runs.tolerance_amount IS 
+    'Amount tolerance for matching (records within this difference are considered matched)';
+COMMENT ON COLUMN core.reconciliation_runs.matching_rules IS 
+    'JSON configuration of matching rules used for this run';
 
 -- =============================================================================
 -- END OF FILE

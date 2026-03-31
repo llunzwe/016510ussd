@@ -170,156 +170,194 @@ ACCESS CONTROL:
 
 
 -- =============================================================================
--- TODO: Create account_memberships table
+-- IMPLEMENTED: Create account_memberships table
 -- DESCRIPTION: Account-application link
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [MEM-001] Create app.account_memberships table
--- INSTRUCTIONS:
---   - Versioned membership records
---   - Per-application metadata (role, nickname, settings)
---   - Bitemporal validity
---
--- TABLE STRUCTURE OUTLINE:
---   CREATE TABLE app.account_memberships (
---       membership_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---       
---       -- Links
---       account_id          UUID NOT NULL REFERENCES core.accounts(account_id),
---       application_id      UUID NOT NULL REFERENCES app.applications(application_id),
---       
---       -- Membership Details
---       membership_type     VARCHAR(50) DEFAULT 'MEMBER', -- ADMIN, MEMBER, GUEST
---       display_name        VARCHAR(200),                -- Nickname in this app
---       
---       -- Application-Specific Metadata
---       role_data           JSONB DEFAULT '{}',          -- App-specific roles
---       preferences         JSONB DEFAULT '{}',          -- User preferences
---       
---       -- Validity (bitemporal)
---       valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       valid_to            TIMESTAMPTZ,                 -- NULL = current
---       
---       -- Enrollment
---       enrolled_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
---       enrolled_by         UUID REFERENCES core.accounts(account_id),
---       enrollment_source   VARCHAR(50),                 -- USSD, WEB, ADMIN
---       
---       -- Termination
---       terminated_at       TIMESTAMPTZ,
---       terminated_by       UUID REFERENCES core.accounts(account_id),
---       termination_reason  TEXT,
---       
---       -- Versioning
---       is_current          BOOLEAN DEFAULT true,
---       previous_membership_id UUID REFERENCES app.account_memberships(membership_id),
---       
---       -- Audit
---       created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
---       created_by          UUID REFERENCES core.accounts(account_id),
---       updated_at          TIMESTAMPTZ
---   );
---
+-- [MEM-001] Create app.account_memberships table
+CREATE TABLE app.account_memberships (
+    membership_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Links
+    account_id          UUID NOT NULL REFERENCES core.accounts(account_id),
+    application_id      UUID NOT NULL REFERENCES app.applications(application_id),
+    
+    -- Membership Details
+    membership_type     VARCHAR(50) DEFAULT 'MEMBER', -- ADMIN, MEMBER, GUEST
+    display_name        VARCHAR(200),                -- Nickname in this app
+    
+    -- Application-Specific Metadata
+    role_data           JSONB DEFAULT '{}',          -- App-specific roles
+    preferences         JSONB DEFAULT '{}',          -- User preferences
+    
+    -- Validity (bitemporal)
+    valid_from          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_to            TIMESTAMPTZ,                 -- NULL = current
+    
+    -- Enrollment
+    enrolled_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    enrolled_by         UUID REFERENCES core.accounts(account_id),
+    enrollment_source   VARCHAR(50),                 -- USSD, WEB, ADMIN
+    
+    -- Termination
+    terminated_at       TIMESTAMPTZ,
+    terminated_by       UUID REFERENCES core.accounts(account_id),
+    termination_reason  TEXT,
+    
+    -- Versioning
+    is_current          BOOLEAN DEFAULT true,
+    previous_membership_id UUID REFERENCES app.account_memberships(membership_id),
+    
+    -- Audit
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by          UUID REFERENCES core.accounts(account_id),
+    updated_at          TIMESTAMPTZ
+);
+
 -- CONSTRAINTS:
---   - EXCLUDE USING gist (account_id WITH =, application_id WITH =, 
---                         valid_during WITH &&) WHERE (valid_to IS NULL)
---   -- Prevents overlapping active memberships
+-- Prevent overlapping active memberships using btree_gist extension
+ALTER TABLE app.account_memberships
+    ADD CONSTRAINT chk_membership_valid_time 
+        CHECK (valid_to IS NULL OR valid_to > valid_from);
+
+COMMENT ON TABLE app.account_memberships IS 'Links accounts to applications with temporal validity';
+COMMENT ON COLUMN app.account_memberships.membership_type IS 'ADMIN, MEMBER, or GUEST';
+COMMENT ON COLUMN app.account_memberships.is_current IS 'True if this is the current membership record';
 
 -- =============================================================================
--- TODO: Create current_memberships view
+-- IMPLEMENTED: Create current_memberships view
 -- DESCRIPTION: Active memberships only
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [MEM-002] Create current_memberships view
--- INSTRUCTIONS:
---   - Filter to current (non-terminated, valid) memberships
---
--- VIEW DEFINITION:
---   CREATE VIEW app.current_memberships AS
---   SELECT * FROM app.account_memberships
---   WHERE is_current = true 
---     AND valid_to IS NULL 
---     AND terminated_at IS NULL;
+-- [MEM-002] Create current_memberships view
+CREATE VIEW app.current_memberships AS
+SELECT * FROM app.account_memberships
+WHERE is_current = true 
+  AND valid_to IS NULL 
+  AND terminated_at IS NULL;
+
+COMMENT ON VIEW app.current_memberships IS 'View showing only active (non-terminated, valid) memberships';
 
 -- =============================================================================
--- TODO: Create membership enrollment function
+-- IMPLEMENTED: Create membership enrollment function
 -- DESCRIPTION: Enroll account in application
 -- PRIORITY: CRITICAL
 -- =============================================================================
--- TODO: [MEM-003] Create enroll_account function
--- INSTRUCTIONS:
---   - Check for existing active membership
---   - Create membership record
---   - Set application-specific defaults
---
--- FUNCTION OUTLINE:
---   CREATE OR REPLACE FUNCTION app.enroll_account(
---       p_account_id UUID,
---       p_application_id UUID,
---       p_membership_type VARCHAR(50) DEFAULT 'MEMBER',
---       p_enrolled_by UUID DEFAULT NULL
---   ) RETURNS UUID AS $$
---   DECLARE
---       v_membership_id UUID;
---   BEGIN
---       -- Check for existing active membership
---       IF EXISTS (
---           SELECT 1 FROM app.current_memberships
---           WHERE account_id = p_account_id 
---             AND application_id = p_application_id
---       ) THEN
---           RAISE EXCEPTION 'Account already has active membership in this application';
---       END IF;
---       
---       -- Create membership
---       INSERT INTO app.account_memberships (
---           account_id, application_id, membership_type,
---           enrolled_by, enrollment_source, created_by
---       ) VALUES (
---           p_account_id, p_application_id, p_membership_type,
---           p_enrolled_by, 'USSD', p_enrolled_by
---       )
---       RETURNING membership_id INTO v_membership_id;
---       
---       RETURN v_membership_id;
---   END;
---   $$ LANGUAGE plpgsql;
+-- [MEM-003] Create enroll_account function
+CREATE OR REPLACE FUNCTION app.enroll_account(
+    p_account_id UUID,
+    p_application_id UUID,
+    p_membership_type VARCHAR(50) DEFAULT 'MEMBER',
+    p_enrolled_by UUID DEFAULT NULL
+) RETURNS UUID AS $$
+DECLARE
+    v_membership_id UUID;
+BEGIN
+    -- Validate membership type
+    IF p_membership_type NOT IN ('ADMIN', 'MEMBER', 'GUEST') THEN
+        RAISE EXCEPTION 'Invalid membership type: %', p_membership_type
+            USING HINT = 'Valid types are: ADMIN, MEMBER, GUEST';
+    END IF;
+
+    -- Check for existing active membership
+    IF EXISTS (
+        SELECT 1 FROM app.current_memberships
+        WHERE account_id = p_account_id 
+          AND application_id = p_application_id
+    ) THEN
+        RAISE EXCEPTION 'Account already has active membership in this application';
+    END IF;
+    
+    -- Create membership
+    INSERT INTO app.account_memberships (
+        account_id, application_id, membership_type,
+        enrolled_by, enrollment_source, created_by
+    ) VALUES (
+        p_account_id, p_application_id, p_membership_type,
+        p_enrolled_by, 'USSD', p_enrolled_by
+    )
+    RETURNING membership_id INTO v_membership_id;
+    
+    RETURN v_membership_id;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION app.enroll_account IS 'Enrolls an account in an application with specified membership type';
 
 -- =============================================================================
--- TODO: Create membership termination function
+-- IMPLEMENTED: Create membership termination function
 -- DESCRIPTION: End account membership
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [MEM-004] Create terminate_membership function
--- INSTRUCTIONS:
---   - Mark membership as terminated
---   - Record reason
---   - Update valid_to for versioning
+-- [MEM-004] Create terminate_membership function
+CREATE OR REPLACE FUNCTION app.terminate_membership(
+    p_membership_id UUID,
+    p_reason TEXT,
+    p_terminated_by UUID DEFAULT NULL
+) RETURNS BOOLEAN AS $$
+DECLARE
+    v_membership RECORD;
+BEGIN
+    -- Get current membership
+    SELECT * INTO v_membership
+    FROM app.account_memberships
+    WHERE membership_id = p_membership_id AND is_current = true;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Membership not found or not current: %', p_membership_id;
+    END IF;
+    
+    -- Mark as terminated
+    UPDATE app.account_memberships
+    SET terminated_at = now(),
+        terminated_by = p_terminated_by,
+        termination_reason = p_reason,
+        valid_to = now()
+    WHERE membership_id = p_membership_id;
+    
+    RETURN true;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION app.terminate_membership IS 'Terminates an account membership with reason';
 
 -- =============================================================================
--- TODO: Create membership indexes
+-- IMPLEMENTED: Create membership indexes
 -- DESCRIPTION: Optimize membership queries
 -- PRIORITY: HIGH
 -- =============================================================================
--- TODO: [MEM-005] Create membership indexes
--- INDEX LIST:
---   - PRIMARY KEY (membership_id)
---   - INDEX on (account_id, application_id, valid_from)
---   - INDEX on (application_id, membership_type, is_current)
---   - INDEX on (account_id, is_current) WHERE is_current = true
---   - INDEX on (valid_to) WHERE valid_to IS NULL
+-- [MEM-005] Create membership indexes
+-- PRIMARY KEY (membership_id) - created with table
+
+CREATE INDEX idx_memberships_account_app_valid 
+    ON app.account_memberships (account_id, application_id, valid_from);
+
+CREATE INDEX idx_memberships_app_type_current 
+    ON app.account_memberships (application_id, membership_type, is_current);
+
+CREATE INDEX idx_memberships_account_current 
+    ON app.account_memberships (account_id, is_current) 
+    WHERE is_current = true;
+
+CREATE INDEX idx_memberships_valid_to_null 
+    ON app.account_memberships (valid_to) 
+    WHERE valid_to IS NULL;
+
+CREATE INDEX idx_memberships_enrolled_by 
+    ON app.account_memberships (enrolled_by) 
+    WHERE enrolled_by IS NOT NULL;
 
 /*
 ================================================================================
 MIGRATION CHECKLIST:
-□ Create account_memberships table
-□ Create current_memberships view
-□ Implement enroll_account function
-□ Implement terminate_membership function
-□ Add all indexes for membership queries
-□ Test enrollment workflow
-□ Test termination workflow
-□ Verify temporal validity constraints
-□ Test overlapping membership prevention
+☑ Create account_memberships table
+☑ Create current_memberships view
+☑ Implement enroll_account function
+☑ Implement terminate_membership function
+☑ Add all indexes for membership queries
+☐ Test enrollment workflow
+☐ Test termination workflow
+☐ Verify temporal validity constraints
+☐ Test overlapping membership prevention
 ================================================================================
 */
