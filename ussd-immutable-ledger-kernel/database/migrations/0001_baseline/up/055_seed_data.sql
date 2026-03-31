@@ -105,9 +105,30 @@ VALUES
     ('LOAN_REPAYMENT', 'Loan Repayment', 'Loan payment',
      '{"type": "object", "properties": {"loan_id": {"type": "string"}, "amount": {"type": "number"}}}'::jsonb,
      'GLOBAL', 0),
+    ('RIDE_REQUEST', 'Ride Request', 'Passenger requests a ride',
+     '{"type": "object", "properties": {"pickup": {"type": "object"}, "destination": {"type": "object"}, "vehicle_type": {"type": "string"}}}'::jsonb,
+     'GLOBAL', 0),
+    ('DRIVER_ASSIGNMENT', 'Driver Assignment', 'System assigns driver to ride request',
+     '{"type": "object", "properties": {"ride_request_tx_id": {"type": "string"}, "driver_account_id": {"type": "string"}}}'::jsonb,
+     'GLOBAL', 0),
+    ('TRIP_START', 'Trip Start', 'Driver marks trip as started',
+     '{"type": "object", "properties": {"ride_request_tx_id": {"type": "string"}, "start_location": {"type": "object"}}}'::jsonb,
+     'GLOBAL', 0),
     ('RIDE_PAYMENT', 'Ride Payment', 'Transport service payment',
      '{"type": "object", "properties": {"ride_id": {"type": "string"}, "amount": {"type": "number"}}}'::jsonb,
      'GLOBAL', 0),
+    ('TRIP_COMPLETE', 'Trip Complete', 'Driver marks trip as completed',
+     '{"type": "object", "properties": {"ride_request_tx_id": {"type": "string"}, "final_fare": {"type": "number"}}}'::jsonb,
+     'GLOBAL', 0),
+    ('RATING', 'Rating', 'Mutual rating between rider and driver',
+     '{"type": "object", "properties": {"trip_tx_id": {"type": "string"}, "stars": {"type": "integer"}, "comment": {"type": "string"}}}'::jsonb,
+     'GLOBAL', 0),
+    ('CANCELLATION_FEE', 'Cancellation Fee', 'Fee charged for trip cancellation',
+     '{"type": "object", "properties": {"ride_request_tx_id": {"type": "string"}, "fee_amount": {"type": "number"}}}'::jsonb,
+     'GLOBAL', 0),
+    ('PAYOUT_REQUEST', 'Payout Request', 'Driver requests earnings payout',
+     '{"type": "object", "properties": {"driver_account_id": {"type": "string"}, "amount": {"type": "number"}}}'::jsonb,
+     'GLOBAL', 1),
     ('PRODUCT_PURCHASE', 'Product Purchase', 'E-commerce transaction',
      '{"type": "object", "properties": {"product_id": {"type": "string"}, "amount": {"type": "number"}}}'::jsonb,
      'GLOBAL', 0),
@@ -336,6 +357,17 @@ SELECT
 WHERE NOT EXISTS (
     SELECT 1 FROM core.accounts WHERE account_number = 'SYSTEM-RESERVE-001'
 );
+
+-- Seed default applications
+INSERT INTO app.applications (application_code, application_name, description,
+    owner_name, base_currency, timezone, default_language, settings, status)
+VALUES
+    ('ROOT', 'Root Application', 'System root tenant', 'System Administrator', 'USD', 'UTC', 'en',
+     '{"system": true}'::jsonb, 'ACTIVE'),
+    ('TRANSPORT', 'Transport ZW', 'Zimbabwe ride-hailing and transport services',
+     'Transport Platform Operator', 'USD', 'Africa/Harare', 'en',
+     '{"industry": "transport", "country": "ZW", "supports_cash": true, "supports_wallet": true, "supports_mobile_money": true}'::jsonb, 'ACTIVE')
+ON CONFLICT (application_code) DO NOTHING;
 
 -- Seed initial USSD shortcodes
 INSERT INTO ussd.shortcodes (shortcode, country_code, network_operator,

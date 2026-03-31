@@ -344,3 +344,283 @@ This combined list contains **only components that are directly relevant** to a 
 - Complex peer‑to‑peer replication (multi‑master)
 - Full eIDAS signature levels (simplified to PIN/biometric)
   All remaining components are **implementable in PostgreSQL** using the patterns demonstrated in the provided SQL files. The USSD kernel’s Core schema will be fully immutable; the App schema will handle versioned configurations and audit‑logged mutable settings.
+
+ussd-immutable-ledger-kernel/
+├── database/
+│   ├── migrations/
+│   │   ├── 0001_baseline/
+│   │   │   ├── up/
+│   │   │   │   ├── 001_create_schemas.sql
+│   │   │   │   ├── 002_core_extensions.sql
+│   │   │   │   ├── 003_core_account_registry.sql
+│   │   │   │   ├── 004_core_transaction_log.sql
+│   │   │   │   ├── 005_core_movement_legs.sql
+│   │   │   │   ├── 006_core_movement_postings.sql
+│   │   │   │   ├── 007_core_blocks_merkle.sql
+│   │   │   │   ├── 008_core_entity_sequences.sql
+│   │   │   │   ├── 009_core_agent_relationships.sql
+│   │   │   │   ├── 010_core_virtual_accounts.sql
+│   │   │   │   ├── 011_core_transaction_sagas.sql
+│   │   │   │   ├── 012_core_transaction_operations.sql
+│   │   │   │   ├── 013_core_rejection_log.sql
+│   │   │   │   ├── 014_core_settlement_instructions.sql
+│   │   │   │   ├── 015_core_liquidity_positions.sql
+│   │   │   │   ├── 016_core_reconciliation_runs.sql
+│   │   │   │   ├── 017_core_reconciliation_items.sql
+│   │   │   │   ├── 018_core_suspense_items.sql
+│   │   │   │   ├── 019_core_suspense_resolutions.sql
+│   │   │   │   ├── 020_core_control_batches.sql
+│   │   │   │   ├── 021_core_batch_jobs.sql
+│   │   │   │   ├── 022_core_document_registry.sql
+│   │   │   │   ├── 023_core_document_versions.sql
+│   │   │   │   ├── 024_core_digital_signatures.sql
+│   │   │   │   ├── 025_core_archive_manifest.sql
+│   │   │   │   ├── 026_core_chart_of_accounts.sql
+│   │   │   │   ├── 027_core_period_end_balances.sql
+│   │   │   │   ├── 028_core_exchange_rates.sql
+│   │   │   │   ├── 029_core_bad_debt_provision.sql
+│   │   │   │   ├── 030_core_integrity_triggers.sql
+│   │   │   │   ├── 031_app_registry.sql
+│   │   │   │   ├── 032_app_account_membership.sql
+│   │   │   │   ├── 033_app_roles_permissions.sql
+│   │   │   │   ├── 034_app_user_role_assignments.sql
+│   │   │   │   ├── 035_app_entitlement_limits.sql
+│   │   │   │   ├── 036_app_validation_rules.sql
+│   │   │   │   ├── 037_app_hooks_registry.sql
+│   │   │   │   ├── 038_app_business_calendar.sql
+│   │   │   │   ├── 039_app_fiscal_periods.sql
+│   │   │   │   ├── 040_app_cutoff_times.sql
+│   │   │   │   ├── 041_app_tax_rates.sql
+│   │   │   │   ├── 042_app_retention_policies.sql
+│   │   │   │   ├── 043_app_legal_hold.sql
+│   │   │   │   ├── 044_app_matching_rules.sql
+│   │   │   │   ├── 045_app_configuration_store.sql
+│   │   │   │   ├── 046_app_feature_flags.sql
+│   │   │   │   ├── 047_ussd_session_state.sql
+│   │   │   │   ├── 048_ussd_shortcode_routing.sql
+│   │   │   │   ├── 049_ussd_menu_configurations.sql
+│   │   │   │   ├── 050_ussd_pending_transactions.sql
+│   │   │   │   ├── 051_ussd_device_fingerprints.sql
+│   │   │   │   ├── 052_security_rls_policies.sql
+│   │   │   │   ├── 053_security_audit_tables.sql
+│   │   │   │   ├── 054_indexes_constraints.sql
+│   │   │   │   └── 055_seed_data.sql
+│   │   │   └── down/
+│   │   │       └── 0001_baseline_rollback.sql
+│   │   ├── 0002_partitioning_setup/
+│   │   │   ├── up/
+│   │   │   │   ├── 001_create_partition_schemes.sql
+│   │   │   │   └── 002_setup_hypertables.sql
+│   │   │   └── down/
+│   │   ├── 0003_archival_policies/
+│   │   │   ├── up/
+│   │   │   │   └── 001_archival_configuration.sql
+│   │   │   └── down/
+│   │   └── README.md
+│   │
+│   ├── schema/
+│   │   ├── core/
+│   │   │   ├── tables/
+│   │   │   │   ├── 000_account_registry.sql
+│   │   │   │   ├── 001_transaction_types.sql
+│   │   │   │   ├── 002_transaction_log.sql
+│   │   │   │   ├── 003_movement_legs.sql
+│   │   │   │   ├── 004_movement_postings.sql
+│   │   │   │   ├── 005_blocks.sql
+│   │   │   │   ├── 006_entity_sequences.sql
+│   │   │   │   ├── 007_agent_relationships.sql
+│   │   │   │   ├── 008_virtual_accounts.sql
+│   │   │   │   ├── 009_transaction_sagas.sql
+│   │   │   │   ├── 010_transaction_operations.sql
+│   │   │   │   ├── 011_rejection_log.sql
+│   │   │   │   ├── 012_settlement_instructions.sql
+│   │   │   │   ├── 013_liquidity_positions.sql
+│   │   │   │   ├── 014_reconciliation_runs.sql
+│   │   │   │   ├── 015_reconciliation_items.sql
+│   │   │   │   ├── 016_suspense_items.sql
+│   │   │   │   ├── 017_suspense_resolutions.sql
+│   │   │   │   ├── 018_control_batches.sql
+│   │   │   │   ├── 019_batch_jobs.sql
+│   │   │   │   ├── 020_document_registry.sql
+│   │   │   │   ├── 021_document_versions.sql
+│   │   │   │   ├── 022_digital_signatures.sql
+│   │   │   │   ├── 023_archive_manifest.sql
+│   │   │   │   ├── 024_chart_of_accounts.sql
+│   │   │   │   ├── 025_period_end_balances.sql
+│   │   │   │   ├── 026_exchange_rates.sql
+│   │   │   │   ├── 027_bad_debt_provision.sql
+│   │   │   │   ├── 028_idempotency_keys.sql
+│   │   │   │   ├── 029_audit_trail.sql
+│   │   │   │   └── Add more...
+│   │   │   ├── functions/
+│   │   │   │   ├── cryptographic/
+│   │   │   │   │   ├── 000_hash_chain_compute.sql
+│   │   │   │   │   ├── 001_merkle_root_calculate.sql
+│   │   │   │   │   ├── 002_integrity_verify.sql
+│   │   │   │   │   └── 003_proof_generate.sql
+│   │   │   │   ├── transaction/
+│   │   │   │   │   ├── 000_submit_transaction.sql
+│   │   │   │   │   ├── 001_validate_payload.sql
+│   │   │   │   │   ├── 002_get_balance_at_time.sql
+│   │   │   │   │   └── 003_get_transaction_history.sql
+│   │   │   │   └── maintenance/
+│   │   │   │       ├── 000_refresh_materialized_views.sql
+│   │   │   │       ├── 001_partition_maintenance.sql
+│   │   │   │       └── 002_health_checks.sql
+│   │   │   ├── triggers/
+│   │   │   │   ├── 000_immutability_enforcement.sql
+│   │   │   │   ├── 001_hash_chain_automation.sql
+│   │   │   │   └── 002_audit_log_capture.sql
+│   │   │   ├── policies/
+│   │   │   │   └── 000_row_level_security_core.sql
+│   │   │   ├── views/
+│   │   │   │   ├── 000_account_state_snapshot.sql
+│   │   │   │   ├── 001_trial_balance.sql
+│   │   │   │   └── 002_entity_streams.sql
+│   │   │   └── indexes/
+│   │   │       ├── 000_transaction_log_indexes.sql
+│   │   │       ├── 001_account_registry_indexes.sql
+│   │   │       └── 002_partitioning_indexes.sql
+│   │   │
+│   │   ├── applications/
+│   │   │   ├── (Business Logic Applications)
+│   │   │
+│   │   └── ussd_gateway/
+│   │       ├── tables/
+│   │       │   ├── 000_session_state.sql
+│   │       │   ├── 001_shortcode_routing.sql
+│   │       │   ├── 002_menu_configurations.sql
+│   │       │   ├── 003_pending_transactions.sql
+│   │       │   └── 004_device_fingerprints.sql
+│   │       ├── functions/
+│   │       │   ├── session/
+│   │       │   │   ├── 000_create_session.sql
+│   │       │   │   ├── 001_update_session_context.sql
+│   │       │   │   ├── 002_resume_session.sql
+│   │       │   │   └── 003_cleanup_expired_sessions.sql
+│   │       │   ├── routing/
+│   │       │   │   ├── 000_resolve_shortcode.sql
+│   │       │   │   └── 001_route_to_application.sql
+│   │       │   └── security/
+│   │       │       ├── 000_verify_device_fingerprint.sql
+│   │       │       ├── 001_check_velocity_limits.sql
+│   │       │       └── 002_detect_sim_swap.sql
+│   │       └── indexes/
+│   │           └── 000_session_state_indexes.sql
+│   │
+│   ├── partitions/
+│   │   ├── templates/
+│   │   │   ├── 000_monthly_partition_template.sql
+│   │   │   └── 001_application_list_template.sql
+│   │   ├── maintenance/
+│   │   │   ├── 000_create_future_partitions.sql
+│   │   │   ├── 001_detach_old_partitions.sql
+│   │   │   └── 002_archive_cold_partitions.sql
+│   │   └── hypertables/
+│   │       └── 000_timescale_setup.sql
+│   │
+│   ├── replication/
+│   │   ├── logical/
+│   │   │   ├── 000_publication_setup.sql
+│   │   │   └── 001_subscription_config.sql
+│   │   └── physical/
+│   │       ├── 000_wal_archiving.sql
+│   │       └── 001_streaming_replication.sql
+│   │
+│   ├── security/
+│   │   ├── rls/
+│   │   │   ├── 000_core_transaction_access.sql
+│   │   │   ├── 001_core_account_access.sql
+│   │   │   └── 002_app_configuration_access.sql
+│   │   ├── encryption/
+│   │   │   ├── 000_pii_field_encryption.sql
+│   │   │   └── 001_key_rotation_procedures.sql
+│   │   └── audit/
+│   │       ├── 000_audit_trigger_functions.sql
+│   │       ├── 001_audit_table_definitions.sql
+│   │       └── 002_document_access_log.sql
+│   │
+│   ├── jobs/
+│   │   ├── background_workers/
+│   │   │   ├── 000_merkle_tree_computation.sql
+│   │   │   ├── 001_integrity_verification_scheduler.sql
+│   │   │   ├── 002_materialized_view_refresh.sql
+│   │   │   └── 003_idempotency_key_cleanup.sql
+│   │   └── cron/
+│   │       ├── 000_eod_processing.sql
+│   │       ├── 001_reconciliation_runs.sql
+│   │       └── 002_archival_execution.sql
+│   │
+│   └── utils/
+│       ├── extensions/
+│       │   ├── 000_pg_crypto_setup.sql
+│       │   ├── 001_uuid_ossp_setup.sql
+│       │   ├── 002_pg_trgm_setup.sql
+│       │   └── 003_timescaledb_setup.sql
+│       ├── helpers/
+│       │   ├── 000_json_validation.sql
+│       │   ├── 001_error_handling.sql
+│       │   └── 002_logging_utilities.sql
+│       └── seed/
+│           ├── 000_system_accounts.sql
+│           ├── 001_default_transaction_types.sql
+│           └── 002_root_application.sql
+│
+├── config/
+│   ├── postgresql/
+│   │   ├── postgresql.conf.immutable_ledger
+│   │   ├── pg_hba.conf.template
+│   │   └── pgbouncer/
+│   │       ├── pgbouncer.ini.template
+│   │       └── userlist.txt.template
+│   ├── partitioning/
+│   │   ├── partition_strategy.yaml
+│   │   └── retention_policies.yaml
+│   └── monitoring/
+│       ├── prometheus_alerts.yml
+│       └── grafana_dashboards/
+│           ├── core_ledger_health.json
+│           └── app_performance.json
+│
+├── procedures/
+│   ├── disaster_recovery/
+│   │   ├── point_in_time_recovery.sql
+│   │   ├── hash_chain_rebuild.sql
+│   │   └── snapshot_restore.sql
+│   ├── compliance/
+│   │   ├── gdpr_anonymization.sql
+│   │   ├── legal_hold_application.sql
+│   │   └── regulatory_reporting_exports.sql
+│   └── maintenance/
+│       ├── reindex_partitioned_tables.sql
+│       ├── vacuum_strategy.sql
+│       └── connection_pool_tuning.sql
+│
+├── tests/
+│   ├── integrity/
+│   │   ├── hash_chain_validation.sql
+│   │   ├── merkle_inclusion_tests.sql
+│   │   └── immutability_violation_attempts.sql
+│   ├── performance/
+│   │   ├── concurrency_load_tests.sql
+│   │   ├── partition_pruning_tests.sql
+│   │   └── materialized_view_refresh_benchmarks.sql
+│   └── security/
+│       ├── rls_policy_tests.sql
+│       ├── encryption_roundtrip_tests.sql
+│       └── sim_swap_detection_tests.sql
+│
+└── docs/
+├── schema_documentation/
+│   ├── core_schema_erd.md
+│   ├── app_schema_erd.md
+│   └── ussd_integration_schema.md
+├── runbooks/
+│   ├── partition_management.md
+│   ├── integrity_verification.md
+│   └── incident_response/
+│       ├── hash_mismatch_response.md
+│       └── settlement_failure_response.md
+└── api/
+├── core_ledger_api_spec.md
+└── app_schema_api_spec.md

@@ -193,6 +193,17 @@ migrations/
 │   │   └── 0003_archival_policies.sql
 │   └── down/
 │       └── .gitkeep                   # See note below
+├── 0004_transport_primitives/         # Transport business primitives
+│   ├── up/
+│   │   ├── 001_transport_geospatial_primitives.sql
+│   │   ├── 002_transport_vehicle_primitives.sql
+│   │   ├── 003_transport_service_primitives.sql
+│   │   ├── 004_transport_fare_primitives.sql
+│   │   ├── 005_transport_app_tables.sql
+│   │   ├── 006_transport_seed_data.sql
+│   │   └── 007_transport_rls_policies.sql
+│   └── down/
+│       └── 0004_transport_primitives_rollback.sql
 └── [future_migrations]/
 ```
 
@@ -211,6 +222,7 @@ migrations/
 | 0001 | baseline | Core schema, tables, enums, functions | Draft | TBD | Pending |
 | 0002 | partitioning_setup | Range partitioning for ledger_entries | Draft | TBD | Pending |
 | 0003 | archival_policies | Automated archival and compression | Draft | TBD | Pending |
+| 0004 | transport_primitives | Zimbabwe transport business primitives | Draft | TBD | Pending |
 
 ## Migration Status Key
 

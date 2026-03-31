@@ -10,7 +10,8 @@ ussd-immutable-ledger-kernel/
 │   ├── migrations/              # Versioned database migrations
 │   │   ├── 0001_baseline/       # Initial schema creation
 │   │   ├── 0002_partitioning_setup/
-│   │   └── 0003_archival_policies/
+│   │   ├── 0003_archival_policies/
+│   │   └── 0004_transport_primitives/  # Zimbabwe transport business
 │   ├── schema/                  # Schema definitions by component
 │   │   ├── core/                # Core immutable ledger schema
 │   │   ├── app/                 # Application layer schema
@@ -40,15 +41,15 @@ ussd-immutable-ledger-kernel/
 
 ## File Count
 
-- **Total Files**: 227
-- **Migrations**: 55 up + 3 down + 1 README
-- **Schema Files**: 30 tables + 15 functions + 3 triggers + 1 policies + 3 views + 3 indexes
-- **App Schema**: 16 tables + 6 functions + 3 views + 1 indexes
+- **Total Files**: 250+
+- **Migrations**: 63 up + 5 down + 1 README
+- **Schema Files**: 55+ tables + 30+ functions + 8 triggers + 1 policies + 12 views + 3 indexes
+- **App Schema**: 19 tables + 7 functions + 4 views + 1 indexes
 - **USSD Gateway**: 5 tables + 9 functions + 1 indexes
 - **Config**: 8 files
 - **Procedures**: 9 files
 - **Tests**: 9 files
-- **Docs**: 8 files
+- **Docs**: 9 files
 
 ## Migration Order
 
@@ -57,6 +58,7 @@ Execute migrations in numerical order:
 1. `0001_baseline/up/` - Creates core and app schemas
 2. `0002_partitioning_setup/up/` - Sets up hypertables
 3. `0003_archival_policies/up/` - Configures data lifecycle
+4. `0004_transport_primitives/up/` - Adds Zimbabwe transport business primitives
 
 ## Original SQL Folder
 

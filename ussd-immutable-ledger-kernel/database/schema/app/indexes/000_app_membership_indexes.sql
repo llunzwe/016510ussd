@@ -9,7 +9,7 @@
  *               query patterns for the RBAC system.
  * 
  * Version:      1.0.0
- * Author:       Platform Engineering Team
+ * Author:       Eng. llunzwe
  * Created:      2026-03-30
  * 
  * DEPENDENCIES:

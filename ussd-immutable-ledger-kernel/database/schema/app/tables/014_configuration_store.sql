@@ -10,7 +10,7 @@
  *                     Supports feature flags, settings, and secrets.
  * 
  * Version:            1.0.0
- * Author:             Platform Engineering Team
+ * Author:             Eng. llunzwe
  * Created:            2026-03-30
  * Last Modified:      2026-03-30
  * 

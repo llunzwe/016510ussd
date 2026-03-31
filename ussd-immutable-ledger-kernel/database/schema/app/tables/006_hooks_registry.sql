@@ -11,7 +11,7 @@
  *                     ordering, retry logic, and circuit breaker patterns.
  * 
  * Version:            1.0.0
- * Author:             Platform Engineering Team
+ * Author:             Eng. llunzwe
  * Created:            2026-03-30
  * Last Modified:      2026-03-30
  * 
@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS app.t_hooks_registry (
                                     CHECK (hook_type IN ('webhook', 'function', 'queue', 'event', 'workflow')),
     hook_phase                  VARCHAR(30) NOT NULL,
                                 CONSTRAINT chk_hook_phase 
-                                    CHECK (hook_phase IN ('pre_validation', 'pre_commit  -- [TXN] ISO 27001: ACID transaction boundary', 'post_commit
+                                    CHECK (hook_phase IN ('pre_validation', 'pre_commit  -- [TXN] ISO 27001: ACID transaction boundary', 'post_commit')),
     
     -- Event Triggering
     trigger_events              TEXT[] NOT NULL DEFAULT '{}',
