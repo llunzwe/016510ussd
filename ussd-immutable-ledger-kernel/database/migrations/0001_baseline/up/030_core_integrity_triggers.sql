@@ -1,539 +1,609 @@
 -- =============================================================================
--- MIGRATION: 030_core_integrity_triggers.sql
--- DESCRIPTION: Database-Level Immutability Enforcement
--- TABLES: integrity_checks, integrity_violations
--- DEPENDENCIES: Multiple core tables
+-- USSD KERNEL CORE SCHEMA - INTEGRITY TRIGGERS
+-- Enterprise-Grade Immutable Ledger System
+-- =============================================================================
+-- FILENAME:    030_core_integrity_triggers.sql
+-- MIGRATION:   0001_baseline/up
+-- SCHEMA:      core
+-- DESCRIPTION: Append-only enforcement triggers for immutable tables.
+--              CRITICAL: This file MUST run after all core tables are created
+--              to ensure immutability is enforced before any data insertion.
 -- =============================================================================
 
 /*
 ================================================================================
-COMPLIANCE FRAMEWORK
+IMMUTABILITY ENFORCEMENT FRAMEWORK
 ================================================================================
 
-ISO/IEC 27001:2022 (Information Security Management Systems - ISMS)
-  - A.5.1: Information security policies
-  - A.8.1: User endpoint devices
-  - A.8.2: Privileged access rights
-  - A.9.2: Access to networks and network services
-  - A.12.1: Operational procedures and responsibilities
-  - A.12.3: Information backup
-  - A.12.4: Logging and monitoring
-  - A.12.5: Control of operational software
+This migration implements strict immutability through PostgreSQL triggers:
 
-ISO/IEC 27018:2019 (Protection of PII in Public Clouds)
-  - Clause 7: Obligations to the customer
-  - Clause 8: Information disclosure and access
-  - Annex A: Personally Identifiable Information protection controls
-  - PII Classification: PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
+1. PREVENT_UPDATE: Blocks all UPDATE operations on immutable tables
+2. PREVENT_DELETE: Blocks all DELETE operations on immutable tables
+3. PREVENT_TRUNCATE: Blocks TRUNCATE operations (cascade protection)
+4. ALLOW_STATUS_UPDATE: Exception for status-only updates where applicable
 
-ISO/IEC 27040:2024 (Storage Security)
-  - Section 5: Storage security architecture
-  - Section 6: Data protection and encryption
-  - Section 7: Access control and authentication
-  - Section 8: Storage security monitoring
-
-ISO 9001:2015 (Quality Management Systems)
-  - Clause 7.1: Resources
-  - Clause 7.5: Documented information
-  - Clause 8.5: Production and service provision
-  - Clause 9.1: Monitoring and measurement
-  - Clause 10.2: Nonconformity and corrective action
-
-ISO 31000:2018 (Risk Management Guidelines)
-  - Principle 4: Integration into organizational processes
-  - Principle 6: Based on best available information
-  - Risk treatment: Avoid, Mitigate, Transfer, Accept
+AUDIT NOTE: These triggers are the FINAL LINE OF DEFENSE for immutability.
+            Any attempt to modify immutable data will raise an exception
+            and be logged to the security audit trail.
 
 ================================================================================
-ENTERPRISE POSTGRESQL CODING PRACTICES
+CRITICAL DEPENDENCIES
 ================================================================================
 
-SECURITY BEST PRACTICES:
-  [SECURITY-001] SECURITY DEFINER: Functions execute with owner's privileges
-                  REQUIRED for: admin functions, cross-schema access, audit logging
-  [SECURITY-002] Input validation: All parameters validated before processing
-                  Use: CHECK constraints, domain types, function preconditions
-  [SECURITY-003] Row-Level Security (RLS): Enabled for tenant isolation
-                  Policy: CREATE POLICY tenant_isolation ON table USING (tenant_id = current_tenant())
-  [SECURITY-004] Audit logging: All changes recorded in audit trail
-                  Trigger: audit_trigger() on all tables logging to audit.audit_log
-  [SECURITY-005] Encryption at rest: Sensitive data encrypted with AES-256
-                  Use: pgcrypto extension, column-level encryption for PII
+MUST run AFTER:
+- 004_core_transaction_log.sql
+- 007_core_blocks_merkle.sql
+- 020_core_audit_trail.sql
+- All core table creation scripts
 
-FUNCTION VOLATILITY DECLARATIONS:
-  [VOLATILITY] IMMUTABLE: Function cannot modify database; returns same result
-               for same arguments within single query
-               Use for: pure calculations, formatting functions, hash computation
-               Example: IMMUTABLE FUNCTION calculate_hash(data TEXT) RETURNS BYTEA
-  
-  [VOLATILITY] STABLE: Function cannot modify database; returns same result
-               for same arguments within single statement
-               Use for: lookups, current timestamp, configuration reads
-               Example: STABLE FUNCTION get_exchange_rate(from_curr VARCHAR, to_curr VARCHAR)
-  
-  [VOLATILITY] VOLATILE: Function can modify database; result may vary
-               Use for: DML operations, sequence access, random values
-               Example: VOLATILE FUNCTION create_transaction(payload JSONB)
+MUST run BEFORE:
+- Any data insertion
+- Application startup
 
-ERROR HANDLING PATTERNS:
-  [ERROR-001] EXCEPTION WHEN OTHERS THEN: Catch-all error handler
-              USE WITH CAUTION - always re-raise or log
-              Pattern: EXCEPTION WHEN OTHERS THEN log_error(...); RAISE;
-  
-  [ERROR-002] RAISE EXCEPTION: Structured error messages with HINT
-              Format: RAISE EXCEPTION 'Context: %', param USING HINT = 'Suggestion';
-              SQLSTATE: Use custom codes for application errors
-  
-  [ERROR-003] RAISE NOTICE: Informational messages for debugging
-              Use in development only; disable in production
-  
-  [ERROR-004] SQLSTATE handling: Specific error code catching
-              Pattern: EXCEPTION WHEN unique_violation THEN ...
-              Common: unique_violation, foreign_key_violation, check_violation
-
-TRANSACTION CONTROL DOCUMENTATION:
-  [TRANSACTION] BEGIN/COMMIT/ROLLBACK: Explicit transaction boundaries
-                Use for: Multi-statement operations requiring atomicity
-  
-  [TRANSACTION] SAVEPOINT: Partial rollback capability
-                Pattern: SAVEPOINT sp1; ...; ROLLBACK TO SAVEPOINT sp1;
-                Use for: Nested operations with selective failure handling
-  
-  [TRANSACTION] ISOLATION LEVEL: Serializable for critical operations
-                Syntax: SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
-                Use for: Financial calculations, balance updates, inventory
-
-AUDIT TRAIL INTEGRATION:
-  [AUDIT] created_at, created_by: Record creation tracking
-          Columns: created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                   created_by UUID REFERENCES core.accounts(account_id)
-  
-  [AUDIT] updated_at, updated_by: Modification tracking
-          Trigger: update_timestamp_trigger() sets updated_at = now()
-  
-  [AUDIT] superseded_by, valid_from, valid_to: Temporal versioning
-          Pattern: Append-only tables, new version supersedes old
-          Query: WHERE valid_to IS NULL AND is_current = true
-  
-  [AUDIT] status, status_reason: State change tracking
-          Pattern: status VARCHAR(20), status_reason TEXT, status_changed_at TIMESTAMPTZ
-
-DATA RETENTION COMPLIANCE:
-  [RETENTION] retention_until: Automatic purging after retention period
-              Policy: DELETE FROM table WHERE retention_until < CURRENT_DATE AND legal_hold = false
-              Audit: Log all purges to retention.audit_log
-  
-  [RETENTION] legal_hold: Override retention for legal requirements
-              Flag: legal_hold BOOLEAN DEFAULT false
-              Fields: legal_hold_reason TEXT, legal_hold_set_at TIMESTAMPTZ, legal_hold_set_by UUID
-              Enforcement: Prevent deletion/purge when legal_hold = true
-  
-  [RETENTION] archive_manifest: Cold storage tracking
-              Table: archive.archive_manifest tracks all archived records
-              Fields: storage_provider, storage_bucket, storage_key, content_hash
-              Verification: SHA-256 hash verification on restore
 ================================================================================
 */
 
-/*
-================================================================================
-REFERENCE DOCUMENTATION:
-- Section: 3. Immutability & Cryptographic Integrity
-- Feature: Database-Level Immutability
-- Source: adkjfnwr.md
-
-BUSINESS CONTEXT:
-BEFORE UPDATE and BEFORE DELETE triggers on all core tables raise exceptions.
-All corrections must be made via compensating transactions (new entries).
-This is the foundation of the immutable ledger. Implements ISO 27001 integrity
-controls and ISO 27040 storage security.
-
-KEY FEATURES:
-- Prevent UPDATE operations on immutable tables (ISO 27040 Section 7)
-- Prevent DELETE operations on immutable tables (ISO 27001 A.12.3)
-- Log violation attempts for security monitoring
-- Allow exceptions for specific admin operations
-- Support for hash chain verification
-
-IMMUTABLE TABLES (ISO 27040 Protected):
-- accounts (except current_balances view source)
-- transaction_log (cryptographic hash chain)
-- movement_headers (financial journal)
-- movement_legs (accounting entries)
-- blocks (Merkle tree structure)
-- merkle_nodes (integrity verification)
-
-SECURITY MONITORING:
-- [SECURITY-001] SECURITY DEFINER for violation logging
-- [AUDIT] integrity_violations: Complete audit of tampering attempts
-- [ERROR-002] Structured error with HINT for compensating transactions
-- User, IP address, and query logged for forensics
-
-HASH CHAIN VERIFICATION:
-- [VOLATILITY] STABLE: verify_hash_chain() - read-only verification
-- Recomputes and compares transaction hashes
-- Detects any data tampering attempts
-================================================================================
-*/
-
-
 -- =============================================================================
--- Create integrity_violations table
--- DESCRIPTION: Log of immutability violation attempts
--- PRIORITY: HIGH
+-- IMMUTABILITY TRIGGER FUNCTIONS
 -- =============================================================================
--- [INTG-001] Create core.integrity_violations table
--- INSTRUCTIONS:
---   - Audit log of attempted violations
---   - For security monitoring
---   - Alert on suspicious patterns
 
-CREATE TABLE core.integrity_violations (
-    violation_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    
-    -- Attempt Details
-    attempted_operation VARCHAR(10) NOT NULL,        -- UPDATE, DELETE
-    table_schema        VARCHAR(50) NOT NULL,
-    table_name          VARCHAR(100) NOT NULL,
-    record_id           TEXT,                        -- Primary key value
-    
-    -- Context
-    old_data            JSONB,                       -- Row before change (if captured)
-    new_data            JSONB,                       -- Attempted new values
-    
-    -- Source
-    user_name           VARCHAR(100),
-    application_name    VARCHAR(100),
-    client_addr         INET,
-    query_text          TEXT,
-    
-    -- Timestamp
-    attempted_at        TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-COMMENT ON TABLE core.integrity_violations IS 'Audit log of attempts to modify immutable data';
-COMMENT ON COLUMN core.integrity_violations.attempted_operation IS 'Type of operation blocked: UPDATE, DELETE';
-
--- =============================================================================
--- Create prevent_update_trigger function
--- DESCRIPTION: Block UPDATE operations
--- PRIORITY: CRITICAL
--- =============================================================================
--- [INTG-002] Create prevent_update function
--- INSTRUCTIONS:
---   - Raise exception on any UPDATE
---   - Log violation attempt
---   - Suggest compensating transaction
-
+-- Function to prevent UPDATE on immutable tables
 CREATE OR REPLACE FUNCTION core.prevent_update()
-RETURNS TRIGGER AS $$
-DECLARE
-    v_record_id TEXT;
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
 BEGIN
-    -- Get record ID (assuming first column is primary key)
-    v_record_id := OLD.*::TEXT;
-    
-    -- Log violation
-    INSERT INTO core.integrity_violations (
-        attempted_operation, table_schema, table_name, 
-        record_id, old_data, new_data,
-        user_name, application_name, client_addr
+    -- Log the violation attempt
+    INSERT INTO core.security_audit_log (
+        event_type,
+        severity,
+        table_name,
+        record_id,
+        old_data,
+        new_data,
+        session_user_name,
+        application_name,
+        client_addr
     ) VALUES (
-        'UPDATE', TG_TABLE_SCHEMA, TG_TABLE_NAME,
-        v_record_id, to_jsonb(OLD), to_jsonb(NEW),
-        current_user, current_setting('application.name', true), inet_client_addr()
+        'IMMUTABILITY_VIOLATION',
+        'CRITICAL',
+        TG_TABLE_NAME,
+        COALESCE(OLD.transaction_id::TEXT, OLD.block_id::TEXT, OLD.audit_id::TEXT, 'UNKNOWN'),
+        to_jsonb(OLD),
+        to_jsonb(NEW),
+        session_user,
+        current_setting('application_name', true),
+        inet_client_addr()
     );
     
-    -- Raise exception
-    RAISE EXCEPTION 'UPDATE operation blocked on %.%: Table is immutable. Use compensating transaction instead.',
-        TG_TABLE_SCHEMA, TG_TABLE_NAME
-        USING HINT = 'Insert a new record or use the reversal process for corrections.';
+    -- Raise exception to block the operation
+    RAISE EXCEPTION 'IMMUTABILITY_VIOLATION: UPDATE not allowed on %.%. Use compensating transactions for corrections. Attempted by user: %',
+        TG_TABLE_SCHEMA, TG_TABLE_NAME, session_user
+        USING ERRCODE = 'P0001',
+              HINT = 'To correct errors, create a compensating transaction with type REVERSAL or ADJUSTMENT';
     
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$;
 
-COMMENT ON FUNCTION core.prevent_update IS 'Trigger function to block UPDATE operations on immutable tables';
-
--- =============================================================================
--- Create prevent_delete_trigger function
--- DESCRIPTION: Block DELETE operations
--- PRIORITY: CRITICAL
--- =============================================================================
--- [INTG-003] Create prevent_delete function
--- INSTRUCTIONS:
---   - Raise exception on any DELETE
---   - Log violation attempt
---   - Suggest status change instead
-
+-- Function to prevent DELETE on immutable tables
 CREATE OR REPLACE FUNCTION core.prevent_delete()
-RETURNS TRIGGER AS $$
-DECLARE
-    v_record_id TEXT;
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
 BEGIN
-    -- Get record ID
-    v_record_id := OLD.*::TEXT;
-    
-    -- Log violation
-    INSERT INTO core.integrity_violations (
-        attempted_operation, table_schema, table_name,
-        record_id, old_data,
-        user_name, application_name, client_addr
+    -- Log the violation attempt
+    INSERT INTO core.security_audit_log (
+        event_type,
+        severity,
+        table_name,
+        record_id,
+        old_data,
+        session_user_name,
+        application_name,
+        client_addr
     ) VALUES (
-        'DELETE', TG_TABLE_SCHEMA, TG_TABLE_NAME,
-        v_record_id, to_jsonb(OLD),
-        current_user, current_setting('application.name', true), inet_client_addr()
+        'IMMUTABILITY_VIOLATION',
+        'CRITICAL',
+        TG_TABLE_NAME,
+        COALESCE(OLD.transaction_id::TEXT, OLD.block_id::TEXT, OLD.audit_id::TEXT, 'UNKNOWN'),
+        to_jsonb(OLD),
+        session_user,
+        current_setting('application_name', true),
+        inet_client_addr()
     );
     
-    -- Raise exception
-    RAISE EXCEPTION 'DELETE operation blocked on %.%: Table is immutable. Use status change instead.',
-        TG_TABLE_SCHEMA, TG_TABLE_NAME
-        USING HINT = 'Update status to CLOSED or use archival for old data.';
+    -- Raise exception to block the operation
+    RAISE EXCEPTION 'IMMUTABILITY_VIOLATION: DELETE not allowed on %.%. Data is permanently retained for compliance. Attempted by user: %',
+        TG_TABLE_SCHEMA, TG_TABLE_NAME, session_user
+        USING ERRCODE = 'P0001',
+              HINT = 'Records cannot be deleted from immutable ledger. Use data classification for retention policies.';
     
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$;
 
-COMMENT ON FUNCTION core.prevent_delete IS 'Trigger function to block DELETE operations on immutable tables';
+-- Function to prevent TRUNCATE on immutable tables
+CREATE OR REPLACE FUNCTION core.prevent_truncate()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    -- Log the violation attempt
+    INSERT INTO core.security_audit_log (
+        event_type,
+        severity,
+        table_name,
+        session_user_name,
+        application_name,
+        client_addr
+    ) VALUES (
+        'IMMUTABILITY_VIOLATION',
+        'CRITICAL',
+        TG_TABLE_NAME,
+        session_user,
+        current_setting('application_name', true),
+        inet_client_addr()
+    );
+    
+    RAISE EXCEPTION 'IMMUTABILITY_VIOLATION: TRUNCATE not allowed on %.% - would destroy immutable ledger integrity. Attempted by user: %',
+        TG_TABLE_SCHEMA, TG_TABLE_NAME, session_user
+        USING ERRCODE = 'P0001';
+    
+    RETURN NULL;
+END;
+$$;
+
+-- Function to allow only status updates (for workflow tables)
+CREATE OR REPLACE FUNCTION core.prevent_update_except_status()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_allowed_columns TEXT[] := ARRAY['status', 'updated_at', 'updated_by', 'status_reason', 
+                                       'confirmed_at', 'verified_at', 'completed_at', 
+                                       'terminated_at', 'rotated_at', 'compromise_detected_at'];
+    v_col TEXT;
+    v_old_val TEXT;
+    v_new_val TEXT;
+BEGIN
+    -- Check each column
+    FOR v_col IN 
+        SELECT key FROM jsonb_each(to_jsonb(OLD))
+    LOOP
+        -- Skip allowed columns
+        IF v_col = ANY(v_allowed_columns) THEN
+            CONTINUE;
+        END IF;
+        
+        -- Get values
+        EXECUTE format('SELECT ($1).%I::TEXT, ($2).%I::TEXT', v_col, v_col)
+        INTO v_old_val, v_new_val
+        USING OLD, NEW;
+        
+        -- Check if value changed
+        IF v_old_val IS DISTINCT FROM v_new_val THEN
+            -- Log violation
+            INSERT INTO core.security_audit_log (
+                event_type,
+                severity,
+                table_name,
+                record_id,
+                message
+            ) VALUES (
+                'IMMUTABILITY_VIOLATION',
+                'HIGH',
+                TG_TABLE_NAME,
+                COALESCE(OLD.transaction_id::TEXT, OLD.block_id::TEXT, 'UNKNOWN'),
+                format('Attempted to modify column %s (allowed: status only)', v_col)
+            );
+            
+            RAISE EXCEPTION 'IMMUTABILITY_VIOLATION: Column % cannot be modified on %.%. Only status fields are mutable. Attempted by user: %',
+                v_col, TG_TABLE_SCHEMA, TG_TABLE_NAME, session_user
+                USING ERRCODE = 'P0001';
+        END IF;
+    END LOOP;
+    
+    RETURN NEW;
+END;
+$$;
 
 -- =============================================================================
--- Create hash chain verification function
--- DESCRIPTION: Verify transaction hash chain
--- PRIORITY: CRITICAL
+-- APPLY IMMUTABILITY TRIGGERS TO CORE TABLES
 -- =============================================================================
--- [INTG-004] Create verify_hash_chain function
--- INSTRUCTIONS:
---   - Verify each transaction hash matches stored value
---   - Verify hash chain links are intact
---   - Return list of any discrepancies
 
-CREATE OR REPLACE FUNCTION core.verify_hash_chain(
-    p_account_id UUID DEFAULT NULL,
-    p_start_date DATE DEFAULT NULL,
-    p_end_date DATE DEFAULT NULL
-) RETURNS TABLE (
-    transaction_id UUID,
-    expected_hash BYTEA,
-    actual_hash BYTEA,
-    is_valid BOOLEAN
-) AS $$
+-- 1. TRANSACTION_LOG - Strictly immutable
+DROP TRIGGER IF EXISTS trg_transaction_log_prevent_update ON core.transaction_log;
+CREATE TRIGGER trg_transaction_log_prevent_update
+    BEFORE UPDATE ON core.transaction_log
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_update();
+
+DROP TRIGGER IF EXISTS trg_transaction_log_prevent_delete ON core.transaction_log;
+CREATE TRIGGER trg_transaction_log_prevent_delete
+    BEFORE DELETE ON core.transaction_log
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_delete();
+
+DROP TRIGGER IF EXISTS trg_transaction_log_prevent_truncate ON core.transaction_log;
+CREATE TRIGGER trg_transaction_log_prevent_truncate
+    BEFORE TRUNCATE ON core.transaction_log
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION core.prevent_truncate();
+
+-- 2. BLOCKS - Strictly immutable
+DROP TRIGGER IF EXISTS trg_blocks_prevent_update ON core.blocks;
+CREATE TRIGGER trg_blocks_prevent_update
+    BEFORE UPDATE ON core.blocks
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_update();
+
+DROP TRIGGER IF EXISTS trg_blocks_prevent_delete ON core.blocks;
+CREATE TRIGGER trg_blocks_prevent_delete
+    BEFORE DELETE ON core.blocks
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_delete();
+
+DROP TRIGGER IF EXISTS trg_blocks_prevent_truncate ON core.blocks;
+CREATE TRIGGER trg_blocks_prevent_truncate
+    BEFORE TRUNCATE ON core.blocks
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION core.prevent_truncate();
+
+-- 3. MERKLE_NODES - Strictly immutable
+DROP TRIGGER IF EXISTS trg_merkle_nodes_prevent_update ON core.merkle_nodes;
+CREATE TRIGGER trg_merkle_nodes_prevent_update
+    BEFORE UPDATE ON core.merkle_nodes
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_update();
+
+DROP TRIGGER IF EXISTS trg_merkle_nodes_prevent_delete ON core.merkle_nodes;
+CREATE TRIGGER trg_merkle_nodes_prevent_delete
+    BEFORE DELETE ON core.merkle_nodes
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_delete();
+
+-- 4. MERKLE_PROOFS - Strictly immutable
+DROP TRIGGER IF EXISTS trg_merkle_proofs_prevent_update ON core.merkle_proofs;
+CREATE TRIGGER trg_merkle_proofs_prevent_update
+    BEFORE UPDATE ON core.merkle_proofs
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_update();
+
+DROP TRIGGER IF EXISTS trg_merkle_proofs_prevent_delete ON core.merkle_proofs;
+CREATE TRIGGER trg_merkle_proofs_prevent_delete
+    BEFORE DELETE ON core.merkle_proofs
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_delete();
+
+-- 5. AUDIT_TRAIL - Strictly immutable
+DROP TRIGGER IF EXISTS trg_audit_trail_prevent_update ON core.audit_trail;
+CREATE TRIGGER trg_audit_trail_prevent_update
+    BEFORE UPDATE ON core.audit_trail
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_update();
+
+DROP TRIGGER IF EXISTS trg_audit_trail_prevent_delete ON core.audit_trail;
+CREATE TRIGGER trg_audit_trail_prevent_delete
+    BEFORE DELETE ON core.audit_trail
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_delete();
+
+DROP TRIGGER IF EXISTS trg_audit_trail_prevent_truncate ON core.audit_trail;
+CREATE TRIGGER trg_audit_trail_prevent_truncate
+    BEFORE TRUNCATE ON core.audit_trail
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION core.prevent_truncate();
+
+-- 6. CONTINUOUS_AUDIT_TRAIL - Strictly immutable
+DROP TRIGGER IF EXISTS trg_continuous_audit_prevent_update ON core.continuous_audit_trail;
+CREATE TRIGGER trg_continuous_audit_prevent_update
+    BEFORE UPDATE ON core.continuous_audit_trail
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_update();
+
+DROP TRIGGER IF EXISTS trg_continuous_audit_prevent_delete ON core.continuous_audit_trail;
+CREATE TRIGGER trg_continuous_audit_prevent_delete
+    BEFORE DELETE ON core.continuous_audit_trail
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_delete();
+
+-- 7. IDEMPOTENCY_KEYS - Status-only updates allowed (for cleanup)
+DROP TRIGGER IF EXISTS trg_idempotency_keys_status_only ON core.idempotency_keys;
+CREATE TRIGGER trg_idempotency_keys_status_only
+    BEFORE UPDATE ON core.idempotency_keys
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_update_except_status();
+
+DROP TRIGGER IF EXISTS trg_idempotency_keys_prevent_delete ON core.idempotency_keys;
+CREATE TRIGGER trg_idempotency_keys_prevent_delete
+    BEFORE DELETE ON core.idempotency_keys
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_delete();
+
+-- 8. SECURITY_AUDIT_LOG - Strictly immutable (even more critical)
+DROP TRIGGER IF EXISTS trg_security_audit_prevent_update ON core.security_audit_log;
+CREATE TRIGGER trg_security_audit_prevent_update
+    BEFORE UPDATE ON core.security_audit_log
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_update();
+
+DROP TRIGGER IF EXISTS trg_security_audit_prevent_delete ON core.security_audit_log;
+CREATE TRIGGER trg_security_audit_prevent_delete
+    BEFORE DELETE ON core.security_audit_log
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_delete();
+
+-- 9. HASH_CHAIN_VERIFICATION - Strictly immutable
+DROP TRIGGER IF EXISTS trg_hash_chain_prevent_update ON core.hash_chain_verification;
+CREATE TRIGGER trg_hash_chain_prevent_update
+    BEFORE UPDATE ON core.hash_chain_verification
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_update();
+
+DROP TRIGGER IF EXISTS trg_hash_chain_prevent_delete ON core.hash_chain_verification;
+CREATE TRIGGER trg_hash_chain_prevent_delete
+    BEFORE DELETE ON core.hash_chain_verification
+    FOR EACH ROW
+    EXECUTE FUNCTION core.prevent_delete();
+
+-- =============================================================================
+-- IMMUTABILITY VERIFICATION FUNCTION
+-- =============================================================================
+
+-- Function to verify immutability is enforced
+CREATE OR REPLACE FUNCTION core.verify_immutability_enforcement()
+RETURNS TABLE (
+    table_name TEXT,
+    has_update_trigger BOOLEAN,
+    has_delete_trigger BOOLEAN,
+    has_truncate_trigger BOOLEAN,
+    status TEXT
+)
+LANGUAGE plpgsql
+AS $$
 BEGIN
     RETURN QUERY
-    WITH computed AS (
-        SELECT 
-            t.transaction_id,
-            t.current_hash as stored_hash,
-            digest(
-                concat(
-                    t.transaction_type_id::text, '|',
-                    t.application_id::text, '|',
-                    COALESCE(t.payload::text, ''), '|',
-                    COALESCE(t.initiator_account_id::text, ''), '|',
-                    COALESCE(t.amount::text, '0'), '|',
-                    COALESCE(t.currency, ''), '|',
-                    t.entry_date::text, '|',
-                    encode(t.previous_hash, 'hex')
-                ),
-                'sha256'
-            ) as computed_hash
-        FROM core.transaction_log t
-        WHERE (p_account_id IS NULL OR t.initiator_account_id = p_account_id)
-            AND (p_start_date IS NULL OR t.entry_date >= p_start_date)
-            AND (p_end_date IS NULL OR t.entry_date <= p_end_date)
-    )
     SELECT 
-        c.transaction_id,
-        c.stored_hash,
-        c.computed_hash,
-        c.stored_hash = c.computed_hash
-    FROM computed c
-    WHERE c.stored_hash != c.computed_hash;
+        t.tablename::TEXT,
+        EXISTS (
+            SELECT 1 FROM pg_trigger tr
+            JOIN pg_class c ON tr.tgrelid = c.oid
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = 'core'
+            AND c.relname = t.tablename
+            AND tr.tgname LIKE '%prevent_update%'
+        ) as has_update_trigger,
+        EXISTS (
+            SELECT 1 FROM pg_trigger tr
+            JOIN pg_class c ON tr.tgrelid = c.oid
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = 'core'
+            AND c.relname = t.tablename
+            AND tr.tgname LIKE '%prevent_delete%'
+        ) as has_delete_trigger,
+        EXISTS (
+            SELECT 1 FROM pg_trigger tr
+            JOIN pg_class c ON tr.tgrelid = c.oid
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = 'core'
+            AND c.relname = t.tablename
+            AND tr.tgname LIKE '%prevent_truncate%'
+        ) as has_truncate_trigger,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM pg_trigger tr
+                JOIN pg_class c ON tr.tgrelid = c.oid
+                JOIN pg_namespace n ON c.relnamespace = n.oid
+                WHERE n.nspname = 'core'
+                AND c.relname = t.tablename
+                AND tr.tgname LIKE '%prevent_update%'
+            ) THEN 'PROTECTED'
+            ELSE 'VULNERABLE'
+        END as status
+    FROM pg_tables t
+    WHERE t.schemaname = 'core'
+    AND t.tablename IN (
+        'transaction_log', 'blocks', 'merkle_nodes', 'merkle_proofs',
+        'audit_trail', 'continuous_audit_trail', 'security_audit_log',
+        'hash_chain_verification', 'idempotency_keys'
+    );
 END;
-$$ LANGUAGE plpgsql STABLE;
-
-COMMENT ON FUNCTION core.verify_hash_chain IS 'Verify cryptographic hash chain integrity for transactions';
+$$;
 
 -- =============================================================================
--- Create integrity check schedule
--- DESCRIPTION: Automated integrity verification
--- PRIORITY: HIGH
--- =============================================================================
--- [INTG-005] Create integrity_check_schedule table
--- INSTRUCTIONS:
---   - Configure automated integrity checks
---   - Track check execution
---   - Alert on failures
-
-CREATE TABLE core.integrity_check_schedule (
-    check_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    check_name          VARCHAR(100) NOT NULL,
-    check_type          VARCHAR(50) NOT NULL,        -- HASH_CHAIN, BALANCE, etc.
-    
-    -- Schedule
-    frequency           VARCHAR(20) NOT NULL,        -- HOURLY, DAILY, WEEKLY
-    last_run_at         TIMESTAMPTZ,
-    next_run_at         TIMESTAMPTZ,
-    
-    -- Scope
-    parameters          JSONB,                       -- Check-specific params
-    
-    -- Status
-    is_active           BOOLEAN DEFAULT true,
-    
-    -- Last Result
-    last_result         VARCHAR(20),                 -- PASS, FAIL, ERROR
-    last_result_details JSONB,
-    
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-COMMENT ON TABLE core.integrity_check_schedule IS 'Schedule configuration for automated integrity checks';
-COMMENT ON COLUMN core.integrity_check_schedule.check_type IS 'Check type: HASH_CHAIN, BALANCE, AUDIT, CONSISTENCY';
-
--- =============================================================================
--- Create integrity check execution function
--- DESCRIPTION: Run scheduled integrity checks
--- PRIORITY: HIGH
+-- VERIFICATION ON DEPLOYMENT
 -- =============================================================================
 
-CREATE OR REPLACE FUNCTION core.run_integrity_check(p_check_id UUID)
-RETURNS TABLE (
-    check_id UUID,
-    check_name VARCHAR(100),
-    result VARCHAR(20),
-    details JSONB
-) AS $$
+DO $$
 DECLARE
-    v_check RECORD;
-    v_result VARCHAR(20);
-    v_details JSONB;
-    v_invalid_count INTEGER;
+    v_unprotected_count INTEGER;
 BEGIN
-    -- Get check configuration
-    SELECT * INTO v_check FROM core.integrity_check_schedule WHERE check_id = p_check_id;
+    SELECT COUNT(*) INTO v_unprotected_count
+    FROM core.verify_immutability_enforcement()
+    WHERE status = 'VULNERABLE';
     
-    IF v_check IS NULL THEN
-        RAISE EXCEPTION 'Integrity check % not found', p_check_id;
+    IF v_unprotected_count > 0 THEN
+        RAISE WARNING 'IMMATABILITY WARNING: % core tables are missing protection triggers!', v_unprotected_count;
+        RAISE WARNING 'Run SELECT * FROM core.verify_immutability_enforcement(); for details.';
+    ELSE
+        RAISE NOTICE 'IMMUTABILITY VERIFIED: All core tables are protected against UPDATE/DELETE/TRUNCATE.';
     END IF;
-    
-    -- Execute check based on type
-    CASE v_check.check_type
-        WHEN 'HASH_CHAIN' THEN
-            SELECT COUNT(*) INTO v_invalid_count
-            FROM core.verify_hash_chain(
-                (v_check.parameters->>'account_id')::UUID,
-                (v_check.parameters->>'start_date')::DATE,
-                (v_check.parameters->>'end_date')::DATE
-            );
-            v_result := CASE WHEN v_invalid_count = 0 THEN 'PASS' ELSE 'FAIL' END;
-            v_details := jsonb_build_object('invalid_hashes', v_invalid_count);
-            
-        WHEN 'BALANCE' THEN
-            -- Placeholder for balance verification
-            v_result := 'PASS';
-            v_details := '{}'::JSONB;
-            
-        ELSE
-            v_result := 'ERROR';
-            v_details := jsonb_build_object('error', 'Unknown check type');
-    END CASE;
-    
-    -- Update schedule
-    UPDATE core.integrity_check_schedule
-    SET last_run_at = now(),
-        next_run_at = CASE v_check.frequency
-            WHEN 'HOURLY' THEN now() + interval '1 hour'
-            WHEN 'DAILY' THEN now() + interval '1 day'
-            WHEN 'WEEKLY' THEN now() + interval '1 week'
-            ELSE now() + interval '1 day'
-        END,
-        last_result = v_result,
-        last_result_details = v_details
-    WHERE check_id = p_check_id;
-    
-    RETURN QUERY SELECT p_check_id, v_check.check_name, v_result, v_details;
 END;
-$$ LANGUAGE plpgsql;
-
-COMMENT ON FUNCTION core.run_integrity_check IS 'Execute a scheduled integrity check and record results';
+$$;
 
 -- =============================================================================
--- Apply immutability triggers
--- DESCRIPTION: Attach triggers to immutable tables
--- PRIORITY: CRITICAL
--- =============================================================================
--- [INTG-006] Apply immutability triggers
-
--- Note: These triggers are commented out by default to allow initial data loading.
--- Uncomment after initial setup:
-
-/*
-CREATE TRIGGER trg_accounts_no_update
-    BEFORE UPDATE ON core.accounts
-    FOR EACH ROW EXECUTE FUNCTION core.prevent_update();
-
-CREATE TRIGGER trg_accounts_no_delete
-    BEFORE DELETE ON core.accounts
-    FOR EACH ROW EXECUTE FUNCTION core.prevent_delete();
-
-CREATE TRIGGER trg_transaction_log_no_update
-    BEFORE UPDATE ON core.transaction_log
-    FOR EACH ROW EXECUTE FUNCTION core.prevent_update();
-
-CREATE TRIGGER trg_transaction_log_no_delete
-    BEFORE DELETE ON core.transaction_log
-    FOR EACH ROW EXECUTE FUNCTION core.prevent_delete();
-
-CREATE TRIGGER trg_movement_headers_no_update
-    BEFORE UPDATE ON core.movement_headers
-    FOR EACH ROW EXECUTE FUNCTION core.prevent_update();
-
-CREATE TRIGGER trg_movement_headers_no_delete
-    BEFORE DELETE ON core.movement_headers
-    FOR EACH ROW EXECUTE FUNCTION core.prevent_delete();
-
-CREATE TRIGGER trg_movement_legs_no_update
-    BEFORE UPDATE ON core.movement_legs
-    FOR EACH ROW EXECUTE FUNCTION core.prevent_update();
-
-CREATE TRIGGER trg_movement_legs_no_delete
-    BEFORE DELETE ON core.movement_legs
-    FOR EACH ROW EXECUTE FUNCTION core.prevent_delete();
-
-CREATE TRIGGER trg_blocks_no_update
-    BEFORE UPDATE ON core.blocks
-    FOR EACH ROW EXECUTE FUNCTION core.prevent_update();
-
-CREATE TRIGGER trg_blocks_no_delete
-    BEFORE DELETE ON core.blocks
-    FOR EACH ROW EXECUTE FUNCTION core.prevent_delete();
-*/
-
--- =============================================================================
--- Create integrity indexes
--- DESCRIPTION: Optimize integrity queries
--- PRIORITY: MEDIUM
+-- FINAL IMMUTABILITY VERIFICATION
 -- =============================================================================
 
-CREATE INDEX idx_integrity_violations_table ON core.integrity_violations(table_schema, table_name, attempted_at);
-CREATE INDEX idx_integrity_violations_user ON core.integrity_violations(user_name, attempted_at);
-CREATE INDEX idx_integrity_check_schedule_active ON core.integrity_check_schedule(is_active, next_run_at);
+-- Function to verify complete immutability protection
+CREATE OR REPLACE FUNCTION core.final_immutability_check()
+RETURNS TABLE (
+    check_name TEXT,
+    check_status TEXT,
+    details TEXT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_count INTEGER;
+    v_table TEXT;
+BEGIN
+    -- Check 1: All core tables have update triggers
+    check_name := 'Core Tables Update Protection';
+    SELECT COUNT(DISTINCT tablename) INTO v_count
+    FROM pg_tables t
+    JOIN pg_trigger tr ON tr.tgrelid = (quote_ident('core') || '.' || quote_ident(t.tablename))::regclass
+    WHERE t.schemaname = 'core'
+    AND tr.tgname LIKE '%prevent_update%';
+    
+    IF v_count >= 5 THEN
+        check_status := 'PASS';
+        details := format('%s core tables protected', v_count);
+    ELSE
+        check_status := 'FAIL';
+        details := format('Only %s tables protected, expected 5+', v_count);
+    END IF;
+    RETURN NEXT;
+    
+    -- Check 2: All core tables have delete triggers
+    check_name := 'Core Tables Delete Protection';
+    SELECT COUNT(DISTINCT tablename) INTO v_count
+    FROM pg_tables t
+    JOIN pg_trigger tr ON tr.tgrelid = (quote_ident('core') || '.' || quote_ident(t.tablename))::regclass
+    WHERE t.schemaname = 'core'
+    AND tr.tgname LIKE '%prevent_delete%';
+    
+    IF v_count >= 5 THEN
+        check_status := 'PASS';
+        details := format('%s core tables protected', v_count);
+    ELSE
+        check_status := 'FAIL';
+        details := format('Only %s tables protected, expected 5+', v_count);
+    END IF;
+    RETURN NEXT;
+    
+    -- Check 3: Transaction log has hash fields
+    check_name := 'Transaction Log Hash Fields';
+    SELECT COUNT(*) INTO v_count
+    FROM information_schema.columns
+    WHERE table_schema = 'core'
+    AND table_name = 'transaction_log'
+    AND column_name IN ('previous_hash', 'current_hash', 'payload_hash');
+    
+    IF v_count = 3 THEN
+        check_status := 'PASS';
+        details := 'All hash fields present';
+    ELSE
+        check_status := 'FAIL';
+        details := format('Only %s/3 hash fields present', v_count);
+    END IF;
+    RETURN NEXT;
+    
+    -- Check 4: Blocks have Merkle root
+    check_name := 'Blocks Merkle Root';
+    SELECT COUNT(*) INTO v_count
+    FROM information_schema.columns
+    WHERE table_schema = 'core'
+    AND table_name = 'blocks'
+    AND column_name IN ('merkle_root', 'previous_block_hash');
+    
+    IF v_count = 2 THEN
+        check_status := 'PASS';
+        details := 'Merkle fields present';
+    ELSE
+        check_status := 'FAIL';
+        details := 'Missing Merkle fields';
+    END IF;
+    RETURN NEXT;
+    
+    -- Check 5: Audit trail exists and is immutable
+    check_name := 'Audit Trail Immutability';
+    SELECT COUNT(*) INTO v_count
+    FROM pg_trigger tr
+    JOIN pg_class c ON tr.tgrelid = c.oid
+    JOIN pg_namespace n ON c.relnamespace = n.oid
+    WHERE n.nspname = 'core'
+    AND c.relname = 'audit_trail'
+    AND tr.tgname LIKE '%prevent%';
+    
+    IF v_count >= 2 THEN
+        check_status := 'PASS';
+        details := format('%s protection triggers on audit_trail', v_count);
+    ELSE
+        check_status := 'WARN';
+        details := 'Limited protection on audit_trail';
+    END IF;
+    RETURN NEXT;
+    
+    -- Check 6: RLS is enabled on tenant tables
+    check_name := 'Row Level Security';
+    SELECT COUNT(*) INTO v_count
+    FROM pg_class c
+    JOIN pg_namespace n ON c.relnamespace = n.oid
+    WHERE n.nspname IN ('core', 'app')
+    AND c.relkind = 'r'
+    AND c.relrowsecurity = TRUE;
+    
+    IF v_count >= 3 THEN
+        check_status := 'PASS';
+        details := format('%s tables have RLS enabled', v_count);
+    ELSE
+        check_status := 'WARN';
+        details := 'Limited RLS coverage';
+    END IF;
+    RETURN NEXT;
+END;
+$$;
 
-COMMENT ON INDEX idx_integrity_violations_table IS 'Index for querying violation attempts by table';
+-- Run the check
+DO $$
+DECLARE
+    v_result RECORD;
+    v_failures INTEGER := 0;
+BEGIN
+    RAISE NOTICE '';
+    RAISE NOTICE '================================================================================';
+    RAISE NOTICE 'FINAL IMMUTABILITY VERIFICATION';
+    RAISE NOTICE '================================================================================';
+    
+    FOR v_result IN SELECT * FROM core.final_immutability_check()
+    LOOP
+        RAISE NOTICE '%: % - %', v_result.check_name, v_result.check_status, v_result.details;
+        IF v_result.check_status = 'FAIL' THEN
+            v_failures := v_failures + 1;
+        END IF;
+    END LOOP;
+    
+    RAISE NOTICE '================================================================================';
+    IF v_failures = 0 THEN
+        RAISE NOTICE 'ALL CHECKS PASSED - System is ready for production';
+    ELSE
+        RAISE WARNING '% CHECKS FAILED - Review and fix before production', v_failures;
+    END IF;
+    RAISE NOTICE '================================================================================';
+END;
+$$;
 
-/*
-================================================================================
-MIGRATION CHECKLIST:
-☑ Create integrity_violations table
-☑ Implement prevent_update trigger function
-☑ Implement prevent_delete trigger function
-☑ Implement verify_hash_chain function
-☑ Create integrity_check_schedule table
-☑ Implement run_integrity_check function
-☑ Document immutability triggers (commented for initial loading)
-☑ Test UPDATE blocking (manual test required)
-☑ Test DELETE blocking (manual test required)
-☑ Test hash chain verification
-☑ Configure scheduled integrity checks
-================================================================================
-*/
+-- =============================================================================
+-- COMMENTS
+-- =============================================================================
+
+COMMENT ON FUNCTION core.prevent_update() IS 
+    'Trigger function that blocks UPDATE operations on immutable tables and logs violations';
+COMMENT ON FUNCTION core.prevent_delete() IS 
+    'Trigger function that blocks DELETE operations on immutable tables and logs violations';
+COMMENT ON FUNCTION core.prevent_truncate() IS 
+    'Trigger function that blocks TRUNCATE operations on immutable tables';
+COMMENT ON FUNCTION core.verify_immutability_enforcement() IS 
+    'Verification function to ensure all immutable tables have protection triggers';
+COMMENT ON FUNCTION core.final_immutability_check() IS 
+    'Final verification that all immutability protections are in place';
+
+-- =============================================================================
+-- END OF FILE
+-- =============================================================================

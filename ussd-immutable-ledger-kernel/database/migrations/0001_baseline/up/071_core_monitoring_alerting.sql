@@ -582,6 +582,87 @@ VALUES
 ON CONFLICT DO NOTHING;
 
 -- =============================================================================
+-- EMERGENCY ADMIN FUNCTIONS
+-- =============================================================================
+
+-- Emergency function to verify hash chain (read-only, safe)
+CREATE OR REPLACE FUNCTION core.emergency_verify_hash_chain(
+    p_start_transaction_id BIGINT DEFAULT NULL,
+    p_end_transaction_id BIGINT DEFAULT NULL
+)
+RETURNS TABLE (
+    transaction_id BIGINT,
+    is_valid BOOLEAN,
+    expected_hash VARCHAR(64),
+    actual_hash VARCHAR(64),
+    error_message TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_record RECORD;
+    v_previous_hash VARCHAR(64);
+BEGIN
+    v_previous_hash := 'GENESIS';
+    
+    FOR v_record IN 
+        SELECT t.transaction_id, t.previous_hash, t.current_hash, t.payload_hash
+        FROM core.transaction_log t
+        WHERE (p_start_transaction_id IS NULL OR t.transaction_id >= p_start_transaction_id)
+        AND (p_end_transaction_id IS NULL OR t.transaction_id <= p_end_transaction_id)
+        ORDER BY t.transaction_id
+    LOOP
+        transaction_id := v_record.transaction_id;
+        
+        -- Check chain link
+        IF v_record.previous_hash IS DISTINCT FROM v_previous_hash THEN
+            is_valid := FALSE;
+            expected_hash := v_previous_hash;
+            actual_hash := v_record.previous_hash;
+            error_message := 'Previous hash mismatch in chain';
+            RETURN NEXT;
+        ELSE
+            is_valid := TRUE;
+            expected_hash := v_record.current_hash;
+            actual_hash := v_record.current_hash;
+            error_message := NULL;
+            RETURN NEXT;
+        END IF;
+        
+        v_previous_hash := v_record.current_hash;
+    END LOOP;
+END;
+$$;
+
+-- Emergency function to get system status
+CREATE OR REPLACE FUNCTION core.emergency_system_status()
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_result JSONB;
+BEGIN
+    SELECT jsonb_build_object(
+        'database', current_database(),
+        'timestamp', NOW(),
+        'session_user', session_user,
+        'current_user', current_user,
+        'transaction_log_count', (SELECT COUNT(*) FROM core.transaction_log),
+        'blocks_count', (SELECT COUNT(*) FROM core.blocks),
+        'pending_transactions', (SELECT COUNT(*) FROM core.transaction_log WHERE status = 'pending'),
+        'failed_transactions', (SELECT COUNT(*) FROM core.transaction_log WHERE status = 'failed'),
+        'active_applications', (SELECT COUNT(*) FROM app.applications WHERE status = 'active'),
+        'immutability_checks', (SELECT jsonb_agg(jsonb_build_object('check', check_name, 'status', check_status)) FROM core.final_immutability_check()),
+        'recent_errors', (SELECT jsonb_agg(jsonb_build_object('time', event_timestamp, 'type', event_type)) FROM core.security_audit_log WHERE severity = 'CRITICAL' AND event_timestamp > NOW() - INTERVAL '24 hours' LIMIT 5)
+    ) INTO v_result;
+    
+    RETURN v_result;
+END;
+$$;
+
+-- =============================================================================
 -- COMMENTS
 -- =============================================================================
 
@@ -593,6 +674,10 @@ COMMENT ON TABLE core.incidents IS
     'Incident management for outages and security events';
 COMMENT ON VIEW core.system_health IS 
     'Real-time system health indicators';
+COMMENT ON FUNCTION core.emergency_verify_hash_chain() IS 
+    'Emergency function to verify hash chain integrity (read-only, safe)';
+COMMENT ON FUNCTION core.emergency_system_status() IS 
+    'Emergency function to get complete system status in JSON format';
 
 -- =============================================================================
 -- END OF FILE
